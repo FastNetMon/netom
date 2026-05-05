@@ -173,6 +173,10 @@ fn byte_to_ppi(byte: u8) -> PduParseInfo {
 
 
 impl RotondaPaMap {
+    pub fn empty_path_attributes() -> Self {
+        OwnedPathAttributes::new(PduParseInfo::modern(), Vec::new()).into()
+    }
+
     pub fn new(path_attributes: OwnedPathAttributes) -> Self {
         let ppi = path_attributes.pdu_parse_info();
         let mut pas = path_attributes.into_vec();

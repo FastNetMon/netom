@@ -81,6 +81,7 @@ impl Rib {
         route_status: RouteStatus,
         ltime: u64,
         ingress_id: IngressId,
+        retain_withdrawn_attributes: bool,
     ) -> Result<UpsertReport, String> {
         let res = match val {
             RotondaRoute::Ipv4Unicast(n, ..) => self.insert_prefix(
@@ -90,6 +91,7 @@ impl Rib {
                 route_status,
                 ltime,
                 ingress_id,
+                retain_withdrawn_attributes,
             ),
             RotondaRoute::Ipv6Unicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -98,6 +100,7 @@ impl Rib {
                 route_status,
                 ltime,
                 ingress_id,
+                retain_withdrawn_attributes,
             ),
             RotondaRoute::Ipv4Multicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -106,6 +109,7 @@ impl Rib {
                 route_status,
                 ltime,
                 ingress_id,
+                retain_withdrawn_attributes,
             ),
             RotondaRoute::Ipv6Multicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -114,6 +118,7 @@ impl Rib {
                 route_status,
                 ltime,
                 ingress_id,
+                retain_withdrawn_attributes,
             ),
         };
         res.map_err(|e| e.to_string())
@@ -127,6 +132,7 @@ impl Rib {
         route_status: RouteStatus,
         ltime: u64,
         ingress_id: IngressId,
+        retain_withdrawn_attributes: bool,
     ) -> Result<UpsertReport, PrefixStoreError> {
         // Check whether our self.rib is Some(..) or bail out.
         let arc_store = match multicast.0 {
@@ -141,6 +147,26 @@ impl Rib {
         let mui = ingress_id;
 
         if route_status == RouteStatus::Withdrawn {
+            if !retain_withdrawn_attributes {
+                if !store.contains(prefix, Some(mui)) {
+                    return Ok(UpsertReport {
+                        cas_count: 0,
+                        prefix_new: false,
+                        mui_new: false,
+                        mui_count: 0,
+                    });
+                }
+
+                let pubrec = Record::new(
+                    mui,
+                    ltime,
+                    RouteStatus::Withdrawn,
+                    RotondaPaMap::empty_path_attributes(),
+                );
+
+                return store.insert(prefix, pubrec, None);
+            }
+
             // instead of creating an empty PrefixRoute for this Prefix and
             // putting that in the store, we use the new
             // mark_mui_as_withdrawn_for_prefix . This way, we preserve the
@@ -164,7 +190,7 @@ impl Rib {
             route_status,
             val.rotonda_pamap().clone(),
         );
-        
+
         store.insert(
             prefix, pubrec, None, // Option<TBI>
         )
@@ -174,6 +200,7 @@ impl Rib {
         &self,
         ingress_id: IngressId,
         specific_afisafi: Option<AfiSafiType>,
+        retain_withdrawn_attributes: bool,
     ) {
         // This signals a withdraw-all-for-peer, because a BGP session
         // was lost or because a BMP PeerDownNotification was
@@ -209,6 +236,12 @@ impl Rib {
         //     those withdrawals to the very latest (most-East) point?
 
         debug!("withdraw_for_ingress for {ingress_id}");
+        if !retain_withdrawn_attributes {
+            self.compact_withdrawn_attributes_for_ingress(
+                ingress_id,
+                specific_afisafi,
+            );
+        }
         match specific_afisafi {
             None => {
                 // Set all address families to withdrawn.
@@ -290,6 +323,124 @@ impl Rib {
 
             afisafi => {
                 panic!("no support to withdraw {:?} yet", afisafi)
+            }
+        }
+    }
+
+    pub fn compact_withdrawn_attributes_for_ingress(
+        &self,
+        ingress_id: IngressId,
+        specific_afisafi: Option<AfiSafiType>,
+    ) {
+        match specific_afisafi {
+            None => {
+                self.compact_withdrawn_attributes_in_store(
+                    self.unicast.as_ref().as_ref(),
+                    ingress_id,
+                    None,
+                );
+                self.compact_withdrawn_attributes_in_store(
+                    self.multicast.as_ref().as_ref(),
+                    ingress_id,
+                    None,
+                );
+            }
+            Some(AfiSafiType::Ipv4Unicast) => {
+                self.compact_withdrawn_attributes_in_store(
+                    self.unicast.as_ref().as_ref(),
+                    ingress_id,
+                    Some(AfiSafiType::Ipv4Unicast),
+                );
+            }
+            Some(AfiSafiType::Ipv6Unicast) => {
+                self.compact_withdrawn_attributes_in_store(
+                    self.unicast.as_ref().as_ref(),
+                    ingress_id,
+                    Some(AfiSafiType::Ipv6Unicast),
+                );
+            }
+            Some(AfiSafiType::Ipv4Multicast) => {
+                self.compact_withdrawn_attributes_in_store(
+                    self.multicast.as_ref().as_ref(),
+                    ingress_id,
+                    Some(AfiSafiType::Ipv4Multicast),
+                );
+            }
+            Some(AfiSafiType::Ipv6Multicast) => {
+                self.compact_withdrawn_attributes_in_store(
+                    self.multicast.as_ref().as_ref(),
+                    ingress_id,
+                    Some(AfiSafiType::Ipv6Multicast),
+                );
+            }
+            afisafi => {
+                warn!(
+                    "no support to compact withdrawn attributes for {:?} yet",
+                    afisafi
+                );
+            }
+        }
+    }
+
+    fn compact_withdrawn_attributes_in_store(
+        &self,
+        store: Option<&Store>,
+        ingress_id: IngressId,
+        specific_afisafi: Option<AfiSafiType>,
+    ) {
+        let Some(store) = store else {
+            return;
+        };
+
+        let guard = &epoch::pin();
+        let prefixes = match specific_afisafi {
+            Some(AfiSafiType::Ipv4Unicast | AfiSafiType::Ipv4Multicast) => store
+                .prefixes_iter_v4(guard)
+                .flatten()
+                .filter(|prefix_record| {
+                    prefix_record
+                        .meta
+                        .iter()
+                        .any(|record| record.multi_uniq_id == ingress_id)
+                })
+                .map(|prefix_record| prefix_record.prefix)
+                .collect::<Vec<_>>(),
+            Some(AfiSafiType::Ipv6Unicast | AfiSafiType::Ipv6Multicast) => store
+                .prefixes_iter_v6(guard)
+                .flatten()
+                .filter(|prefix_record| {
+                    prefix_record
+                        .meta
+                        .iter()
+                        .any(|record| record.multi_uniq_id == ingress_id)
+                })
+                .map(|prefix_record| prefix_record.prefix)
+                .collect::<Vec<_>>(),
+            _ => store
+                .prefixes_iter(guard)
+                .flatten()
+                .filter(|prefix_record| {
+                    prefix_record
+                        .meta
+                        .iter()
+                        .any(|record| record.multi_uniq_id == ingress_id)
+                })
+                .map(|prefix_record| prefix_record.prefix)
+                .collect::<Vec<_>>(),
+        };
+
+        for prefix in prefixes {
+            let pubrec = Record::new(
+                ingress_id,
+                0,
+                RouteStatus::Withdrawn,
+                RotondaPaMap::empty_path_attributes(),
+            );
+
+            if let Err(err) = store.insert(&prefix, pubrec, None) {
+                warn!(
+                    "failed to compact withdrawn attributes for {prefix} and ingress {ingress_id}: {err}"
+                );
             }
         }
     }
@@ -485,7 +636,7 @@ impl Rib {
         // - community
         // - large community
         // - peer distinguisher
-        
+
         debug!("store lookup took {:?}", std::time::Instant::now().duration_since(t0));
 
 
@@ -548,7 +699,7 @@ impl Rib {
         });
 
         debug!("filtering took {:?}", std::time::Instant::now().duration_since(t0));
-        
+
         res
 
     }
@@ -559,7 +710,7 @@ impl Rib {
     // In such case, we could optimize:
     //  - fetch the required info once, pass it into apply_filter
     //  - in apply_filter, check for such info and branch: if let Some(passed_info), etc
-    
+
     fn apply_filter(&self, records: &mut Vec<Record<RotondaPaMap>>, filter: &QueryFilter, roto_filter: Option<RotoHttpFilter>) {
         if let Some(rib_type) = filter.rib_type {
             records.retain(|r|{
@@ -730,9 +881,9 @@ impl Serialize for SearchResult {
         //          - can we provide multiple 'styles' of output (via some query param), e.g.
         //              - the old, very verbose one,
         //              - one with Martin Pels' draft applied
-        //          
         //
-        //         
+        //
+        //
         // - includes:
         //  X more specifics
         //  X less specifics
@@ -746,7 +897,7 @@ impl Serialize for SearchResult {
         //          "routes": [ ... ]
         //      },
         //      "included": ...
-        // 
+        //
         // the good thing about that repetition though is, that when including routes for more/less
         // specifics in the "included" section, we can follow the exact same structure?
         //
@@ -755,7 +906,7 @@ impl Serialize for SearchResult {
         //
         //      "included": [
         //          {
-        //              "include_type": "moreSpecifics", 
+        //              "include_type": "moreSpecifics",
         //                  "data": {
         //                      "nlri": $some_nlri,
         //                      "routes": [ { .. }, .. ]
@@ -769,7 +920,7 @@ impl Serialize for SearchResult {
         //                  }
         //          }
         //      ]
-        //              
+        //
         //
         //
         #[derive(Serialize)]
@@ -906,12 +1057,12 @@ impl Serialize for PrefixRecordWrapper<'_, '_, '_> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer {
-            
+
              Data {
                 nlri: Some(self.0.prefix),
                 routes: RecordsWrapper(&self.0.meta, self.1, self.2),
             }.serialize(serializer)
-        
+
     }
 }
 

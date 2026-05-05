@@ -12,7 +12,7 @@ use crate::{
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use roto::Verdict;
-use std::{collections::{HashMap, HashSet}, io::prelude::*, sync::{Mutex, RwLock, Weak}};
+use std::{collections::{HashMap, HashSet}, io::prelude::*, sync::{Mutex, RwLock, Weak, atomic::{AtomicBool, Ordering}}};
 use rotonda_store::{errors::PrefixStoreError, match_options::{IncludeHistory, MatchOptions, MatchType, QueryResult}, prefix_record::{Record, RecordSet, RouteStatus}, rib::{config::MemoryOnlyConfig, StarCastRib}, stats::UpsertReport};
 use std::io::prelude::*;
 
@@ -156,6 +156,10 @@ pub struct RibUnit {
     /// one with its `rib_type` set to `Virtual`.
     #[serde(default)]
     pub filter_name: Option<FilterName>,
+
+    /// Whether withdrawn routes keep their last seen path attributes in the RIB.
+    #[serde(default = "RibUnit::default_retain_withdrawn_attributes")]
+    pub retain_withdrawn_attributes: bool,
 }
 
 impl RibUnit {
@@ -169,6 +173,7 @@ impl RibUnit {
             gate,
             component,
             self.filter_name.unwrap_or_default(),
+            self.retain_withdrawn_attributes,
         )
         .map_err(|_| Terminated)?
         .run(self.sources, waitpoint)
@@ -177,6 +182,10 @@ impl RibUnit {
 
     fn default_query_limits() -> QueryLimits {
         QueryLimits::default()
+    }
+
+    fn default_retain_withdrawn_attributes() -> bool {
+        true
     }
 }
 
@@ -198,6 +207,7 @@ pub struct RibUnitRunner {
     #[allow(dead_code)] // this will go
     rib_merge_update_stats: Arc<RibMergeUpdateStatistics>,
     status_reporter: Arc<RibUnitStatusReporter>,
+    retain_withdrawn_attributes: Arc<AtomicBool>,
     _process_metrics: Arc<TokioTaskMetrics>,
     #[allow(dead_code)] // this will go
     tracer: Arc<Tracer>,
@@ -226,6 +236,7 @@ impl RibUnitRunner {
         gate: Gate,
         mut component: Component,
         filter_name: FilterName,
+        retain_withdrawn_attributes: bool,
     ) -> Result<Self, PrefixStoreError> {
         let unit_name = component.name().clone();
         let gate = Arc::new(gate);
@@ -339,6 +350,9 @@ impl RibUnitRunner {
             rtr_cache,
             ingress_register: component.ingresses(),
             status_reporter,
+            retain_withdrawn_attributes: Arc::new(AtomicBool::new(
+                retain_withdrawn_attributes,
+            )),
             filter_name,
             _process_metrics,
             rib_merge_update_stats,
@@ -349,6 +363,13 @@ impl RibUnitRunner {
     #[cfg(test)]
     pub(crate) fn mock(
         _roto_script: &str,
+    ) -> Result<(Self, crate::comms::GateAgent), PrefixStoreError> {
+        Self::mock_with_retain_withdrawn_attributes(true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_with_retain_withdrawn_attributes(
+        retain_withdrawn_attributes: bool,
     ) -> Result<(Self, crate::comms::GateAgent), PrefixStoreError> {
         //use crate::common::roto::RotoScriptOrigin;
 
@@ -371,11 +392,14 @@ impl RibUnitRunner {
 
         let shared_rib = Arc::new(ArcSwap::new(Arc::new(rib)));
         let tracer = Arc::new(Tracer::new());
+        let retain_withdrawn_attributes =
+            Arc::new(AtomicBool::new(retain_withdrawn_attributes));
 
         let runner = Self {
             gate,
             rib: shared_rib,
             status_reporter,
+            retain_withdrawn_attributes,
             rtr_cache: Default::default(),
             filter_name,
             _process_metrics,
@@ -410,7 +434,11 @@ impl RibUnitRunner {
         debug!("signal_withdraw for {ingress_id}");
         self.rib
             .load()
-            .withdraw_for_ingress(ingress_id, specific_afisafi);
+            .withdraw_for_ingress(
+                ingress_id,
+                specific_afisafi,
+                self.retain_withdrawn_attributes.load(Ordering::Relaxed),
+            );
     }
 
     pub async fn run(
@@ -448,9 +476,15 @@ impl RibUnitRunner {
                                     sources: new_sources,
                                     query_limits: _new_query_limits,
                                     filter_name: new_filter_name,
+                                    retain_withdrawn_attributes:
+                                        new_retain_withdrawn_attributes,
                                 }),
                         } => {
                             arc_self.status_reporter.reconfigured();
+                            arc_self.retain_withdrawn_attributes.store(
+                                new_retain_withdrawn_attributes,
+                                Ordering::Relaxed,
+                            );
 
                             // Replace the roto script with the new one
                             let old_filter_name =
@@ -1101,7 +1135,13 @@ impl RibUnitRunner {
 
         let ltime = 0_u64; // XXX should come from Payload
 
-        match rib.insert(&payload.rx_value, route_status, ltime, ingress_id) {
+        match rib.insert(
+            &payload.rx_value,
+            route_status,
+            ltime,
+            ingress_id,
+            self.retain_withdrawn_attributes.load(Ordering::Relaxed),
+        ) {
             Ok(report) => {
                 let post_insert = std::time::Instant::now();
                 let store_op_delay = pre_insert.duration_since(post_insert);

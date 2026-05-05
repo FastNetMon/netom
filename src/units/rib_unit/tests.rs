@@ -9,7 +9,11 @@ use crate::{
 use chrono::Utc;
 use futures::future::join_all;
 use inetnum::{addr::Prefix, asn::Asn};
-use rotonda_store::prefix_record::RouteStatus;
+use rotonda_store::{
+    epoch,
+    match_options::{IncludeHistory, MatchOptions, MatchType},
+    prefix_record::RouteStatus,
+};
 use routecore::bgp::communities::Wellknown;
 use routecore::bgp::message::update_builder::StandardCommunitiesList;
 use routecore::bgp::message::{SessionConfig, UpdateMessage};
@@ -135,6 +139,66 @@ async fn process_update_same_route_twice() {
 
     // And check that recorded metrics are correct
     assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 0, 1, 1));
+}
+
+#[tokio::test]
+async fn process_update_withdraw_retains_attributes_by_default() {
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let prefix = Prefix::from_str("127.0.0.1/32").unwrap();
+
+    runner
+        .process_update(mk_route_update(&prefix, Some("[111,222,333]")))
+        .await
+        .unwrap();
+    let announced_attr_len = stored_attr_len(&runner, &prefix);
+    assert!(announced_attr_len > 2);
+
+    runner
+        .process_update(mk_route_update(&prefix, None))
+        .await
+        .unwrap();
+
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    assert_eq!(stored_attr_len(&runner, &prefix), announced_attr_len);
+}
+
+#[tokio::test]
+async fn process_update_withdraw_can_drop_attributes() {
+    let (runner, _) =
+        RibUnitRunner::mock_with_retain_withdrawn_attributes(false).unwrap();
+    let prefix = Prefix::from_str("127.0.0.1/32").unwrap();
+
+    runner
+        .process_update(mk_route_update(&prefix, Some("[111,222,333]")))
+        .await
+        .unwrap();
+    assert!(stored_attr_len(&runner, &prefix) > 2);
+
+    runner
+        .process_update(mk_route_update(&prefix, None))
+        .await
+        .unwrap();
+
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    assert_eq!(stored_attr_len(&runner, &prefix), 2);
+}
+
+#[tokio::test]
+async fn process_peer_withdraw_can_drop_attributes() {
+    let (runner, _) =
+        RibUnitRunner::mock_with_retain_withdrawn_attributes(false).unwrap();
+    let prefix = Prefix::from_str("127.0.0.1/32").unwrap();
+
+    runner
+        .process_update(mk_route_update(&prefix, Some("[111,222,333]")))
+        .await
+        .unwrap();
+    assert!(stored_attr_len(&runner, &prefix) > 2);
+
+    runner.process_update(Update::Withdraw(1, None)).await.unwrap();
+
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    assert_eq!(stored_attr_len(&runner, &prefix), 2);
 }
 
 #[ignore]
@@ -719,6 +783,41 @@ fn mk_route_update_with_communities(
     //Update::from(Payload::from(TypeValue::from(BuiltinTypeValue::Route(
     //    route,
     //))))
+}
+
+fn stored_attr_len(runner: &RibUnitRunner, prefix: &Prefix) -> usize {
+    stored_record(runner, prefix).meta.as_ref().len()
+}
+
+fn stored_status(runner: &RibUnitRunner, prefix: &Prefix) -> RouteStatus {
+    stored_record(runner, prefix).status
+}
+
+fn stored_record(
+    runner: &RibUnitRunner,
+    prefix: &Prefix,
+) -> rotonda_store::prefix_record::Record<crate::payload::RotondaPaMap> {
+    let match_result = runner
+        .rib()
+        .store()
+        .unwrap()
+        .match_prefix(prefix, &match_options(), &epoch::pin())
+        .unwrap();
+
+    assert!(matches!(match_result.match_type, MatchType::ExactMatch));
+    assert_eq!(match_result.records.len(), 1);
+    match_result.records.into_iter().next().unwrap()
+}
+
+fn match_options() -> MatchOptions {
+    MatchOptions {
+        match_type: MatchType::ExactMatch,
+        include_withdrawn: true,
+        include_less_specifics: false,
+        include_more_specifics: false,
+        mui: None,
+        include_history: IncludeHistory::None,
+    }
 }
 
 #[allow(dead_code)]
