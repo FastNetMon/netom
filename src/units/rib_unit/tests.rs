@@ -201,6 +201,32 @@ async fn process_peer_withdraw_can_drop_attributes() {
     assert_eq!(stored_attr_len(&runner, &prefix), 2);
 }
 
+#[tokio::test]
+async fn process_update_can_deduplicate_path_attributes() {
+    let (runner, _) =
+        RibUnitRunner::mock_with_deduplicate_path_attributes(true).unwrap();
+    let prefix_one = Prefix::from_str("127.0.0.1/32").unwrap();
+    let prefix_two = Prefix::from_str("127.0.0.2/32").unwrap();
+
+    runner
+        .process_update(mk_route_update(&prefix_one, Some("[111,222,333]")))
+        .await
+        .unwrap();
+    runner
+        .process_update(mk_route_update(&prefix_two, Some("[111,222,333]")))
+        .await
+        .unwrap();
+
+    let record_one = stored_record(&runner, &prefix_one);
+    let record_two = stored_record(&runner, &prefix_two);
+
+    assert_eq!(record_one.meta.as_ref(), record_two.meta.as_ref());
+    assert_eq!(
+        record_one.meta.as_ref().as_ptr(),
+        record_two.meta.as_ref().as_ptr()
+    );
+}
+
 #[ignore]
 #[tokio::test]
 async fn process_update_equivalent_route_twice() {

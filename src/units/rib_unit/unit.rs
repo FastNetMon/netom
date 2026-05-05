@@ -160,6 +160,10 @@ pub struct RibUnit {
     /// Whether withdrawn routes keep their last seen path attributes in the RIB.
     #[serde(default = "RibUnit::default_retain_withdrawn_attributes")]
     pub retain_withdrawn_attributes: bool,
+
+    /// Whether identical path attribute blobs are shared between stored routes.
+    #[serde(default)]
+    pub deduplicate_path_attributes: bool,
 }
 
 impl RibUnit {
@@ -174,6 +178,7 @@ impl RibUnit {
             component,
             self.filter_name.unwrap_or_default(),
             self.retain_withdrawn_attributes,
+            self.deduplicate_path_attributes,
         )
         .map_err(|_| Terminated)?
         .run(self.sources, waitpoint)
@@ -208,6 +213,7 @@ pub struct RibUnitRunner {
     rib_merge_update_stats: Arc<RibMergeUpdateStatistics>,
     status_reporter: Arc<RibUnitStatusReporter>,
     retain_withdrawn_attributes: Arc<AtomicBool>,
+    deduplicate_path_attributes: Arc<AtomicBool>,
     _process_metrics: Arc<TokioTaskMetrics>,
     #[allow(dead_code)] // this will go
     tracer: Arc<Tracer>,
@@ -237,6 +243,7 @@ impl RibUnitRunner {
         mut component: Component,
         filter_name: FilterName,
         retain_withdrawn_attributes: bool,
+        deduplicate_path_attributes: bool,
     ) -> Result<Self, PrefixStoreError> {
         let unit_name = component.name().clone();
         let gate = Arc::new(gate);
@@ -353,6 +360,9 @@ impl RibUnitRunner {
             retain_withdrawn_attributes: Arc::new(AtomicBool::new(
                 retain_withdrawn_attributes,
             )),
+            deduplicate_path_attributes: Arc::new(AtomicBool::new(
+                deduplicate_path_attributes,
+            )),
             filter_name,
             _process_metrics,
             rib_merge_update_stats,
@@ -370,6 +380,21 @@ impl RibUnitRunner {
     #[cfg(test)]
     pub(crate) fn mock_with_retain_withdrawn_attributes(
         retain_withdrawn_attributes: bool,
+    ) -> Result<(Self, crate::comms::GateAgent), PrefixStoreError> {
+        Self::mock_with_options(retain_withdrawn_attributes, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mock_with_deduplicate_path_attributes(
+        deduplicate_path_attributes: bool,
+    ) -> Result<(Self, crate::comms::GateAgent), PrefixStoreError> {
+        Self::mock_with_options(true, deduplicate_path_attributes)
+    }
+
+    #[cfg(test)]
+    fn mock_with_options(
+        retain_withdrawn_attributes: bool,
+        deduplicate_path_attributes: bool,
     ) -> Result<(Self, crate::comms::GateAgent), PrefixStoreError> {
         //use crate::common::roto::RotoScriptOrigin;
 
@@ -394,12 +419,15 @@ impl RibUnitRunner {
         let tracer = Arc::new(Tracer::new());
         let retain_withdrawn_attributes =
             Arc::new(AtomicBool::new(retain_withdrawn_attributes));
+        let deduplicate_path_attributes =
+            Arc::new(AtomicBool::new(deduplicate_path_attributes));
 
         let runner = Self {
             gate,
             rib: shared_rib,
             status_reporter,
             retain_withdrawn_attributes,
+            deduplicate_path_attributes,
             rtr_cache: Default::default(),
             filter_name,
             _process_metrics,
@@ -478,11 +506,17 @@ impl RibUnitRunner {
                                     filter_name: new_filter_name,
                                     retain_withdrawn_attributes:
                                         new_retain_withdrawn_attributes,
+                                    deduplicate_path_attributes:
+                                        new_deduplicate_path_attributes,
                                 }),
                         } => {
                             arc_self.status_reporter.reconfigured();
                             arc_self.retain_withdrawn_attributes.store(
                                 new_retain_withdrawn_attributes,
+                                Ordering::Relaxed,
+                            );
+                            arc_self.deduplicate_path_attributes.store(
+                                new_deduplicate_path_attributes,
                                 Ordering::Relaxed,
                             );
 
@@ -1141,6 +1175,7 @@ impl RibUnitRunner {
             ltime,
             ingress_id,
             self.retain_withdrawn_attributes.load(Ordering::Relaxed),
+            self.deduplicate_path_attributes.load(Ordering::Relaxed),
         ) {
             Ok(report) => {
                 let post_insert = std::time::Instant::now();

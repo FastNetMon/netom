@@ -24,7 +24,7 @@ use routecore::bgp::{
 use serde::{ser::{SerializeSeq, SerializeStruct}, Serialize, Serializer};
 
 use crate::{
-    ingress::{self, register::{IdAndInfo, OwnedIdAndInfo}, IngressId, IngressInfo}, payload::{RotondaPaMap, RotondaPaMapWithQueryFilter, RotondaRoute, RouterId}, representation::{GenOutput, Json}, roto_runtime::{types::{RotoPackage}, Ctx}
+    ingress::{self, register::{IdAndInfo, OwnedIdAndInfo}, IngressId, IngressInfo}, payload::{PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter, RotondaRoute, RouterId}, representation::{GenOutput, Json}, roto_runtime::{types::{RotoPackage}, Ctx}
 };
 
 use super::{http_ng::Include, QueryFilter};
@@ -46,6 +46,7 @@ pub struct Rib {
     ingress_register: Arc<ingress::Register>,
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
+    path_attribute_interner: Arc<PathAttributeInterner>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -64,6 +65,7 @@ impl Rib {
             ingress_register,
             roto_package,
             roto_context,
+            path_attribute_interner: Arc::new(PathAttributeInterner::default()),
         })
     }
 
@@ -82,6 +84,7 @@ impl Rib {
         ltime: u64,
         ingress_id: IngressId,
         retain_withdrawn_attributes: bool,
+        deduplicate_path_attributes: bool,
     ) -> Result<UpsertReport, String> {
         let res = match val {
             RotondaRoute::Ipv4Unicast(n, ..) => self.insert_prefix(
@@ -92,6 +95,7 @@ impl Rib {
                 ltime,
                 ingress_id,
                 retain_withdrawn_attributes,
+                deduplicate_path_attributes,
             ),
             RotondaRoute::Ipv6Unicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -101,6 +105,7 @@ impl Rib {
                 ltime,
                 ingress_id,
                 retain_withdrawn_attributes,
+                deduplicate_path_attributes,
             ),
             RotondaRoute::Ipv4Multicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -110,6 +115,7 @@ impl Rib {
                 ltime,
                 ingress_id,
                 retain_withdrawn_attributes,
+                deduplicate_path_attributes,
             ),
             RotondaRoute::Ipv6Multicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -119,6 +125,7 @@ impl Rib {
                 ltime,
                 ingress_id,
                 retain_withdrawn_attributes,
+                deduplicate_path_attributes,
             ),
         };
         res.map_err(|e| e.to_string())
@@ -133,6 +140,7 @@ impl Rib {
         ltime: u64,
         ingress_id: IngressId,
         retain_withdrawn_attributes: bool,
+        deduplicate_path_attributes: bool,
     ) -> Result<UpsertReport, PrefixStoreError> {
         // Check whether our self.rib is Some(..) or bail out.
         let arc_store = match multicast.0 {
@@ -188,7 +196,12 @@ impl Rib {
             mui,
             ltime,
             route_status,
-            val.rotonda_pamap().clone(),
+            if deduplicate_path_attributes {
+                val.rotonda_pamap()
+                    .dedup_with(&self.path_attribute_interner)
+            } else {
+                val.rotonda_pamap().clone()
+            },
         );
 
         store.insert(

@@ -6,7 +6,12 @@ use routecore::bgp::types::AfiSafiType;
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 use smallvec::{smallvec, SmallVec};
-use std::fmt;
+use std::{
+    collections::{hash_map::DefaultHasher, HashMap},
+    fmt,
+    hash::{Hash, Hasher},
+    sync::{Arc, Mutex, Weak},
+};
 
 use crate::ingress::{self, IngressId, IngressInfo};
 use crate::roto_runtime::types::OutputStreamMessage;
@@ -150,7 +155,58 @@ pub struct RotondaPaMap{
     // raw[0] is RpkiInfo
     // raw[1] is PduParseInfo
     // raw[2..] contains the path attributes blob
-    raw: Vec<u8>,
+    raw: Arc<[u8]>,
+}
+
+#[derive(Debug)]
+pub struct PathAttributeInterner {
+    shards: Vec<Mutex<HashMap<u64, Vec<Weak<[u8]>>>>>,
+}
+
+impl Default for PathAttributeInterner {
+    fn default() -> Self {
+        const NUM_SHARDS: usize = 64;
+
+        Self {
+            shards: (0..NUM_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+        }
+    }
+}
+
+impl PathAttributeInterner {
+    pub fn intern(&self, raw: &[u8]) -> Arc<[u8]> {
+        let hash = hash_bytes(raw);
+        let shard_index = hash as usize % self.shards.len();
+        let mut shard = self.shards[shard_index].lock().unwrap();
+        let entries = shard.entry(hash).or_default();
+
+        let mut idx = 0;
+        while idx < entries.len() {
+            match entries[idx].upgrade() {
+                Some(existing) => {
+                    if existing.as_ref() == raw {
+                        return existing;
+                    }
+                    idx += 1;
+                }
+                None => {
+                    entries.swap_remove(idx);
+                }
+            }
+        }
+
+        let interned = Arc::<[u8]>::from(raw);
+        entries.push(Arc::downgrade(&interned));
+        interned
+    }
+}
+
+fn hash_bytes(raw: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    raw.hash(&mut hasher);
+    hasher.finish()
 }
 
 // These from/to byte functions should ideally live in routecore, but as we
@@ -187,11 +243,17 @@ impl RotondaPaMap {
         raw.push(ppi_to_byte(ppi));
 
         raw.append(&mut pas);
-        Self { raw }
+        Self { raw: raw.into() }
+    }
+
+    pub fn dedup_with(&self, interner: &PathAttributeInterner) -> Self {
+        Self {
+            raw: interner.intern(self.raw.as_ref()),
+        }
     }
 
     pub fn set_rpki_info(&mut self, rpki_info: RpkiInfo) {
-        self.raw[0] = rpki_info.into();
+        Arc::make_mut(&mut self.raw)[0] = rpki_info.into();
     }
 
     pub fn rpki_info(&self) -> RpkiInfo {
