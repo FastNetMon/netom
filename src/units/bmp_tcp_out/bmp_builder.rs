@@ -15,6 +15,7 @@ use crate::payload::{RotondaPaMap, RotondaRoute};
 
 // BMP message types (RFC 7854 Section 4.1)
 const BMP_MSG_ROUTE_MONITORING: u8 = 0;
+const BMP_MSG_STATISTICS_REPORT: u8 = 1;
 const BMP_MSG_PEER_DOWN: u8 = 2;
 const BMP_MSG_PEER_UP: u8 = 3;
 const BMP_MSG_INITIATION: u8 = 4;
@@ -441,6 +442,29 @@ pub fn build_route_monitoring_from_route(
     Some(build_route_monitoring(peer, prefix, pamap, is_withdrawal))
 }
 
+/// Build a BMP Statistics Report (RFC 7854 §4.8) for the given peer.
+///
+/// `body` is the opaque stats body received from upstream — the 4-byte
+/// stats count followed by stat TLVs. We rebuild only the BMP common
+/// header and per-peer header so the report is attributed to the correct
+/// re-streamed peer; the body is forwarded verbatim, preserving any
+/// vendor / RFC-extension stat TLVs.
+pub fn build_statistics_report(peer: &PeerInfo, body: &[u8]) -> Vec<u8> {
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + body.len();
+
+    let mut buf = Vec::with_capacity(total_len);
+    write_common_header(
+        &mut buf,
+        BMP_MSG_STATISTICS_REPORT,
+        total_len as u32,
+    );
+    write_per_peer_header(&mut buf, peer);
+    buf.extend_from_slice(body);
+
+    buf
+}
+
 /// Build a BMP Route Monitoring message representing an End-of-RIB marker for
 /// the given AFI/SAFI.
 ///
@@ -810,6 +834,42 @@ mod tests {
 
         let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
         assert_eq!(len as usize, msg.len());
+    }
+
+    #[test]
+    fn test_build_statistics_report() {
+        let peer = PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0x40,
+            peer_distinguisher: [0u8; 8],
+            peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: Asn::from_u32(65000),
+            peer_bgp_id: [0u8; 4],
+            admin_label: None,
+        };
+
+        // One stat TLV: type=0 (rejected prefixes), len=4, value=0x000000AA.
+        let body: &[u8] = &[
+            0x00, 0x00, 0x00, 0x01, // stats count = 1
+            0x00, 0x00, // stat type = 0
+            0x00, 0x04, // stat length = 4
+            0x00, 0x00, 0x00, 0xAA, // stat value
+        ];
+        let msg = build_statistics_report(&peer, body);
+
+        assert_eq!(msg[0], 3); // Version
+        assert_eq!(msg[5], 1); // Type = Statistics Report
+
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        assert_eq!(len as usize, msg.len());
+        assert_eq!(
+            msg.len(),
+            BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + body.len()
+        );
+
+        // Body must be appended verbatim after common + per-peer header.
+        let body_offset = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN;
+        assert_eq!(&msg[body_offset..], body);
     }
 
     #[test]

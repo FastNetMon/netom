@@ -1,6 +1,7 @@
 pub(crate) mod metrics;
 pub(crate) mod peer_config;
 pub(crate) mod router_handler;
+pub(crate) mod stats_builder;
 pub(crate) mod status_reporter;
 pub(crate) mod tcp_md5;
 

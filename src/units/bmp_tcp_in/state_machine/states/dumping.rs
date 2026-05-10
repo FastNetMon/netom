@@ -220,6 +220,8 @@ impl BmpStateDetails<Dumping> {
 
             BmpMsg::TerminationMessage(msg) => self.terminate(Some(msg)),
 
+            BmpMsg::StatisticsReport(msg) => self.statistics_report(msg),
+
             _ => {
                 // We ignore these. TODO: Should we count them?
                 self.mk_other_result()

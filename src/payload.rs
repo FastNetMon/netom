@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use rotonda_store::prefix_record::{Meta, RouteStatus};
 use routecore::bgp::message::PduParseInfo;
 use routecore::bgp::path_attributes::OwnedPathAttributes;
@@ -151,7 +152,7 @@ impl AsRef<[u8]> for RotondaPaMap {
 }
 
 #[derive(Debug, Default, Clone, Eq, PartialEq)]
-pub struct RotondaPaMap{
+pub struct RotondaPaMap {
     // raw[0] is RpkiInfo
     // raw[1] is PduParseInfo
     // raw[2..] contains the path attributes blob
@@ -227,7 +228,6 @@ fn byte_to_ppi(byte: u8) -> PduParseInfo {
     }
 }
 
-
 impl RotondaPaMap {
     pub fn empty_path_attributes() -> Self {
         OwnedPathAttributes::new(PduParseInfo::modern(), Vec::new()).into()
@@ -237,7 +237,7 @@ impl RotondaPaMap {
         let ppi = path_attributes.pdu_parse_info();
         let mut pas = path_attributes.into_vec();
         let mut raw = Vec::with_capacity(2 + pas.len());
-        
+
         let rpki_info = RpkiInfo::default();
         raw.push(rpki_info.into());
         raw.push(ppi_to_byte(ppi));
@@ -279,14 +279,24 @@ impl Serialize for RotondaPaMap {
     {
         let mut s = serializer.serialize_struct("route", 2)?;
         s.serialize_field("rpki", &self.rpki_info())?;
-        s.serialize_field("pathAttributes", &self.path_attributes().iter().flatten()
-            .filter(|pa| pa.type_code() != 15)
-            .flat_map(|pa| pa.to_owned()).collect::<Vec<_>>())?;
+        s.serialize_field(
+            "pathAttributes",
+            &self
+                .path_attributes()
+                .iter()
+                .flatten()
+                .filter(|pa| pa.type_code() != 15)
+                .flat_map(|pa| pa.to_owned())
+                .collect::<Vec<_>>(),
+        )?;
         s.end()
     }
 }
 
-pub struct RotondaPaMapWithQueryFilter<'a, 'b>(pub &'a RotondaPaMap, pub &'b QueryFilter);
+pub struct RotondaPaMapWithQueryFilter<'a, 'b>(
+    pub &'a RotondaPaMap,
+    pub &'b QueryFilter,
+);
 impl<'a, 'b> Serialize for RotondaPaMapWithQueryFilter<'a, 'b> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -294,12 +304,25 @@ impl<'a, 'b> Serialize for RotondaPaMapWithQueryFilter<'a, 'b> {
     {
         let mut s = serializer.serialize_struct("route", 2)?;
         s.serialize_field("rpki", &self.0.rpki_info())?;
-        s.serialize_field("pathAttributes", &self.0.path_attributes().iter().flatten()
-            .filter(|pa|
-                (self.1.fields_path_attributes.as_ref().map(|fpa| fpa.contains(&pa.type_code())).unwrap_or(true))
-                && pa.type_code() != 15
-                )
-            .flat_map(|pa| pa.to_owned()).collect::<Vec<_>>())?;
+        s.serialize_field(
+            "pathAttributes",
+            &self
+                .0
+                .path_attributes()
+                .iter()
+                .flatten()
+                .filter(|pa| {
+                    (self
+                        .1
+                        .fields_path_attributes
+                        .as_ref()
+                        .map(|fpa| fpa.contains(&pa.type_code()))
+                        .unwrap_or(true))
+                        && pa.type_code() != 15
+                })
+                .flat_map(|pa| pa.to_owned())
+                .collect::<Vec<_>>(),
+        )?;
         s.end()
     }
 }
@@ -391,6 +414,12 @@ pub enum Update {
 
     OutputStream(Box<SmallVec<[OutputStreamMessage; 2]>>),
     Rtr(crate::units::RtrUpdate),
+
+    // BMP Statistics Report forwarded verbatim from an upstream router.
+    // `body` is the raw bytes after the BMP per-peer header, i.e. the
+    // 4-byte stats count followed by stat TLVs. The downstream re-streamer
+    // re-prefixes a fresh common + per-peer header before sending.
+    PeerStats { ingress_id: IngressId, body: Bytes },
 }
 
 impl Update {
@@ -412,6 +441,7 @@ impl Update {
             Update::UpstreamStatusChange(_) => smallvec![],
             Update::OutputStream(..) => smallvec![],
             Update::Rtr(..) => smallvec![],
+            Update::PeerStats { .. } => smallvec![],
         }
     }
 }

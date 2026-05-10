@@ -26,7 +26,6 @@ use crate::targets::WaitPoint;
 // For low-traffic logging, make sure we flush to disk at least every N secs:
 const LAST_FLUSH_TIMEOUT_SECS: u64 = 1;
 
-
 #[derive(Debug, Deserialize)]
 pub struct File {
     #[serde(flatten)]
@@ -51,7 +50,6 @@ pub enum Format {
     JsonMin,
 }
 
-
 impl File {
     pub async fn run(
         self,
@@ -63,9 +61,7 @@ impl File {
             .run(self.sources, cmd, waitpoint)
             .await
     }
-
 }
-
 
 #[allow(dead_code)]
 pub struct FileRunner {
@@ -76,7 +72,6 @@ pub struct FileRunner {
     last_flush: Instant,
 }
 
-
 impl FileRunner {
     pub fn new(config: Config, component: Component) -> Self {
         let ingresses = component.ingresses().clone();
@@ -86,7 +81,6 @@ impl FileRunner {
             ingresses,
             target_file: None,
             last_flush: Instant::now(),
-
         }
     }
 
@@ -106,8 +100,7 @@ impl FileRunner {
         let f = tokio::fs::File::create(self.config.filename.clone())
             .await
             .inspect_err(|e| error!("{}", e))
-            .map_err(|_| Terminated)
-            ?;
+            .map_err(|_| Terminated)?;
 
         self.target_file = Some(BufWriter::new(f));
 
@@ -117,7 +110,7 @@ impl FileRunner {
         //for link in sources.iter_mut() {
         //    // DirectLink
         //    //link.connect(arc_self.clone(), false).await.unwrap();
-        //    
+        //
         //    link.connect(false).await.unwrap();
         //}
 
@@ -127,13 +120,19 @@ impl FileRunner {
         waitpoint.running().await;
 
         loop {
-            let select_fut = select(
-                cmd_rx.recv().boxed(),
-                sources.query().boxed(),
-            );
-            let select = match tokio::time::timeout(std::time::Duration::from_secs(LAST_FLUSH_TIMEOUT_SECS), select_fut).await {
+            let select_fut =
+                select(cmd_rx.recv().boxed(), sources.query().boxed());
+            let select = match tokio::time::timeout(
+                std::time::Duration::from_secs(LAST_FLUSH_TIMEOUT_SECS),
+                select_fut,
+            )
+            .await
+            {
                 Ok(select) => {
-                    if self.last_flush + Duration::from_secs(LAST_FLUSH_TIMEOUT_SECS) < Instant::now() {
+                    if self.last_flush
+                        + Duration::from_secs(LAST_FLUSH_TIMEOUT_SECS)
+                        < Instant::now()
+                    {
                         self.flush().await;
                     }
                     select
@@ -144,7 +143,7 @@ impl FileRunner {
                 }
             };
             match select {
-                Either::Left((gate_cmd, _)) => { 
+                Either::Left((gate_cmd, _)) => {
                     match gate_cmd {
                         Some(cmd) => match cmd {
                             TargetCommand::Reconfigure { .. } => {
@@ -161,19 +160,17 @@ impl FileRunner {
                                 //    self.status_reporter.metrics(),
                                 //);
                             }
-                            TargetCommand::Terminate => {
-                                break
-                            }
-                        }
-                        None => break
+                            TargetCommand::Terminate => break,
+                        },
+                        None => break,
                     }
                 }
                 Either::Right((update, _)) => {
                     let update = match update {
                         Ok(upd) => upd,
-                        Err(e) =>  {
+                        Err(e) => {
                             debug!("Gate error in file-out target: {}", e);
-                            break
+                            break;
                         }
                     };
 
@@ -182,8 +179,12 @@ impl FileRunner {
                             for m in *msgs {
                                 let m = m.into_record();
                                 if let Some(dst) = self.target_file.as_mut() {
-                                    if let OutputStreamMessageRecord::Entry(ref e) = m {
-                                        if let Some(ref custom_str) = e.custom {
+                                    if let OutputStreamMessageRecord::Entry(
+                                        ref e,
+                                    ) = m
+                                    {
+                                        if let Some(ref custom_str) = e.custom
+                                        {
                                             if e.timestamp != chrono::DateTime::UNIX_EPOCH {
                                                 dst.write_all(
                                                     format!(
@@ -192,21 +193,40 @@ impl FileRunner {
                                                     ).as_ref()
                                                 ).await.unwrap();
                                             }
-                                            dst.write_all(custom_str.as_ref()).await.unwrap();
-                                            dst.write_all(b"\n").await.unwrap();
+                                            dst.write_all(
+                                                custom_str.as_ref(),
+                                            )
+                                            .await
+                                            .unwrap();
+                                            dst.write_all(b"\n")
+                                                .await
+                                                .unwrap();
                                             continue;
-                                        } 
+                                        }
                                     }
                                     match self.config.format {
                                         Format::Csv => {
-                                            let mut wrt = csv::WriterBuilder::new().has_headers(false).from_writer(vec![]);
+                                            let mut wrt =
+                                                csv::WriterBuilder::new()
+                                                    .has_headers(false)
+                                                    .from_writer(vec![]);
                                             wrt.serialize(m).unwrap();
-                                            dst.write_all(&wrt.into_inner().unwrap()).await.unwrap();
+                                            dst.write_all(
+                                                &wrt.into_inner().unwrap(),
+                                            )
+                                            .await
+                                            .unwrap();
                                         }
                                         Format::Json => {
-                                            if let Ok(bytes) = serde_json::to_vec(&m) {
-                                                dst.write_all(&bytes).await.unwrap();
-                                                dst.write_all(b"\n").await.unwrap();
+                                            if let Ok(bytes) =
+                                                serde_json::to_vec(&m)
+                                            {
+                                                dst.write_all(&bytes)
+                                                    .await
+                                                    .unwrap();
+                                                dst.write_all(b"\n")
+                                                    .await
+                                                    .unwrap();
                                             }
                                         }
                                         Format::JsonMin => {
@@ -229,17 +249,17 @@ impl FileRunner {
                         }
 
                         // No action on any of the other Update types
-                        Update::Single(..) |
-                            Update::Bulk(..)  |
-                            Update::Withdraw(..)  |
-                            Update::WithdrawBulk(..)  |
-                            Update::IngressReappeared(..) |
-                            Update::UpstreamStatusChange(..) |
-                            Update::Rtr(..) =>  { }
+                        Update::Single(..)
+                        | Update::Bulk(..)
+                        | Update::Withdraw(..)
+                        | Update::WithdrawBulk(..)
+                        | Update::IngressReappeared(..)
+                        | Update::UpstreamStatusChange(..)
+                        | Update::Rtr(..)
+                        | Update::PeerStats { .. } => {}
                     }
                 }
             }
-
         }
         self.flush().await;
         Ok(())

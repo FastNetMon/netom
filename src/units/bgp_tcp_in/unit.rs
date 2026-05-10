@@ -32,7 +32,7 @@ use crate::common::net::{
 };
 use crate::roto_runtime::metrics::RotoMetricsWrapper;
 use crate::roto_runtime::types::{
-    RotoPackage, FilterName, RotoOutputStream, RotoScripts
+    FilterName, RotoOutputStream, RotoPackage, RotoScripts,
 };
 //use crate::common::roto::{FilterName, RotoScripts};
 use crate::common::status_reporter::{Chainable, UnitStatusReporter};
@@ -41,6 +41,8 @@ use crate::comms::{
     AnyDirectUpdate, DirectLink, DirectUpdate, GateStatus, Terminated,
 };
 use crate::ingress;
+use crate::ingress::peer_stats::BgpPeerStatsRegistry;
+use crate::ingress::IngressType;
 use crate::manager::{Component, WaitPoint};
 use crate::payload::Update;
 use crate::roto_runtime::{Ctx, MutIngressInfoCache};
@@ -62,8 +64,7 @@ pub(crate) type RotoFunc = roto::TypedFunc<
     fn(
         roto::Val<UpdateMessage<Bytes>>,
         roto::Val<MutIngressInfoCache>,
-    ) ->
-    roto::Verdict<(), ()>,
+    ) -> roto::Verdict<(), ()>,
 >;
 
 pub const ROTO_FUNC_FILTER_NAME: &str = "bgp_in";
@@ -83,8 +84,30 @@ pub struct BgpTcpIn {
 
     #[serde(default)]
     pub filter_name: FilterName,
+
+    /// Synthesize per-peer BMP Statistics Reports (RFC 7854 §4.8)
+    /// for native BGP sessions terminated by this unit. The reports
+    /// are emitted as `Update::PeerStats` so any downstream
+    /// `bmp_tcp_out` unit can deliver them to its receivers.
+    ///
+    /// Tri-state: `None` (the default — unset in the user's config)
+    /// gets auto-resolved at config-finalise time to `Some(true)`
+    /// iff a `bmp_tcp_out` unit exists in the same config, otherwise
+    /// `Some(false)`. An explicit `true` or `false` from the user is
+    /// preserved verbatim.
+    #[serde(default)]
+    pub synthesize_peer_stats: Option<bool>,
+
+    /// Cadence in seconds for synthesized Stats Reports. Ignored when
+    /// `synthesize_peer_stats` resolves to false.
+    #[serde(default = "default_peer_stats_interval_secs")]
+    pub peer_stats_interval_secs: u64,
     ///// Outgoing BGP UPDATEs can come from these sources.
     //pub sources: Vec<DirectLink>
+}
+
+fn default_peer_stats_interval_secs() -> u64 {
+    60
 }
 
 impl PartialEq for BgpTcpIn {
@@ -104,6 +127,8 @@ impl BgpTcpIn {
             my_bgp_id: Default::default(),
             peer_configs: Default::default(),
             filter_name: Default::default(),
+            synthesize_peer_stats: None,
+            peer_stats_interval_secs: default_peer_stats_interval_secs(),
             //sources: Vec::new(),
         }
     }
@@ -179,6 +204,7 @@ trait ConfigAcceptor {
         child_status_reporter: Arc<BgpTcpInStatusReporter>,
         live_sessions: Arc<Mutex<LiveSessions>>,
         ingresses: Arc<ingress::Register>,
+        peer_stats: Arc<BgpPeerStatsRegistry>,
         connector_ingress_id: ingress::IngressId,
     );
 }
@@ -187,7 +213,13 @@ pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub type LiveSessions = HashMap<
     (IpAddr, Asn),
-    (u64, AbortHandle, mpsc::Sender<Command>, mpsc::Sender<BgpMsg<Bytes>>, ingress::IngressId),
+    (
+        u64,
+        AbortHandle,
+        mpsc::Sender<Command>,
+        mpsc::Sender<BgpMsg<Bytes>>,
+        ingress::IngressId,
+    ),
 >;
 
 //#[derive(Debug)]
@@ -209,6 +241,8 @@ struct BgpTcpInRunner {
     live_sessions: Arc<Mutex<LiveSessions>>,
 
     ingresses: Arc<ingress::Register>,
+
+    peer_stats: Arc<BgpPeerStatsRegistry>,
 }
 
 // As long as roto::Compiled has no Debug impl, we cook up something simple
@@ -238,6 +272,7 @@ impl BgpTcpInRunner {
             roto_metrics,
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
             ingresses,
+            peer_stats: Arc::new(BgpPeerStatsRegistry::new()),
         }
     }
 
@@ -252,6 +287,7 @@ impl BgpTcpInRunner {
             status_reporter: Default::default(),
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
             ingresses: Arc::new(ingress::Register::default()),
+            peer_stats: Arc::new(BgpPeerStatsRegistry::new()),
             roto_compiled: None,
             roto_metrics: Default::default(),
         };
@@ -280,14 +316,61 @@ impl BgpTcpInRunner {
             link.connect(arc_self.clone(), false).await.unwrap();
         }
 
+        // Spawn the per-peer Stats Report emitter, if enabled.
+        // Reads only Arc-shared state, so it's independent of the
+        // connection-accept loop. Live reconfig of the interval
+        // requires a unit restart — the cadence is read once.
+        let stats_cfg = arc_self.bgp.load();
+        if stats_cfg.synthesize_peer_stats.unwrap_or(false) {
+            let interval_secs = stats_cfg.peer_stats_interval_secs.max(1);
+            let peer_stats = arc_self.peer_stats.clone();
+            let ingresses = arc_self.ingresses.clone();
+            let gate = arc_self.gate.clone();
+            crate::tokio::spawn("bgp-in-peer-stats-emitter", async move {
+                let mut iv = tokio::time::interval(Duration::from_secs(
+                    interval_secs,
+                ));
+                // Consume the immediate first tick so we wait
+                // a full interval before the first emission —
+                // peers usually need a few seconds to come up.
+                iv.tick().await;
+                loop {
+                    iv.tick().await;
+                    for (id, snap) in peer_stats.snapshot_all() {
+                        // Skip peers whose ingress is gone or
+                        // disconnected — emitting for those would
+                        // produce stats with no peer-up context at
+                        // the receiver.
+                        match ingresses.get(id) {
+                            Some(info)
+                                if info.state
+                                    == Some(crate::ingress::register::IngressState::Connected)
+                                    && info.ingress_type
+                                        == Some(IngressType::Bgp) => {}
+                            _ => continue,
+                        }
+                        let body = super::stats_builder::build_stats_body(
+                            &snap,
+                        );
+                        gate.update_data(Update::PeerStats {
+                            ingress_id: id,
+                            body,
+                        })
+                        .await;
+                    }
+                }
+            });
+        }
+        drop(stats_cfg);
+
         let roto_function: Option<RotoFunc> =
             arc_self.roto_compiled.clone().and_then(|c| {
                 let mut c = c.lock().unwrap();
                 c.get_function(ROTO_FUNC_FILTER_NAME)
-                .inspect_err(|_|
-                    warn!("Loaded Roto script has no filter for bgp-in")
-                )
-                .ok()
+                    .inspect_err(|_| {
+                        warn!("Loaded Roto script has no filter for bgp-in")
+                    })
+                    .ok()
             });
 
         let mut roto_context = Ctx::empty();
@@ -376,6 +459,7 @@ impl BgpTcpInRunner {
                                 child_status_reporter,
                                 arc_self.live_sessions.clone(),
                                 arc_self.ingresses.clone(),
+                                arc_self.peer_stats.clone(),
                                 // Tentative register() — the real find_existing check
                                 // happens at SessionNegotiated time in router_handler,
                                 // where we know the remote ASN and can reuse an
@@ -479,13 +563,13 @@ impl BgpTcpInRunner {
             };
             let (addr, prefix_len) = match remote {
                 PrefixOrExact::Exact(addr) => (*addr, None),
-                PrefixOrExact::Prefix(prefix) => (prefix.addr(), Some(prefix.len())),
+                PrefixOrExact::Prefix(prefix) => {
+                    (prefix.addr(), Some(prefix.len()))
+                }
             };
-            if let Err(err) = listener.configure_md5(
-                addr,
-                prefix_len,
-                md5_key.as_bytes(),
-            ) {
+            if let Err(err) =
+                listener.configure_md5(addr, prefix_len, md5_key.as_bytes())
+            {
                 error!(
                     "Failed to configure TCP MD5 on listener for {}: {}",
                     addr, err
@@ -620,6 +704,7 @@ impl ConfigAcceptor for BgpTcpInRunner {
         child_status_reporter: Arc<BgpTcpInStatusReporter>,
         live_sessions: Arc<Mutex<LiveSessions>>,
         ingresses: Arc<ingress::Register>,
+        peer_stats: Arc<BgpPeerStatsRegistry>,
         connector_ingress_id: ingress::IngressId,
     ) {
         let (cmds_tx, cmds_rx) = mpsc::channel(10 * 10); //XXX this is limiting and
@@ -664,6 +749,7 @@ impl ConfigAcceptor for BgpTcpInRunner {
                 child_status_reporter,
                 live_sessions,
                 ingresses,
+                peer_stats,
                 connector_ingress_id,
                 abort_handle_clone,
             ),
@@ -686,19 +772,21 @@ mod tests {
     use inetnum::asn::Asn;
 
     use crate::{
-        common::{
-            net::TcpStreamWrapper,
-            status_reporter::AnyStatusReporter,
-        }, comms::{Gate, GateAgent, Terminated}, ingress, roto_runtime::types::RotoScripts, tests::util::{
+        common::{net::TcpStreamWrapper, status_reporter::AnyStatusReporter},
+        comms::{Gate, GateAgent, Terminated},
+        ingress,
+        roto_runtime::types::RotoScripts,
+        tests::util::{
             internal::get_testable_metrics_snapshot,
             net::{
                 MockTcpListener, MockTcpListenerFactory, MockTcpStreamWrapper,
             },
-        }, units::bgp_tcp_in::{
+        },
+        units::bgp_tcp_in::{
             peer_config::{PeerConfig, PrefixOrExact},
             status_reporter::BgpTcpInStatusReporter,
             unit::{BgpTcpIn, BgpTcpInRunner, ConfigAcceptor, LiveSessions},
-        }
+        },
     };
 
     use super::RotoFunc;
@@ -869,6 +957,7 @@ mod tests {
             _child_status_reporter: Arc<BgpTcpInStatusReporter>,
             _live_sessions: Arc<std::sync::Mutex<LiveSessions>>,
             _ingressess: Arc<ingress::Register>,
+            _peer_stats: Arc<crate::ingress::peer_stats::BgpPeerStatsRegistry>,
             _connector_ingress_id: ingress::IngressId,
         ) {
         }

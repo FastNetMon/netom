@@ -114,7 +114,6 @@ impl BmpTcpInStatusReporter {
             .num_invalid_bmp_messages
             .fetch_add(1, SeqCst);
     }
-
 }
 
 impl UnitStatusReporter for BmpTcpInStatusReporter {}

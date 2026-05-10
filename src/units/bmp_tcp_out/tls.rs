@@ -2,8 +2,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use log::info;
-use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::ServerConfig;
 use sha2::{Digest, Sha256};
 use tokio_rustls::TlsAcceptor;
 
@@ -15,7 +15,9 @@ pub fn build_tls_acceptor(
     listen_addr: &SocketAddr,
 ) -> Result<TlsAcceptor, String> {
     let (certs, key) = match (tls_cert, tls_key) {
-        (Some(cert_path), Some(key_path)) => load_pem_files(cert_path, key_path)?,
+        (Some(cert_path), Some(key_path)) => {
+            load_pem_files(cert_path, key_path)?
+        }
         _ => {
             let (cert, key) = generate_self_signed(listen_addr);
             log_certificate_fingerprint(cert.as_ref());
@@ -40,10 +42,12 @@ fn load_pem_files(
     cert_path: &str,
     key_path: &str,
 ) -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>), String> {
-    let cert_data = std::fs::read(cert_path)
-        .map_err(|e| format!("Failed to read TLS certificate file '{}': {}", cert_path, e))?;
-    let key_data = std::fs::read(key_path)
-        .map_err(|e| format!("Failed to read TLS key file '{}': {}", key_path, e))?;
+    let cert_data = std::fs::read(cert_path).map_err(|e| {
+        format!("Failed to read TLS certificate file '{}': {}", cert_path, e)
+    })?;
+    let key_data = std::fs::read(key_path).map_err(|e| {
+        format!("Failed to read TLS key file '{}': {}", key_path, e)
+    })?;
 
     let certs: Vec<CertificateDer<'static>> =
         rustls_pemfile::certs(&mut cert_data.as_slice())
@@ -51,10 +55,7 @@ fn load_pem_files(
             .map_err(|e| format!("Failed to parse certificate PEM: {e}"))?;
 
     if certs.is_empty() {
-        return Err(format!(
-            "No certificates found in '{}'",
-            cert_path
-        ));
+        return Err(format!("No certificates found in '{}'", cert_path));
     }
 
     let key = rustls_pemfile::private_key(&mut key_data.as_slice())
@@ -81,16 +82,15 @@ fn generate_self_signed(
             .subject_alt_names
             .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
     } else {
-        params
-            .subject_alt_names
-            .push(rcgen::SanType::IpAddress(ip));
+        params.subject_alt_names.push(rcgen::SanType::IpAddress(ip));
     }
 
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2035, 1, 1);
 
-    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-        .expect("key generation should not fail");
+    let key_pair =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("key generation should not fail");
     let cert = params
         .self_signed(&key_pair)
         .expect("self-signed certificate generation should not fail");

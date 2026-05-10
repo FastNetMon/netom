@@ -26,7 +26,7 @@ pub(crate) mod bmp_tcp_out;
 mod mrt_file_in;
 pub(crate) mod rib_unit;
 pub use bmp_tcp_in::unit::TracingMode;
-pub use rib_unit:: unit:: RibUnit;
+pub use rib_unit::unit::RibUnit;
 pub mod rtr;
 pub use rtr::client::RtrUpdate;
 

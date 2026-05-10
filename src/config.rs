@@ -133,11 +133,13 @@ impl Config {
     }
 
     fn finalise(
-        self,
+        mut self,
         config_file: ConfigFile,
         manager: &mut Manager,
     ) -> Result<(Source, Self), Terminate> {
         self.log.switch_logging(false)?;
+
+        self.auto_enable_peer_stats_synthesis();
 
         if log::log_enabled!(log::Level::Trace) {
             trace!("After processing the config file looks like this:");
@@ -150,6 +152,27 @@ impl Config {
         // the caller so that they can monitor it for changes while the
         // application is running.
         Ok((config_file.source, self))
+    }
+
+    /// Resolve the tri-state `synthesize_peer_stats` flag on every
+    /// `BgpTcpIn` unit: if the user didn't set it, default it to
+    /// `true` when at least one `BmpTcpOut` unit is present in the
+    /// same config (since that's the consumer that benefits), and
+    /// `false` otherwise. Explicit user values are left untouched.
+    fn auto_enable_peer_stats_synthesis(&mut self) {
+        use crate::units::Unit;
+        let has_bmp_out = self
+            .units
+            .units()
+            .values()
+            .any(|u| matches!(u, Unit::BmpTcpOut(_)));
+        for unit in self.units.units_mut().values_mut() {
+            if let Unit::BgpTcpIn(bgp) = unit {
+                if bgp.synthesize_peer_stats.is_none() {
+                    bgp.synthesize_peer_stats = Some(has_bmp_out);
+                }
+            }
+        }
     }
 }
 
@@ -370,15 +393,14 @@ impl ConfigFile {
         // this expansion capability to give at least some verification that
         // it is not obviously broken, but it's not enough.
         let config_str = String::from_utf8_lossy(&bytes);
-        let toml: Value =
-            if let Ok(toml) = toml::de::from_str(&config_str) {
-                toml
-            } else {
-                return Err(io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Cannot parse config file",
-                ));
-            };
+        let toml: Value = if let Ok(toml) = toml::de::from_str(&config_str) {
+            toml
+        } else {
+            return Err(io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Cannot parse config file",
+            ));
+        };
 
         let config_str = toml::to_string(&toml).unwrap();
 

@@ -6,8 +6,8 @@ use tokio::net::{TcpListener, TcpStream};
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
-use crate::common::net::StandardTcpListener;
 use super::ListenerMd5Config;
+use crate::common::net::StandardTcpListener;
 
 #[cfg(target_os = "linux")]
 const TCP_MD5SIG_MAXKEYLEN: usize = 80;
@@ -28,8 +28,7 @@ struct TcpMd5Sig {
 
 #[cfg(target_os = "linux")]
 fn sockaddr_storage_from_ip(addr: IpAddr) -> libc::sockaddr_storage {
-    let mut storage: libc::sockaddr_storage =
-        unsafe { std::mem::zeroed() };
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
 
     match addr {
         IpAddr::V4(ip) => {
@@ -54,7 +53,9 @@ fn sockaddr_storage_from_ip(addr: IpAddr) -> libc::sockaddr_storage {
                 sin6_family: libc::AF_INET6 as libc::sa_family_t,
                 sin6_port: 0,
                 sin6_flowinfo: 0,
-                sin6_addr: libc::in6_addr { s6_addr: ip.octets() },
+                sin6_addr: libc::in6_addr {
+                    s6_addr: ip.octets(),
+                },
                 sin6_scope_id: 0,
             };
             unsafe {
@@ -79,9 +80,7 @@ fn configure_md5_fd(
 ) -> io::Result<()> {
     let family = listener_family(fd)?;
     match (family, addr) {
-        (val, IpAddr::V6(_))
-            if val == libc::AF_INET as libc::sa_family_t =>
-        {
+        (val, IpAddr::V6(_)) if val == libc::AF_INET as libc::sa_family_t => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "TCP listener is IPv4, cannot set TCP MD5 for IPv6 peer",
@@ -142,10 +141,9 @@ fn configure_md5_fd(
 
 #[cfg(target_os = "linux")]
 fn listener_family(fd: libc::c_int) -> io::Result<libc::sa_family_t> {
-    let mut storage: libc::sockaddr_storage =
-        unsafe { std::mem::zeroed() };
-    let mut len = std::mem::size_of::<libc::sockaddr_storage>()
-        as libc::socklen_t;
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len =
+        std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     let ret = unsafe {
         libc::getsockname(
             fd,

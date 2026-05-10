@@ -1835,9 +1835,10 @@ mod tests {
     use tokio::sync::Notify;
 
     use crate::{
-        payload::Payload, tests::util::internal::{
+        payload::Payload,
+        tests::util::internal::{
             enable_logging, get_testable_metrics_snapshot,
-        }
+        },
     };
 
     use super::*;
@@ -1846,9 +1847,12 @@ mod tests {
     async fn gate_link_lifecycle_test() {
         use std::str::FromStr;
 
-        use routecore::bgp::{message::PduParseInfo, nlri::afisafi::Ipv4UnicastNlri, path_attributes::OwnedPathAttributes};
+        use routecore::bgp::{
+            message::PduParseInfo, nlri::afisafi::Ipv4UnicastNlri,
+            path_attributes::OwnedPathAttributes,
+        };
 
-        use crate::{payload::{RotondaPaMap, RotondaRoute}};
+        use crate::payload::{RotondaPaMap, RotondaRoute};
 
         // Lifecycle of a connected gate and link:
         //
@@ -1918,17 +1922,14 @@ mod tests {
             Payload::new(
                 RotondaRoute::Ipv4Unicast(
                     Ipv4UnicastNlri::from_str("1.2.3.0/24").unwrap(),
-                    RotondaPaMap::new(
-                        OwnedPathAttributes::new(
-                            PduParseInfo::modern(),
-                            vec![]
-                        )
-                    )
+                    RotondaPaMap::new(OwnedPathAttributes::new(
+                        PduParseInfo::modern(),
+                        vec![],
+                    )),
                 ),
                 None,
                 1234, // IngressId
                 RouteStatus::Active,
-
             )
         }
 
@@ -2002,8 +2003,10 @@ mod tests {
         link.connect(false).await.unwrap();
 
         // Build an update to send
-        let update =
-            Update::Bulk(Box::new(smallvec![mk_test_payload(), mk_test_payload()]));
+        let update = Update::Bulk(Box::new(smallvec![
+            mk_test_payload(),
+            mk_test_payload()
+        ]));
 
         // Send the update through the gate
         eprintln!("SENDING PAYLOAD");

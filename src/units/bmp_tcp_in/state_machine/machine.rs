@@ -41,7 +41,7 @@ use routecore::{
     bmp::message::{
         InformationTlvType, InitiationMessage, Message as BmpMsg,
         PeerDownNotification, PeerUpNotification, PerPeerHeader, RibType,
-        RouteMonitoring,
+        RouteMonitoring, StatisticsReport,
     },
 };
 //use roto::types::builtin::ingress::IngressId;
@@ -671,6 +671,36 @@ where
                 Some(Bytes::copy_from_slice(msg.as_ref())),
             )
         }
+    }
+
+    /// Forward an upstream BMP Statistics Report (RFC 7854 §4.8) as a
+    /// downstream `Update::PeerStats`. The stats body (4-byte count +
+    /// stat TLVs) is sliced out of the message verbatim. The downstream
+    /// re-streamer rebuilds the common + per-peer header so the report
+    /// is attributed to the correct re-streamed peer.
+    ///
+    /// If the per-peer header doesn't map to a known peer (no PeerUp
+    /// processed yet, or peer was already torn down), the report is
+    /// dropped via `mk_other_result`.
+    pub fn statistics_report(
+        self,
+        msg: StatisticsReport<Bytes>,
+    ) -> ProcessingResult {
+        let pph = msg.per_peer_header();
+        let Some(ingress_id) = self.details.get_peer_ingress_id(&pph) else {
+            return self.mk_other_result();
+        };
+
+        // BMP layout: common header (6) + per-peer header (42) + body.
+        // Stats reports are infrequent and short, so a copy here is fine.
+        let raw: &[u8] = msg.as_ref();
+        const BODY_OFFSET: usize = 6 + 42;
+        if raw.len() < BODY_OFFSET {
+            return self.mk_other_result();
+        }
+        let body = Bytes::copy_from_slice(&raw[BODY_OFFSET..]);
+
+        self.mk_routing_update_result(Update::PeerStats { ingress_id, body })
     }
 
     /*

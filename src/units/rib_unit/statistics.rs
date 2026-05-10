@@ -54,7 +54,6 @@ pub struct RibMergeUpdateStatistics {
     other: RwLock<TimingBuckets>,
 }
 
-
 impl std::fmt::Display for RibMergeUpdateStatistics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(

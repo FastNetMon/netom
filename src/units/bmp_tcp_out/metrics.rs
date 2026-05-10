@@ -25,7 +25,9 @@ pub struct BmpTcpOutMetrics {
 
 impl GraphStatus for BmpTcpOutMetrics {
     fn status_text(&self) -> String {
-        let num_clients = self.clients_connected.load(SeqCst)
+        let num_clients = self
+            .clients_connected
+            .load(SeqCst)
             .saturating_sub(self.clients_disconnected.load(SeqCst));
         let num_msgs = self.messages_sent.load(SeqCst);
         format!("clients: {}\nmsgs sent: {}", num_clients, num_msgs)

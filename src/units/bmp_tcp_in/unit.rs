@@ -30,24 +30,29 @@ use crate::{
         },
         status_reporter::Chainable,
         unit::UnitActivity,
-    }, comms::{Gate, GateStatus, Terminated}, ingress::{self, IngressId, IngressInfo}, manager::{Component, WaitPoint}, payload::Update, roto_runtime::{
-        metrics::RotoMetricsWrapper, types::{
-            FilterName, RotoOutputStream, RotoPackage, RotoScripts
-        }, Ctx, MutIngressInfoCache
-    }, tokio::TokioTaskMetrics, tracing::Tracer, units::Unit
+    },
+    comms::{Gate, GateStatus, Terminated},
+    ingress::{self, IngressId, IngressInfo},
+    manager::{Component, WaitPoint},
+    payload::Update,
+    roto_runtime::{
+        metrics::RotoMetricsWrapper,
+        types::{FilterName, RotoOutputStream, RotoPackage, RotoScripts},
+        Ctx, MutIngressInfoCache,
+    },
+    tokio::TokioTaskMetrics,
+    tracing::Tracer,
+    units::Unit,
 };
 
-use super::{
-    state_machine::{BmpState, BmpStateMachineMetrics},
-    types::RouterInfo,
-};
 use super::{
     metrics::BmpTcpInMetrics, router_handler::RouterHandler,
     status_reporter::BmpTcpInStatusReporter, util::format_source_id,
 };
-
-
-
+use super::{
+    state_machine::{BmpState, BmpStateMachineMetrics},
+    types::RouterInfo,
+};
 
 //-------- BmpIn -------------------------------------------------------------
 
@@ -94,11 +99,10 @@ impl std::fmt::Display for TracingMode {
 
 pub(crate) type RotoFunc = roto::TypedFunc<
     Ctx,
-    fn (
+    fn(
         roto::Val<BmpMessage<Bytes>>,
-        roto::Val<MutIngressInfoCache>
-    ) ->
-    roto::Verdict<(), ()>,
+        roto::Val<MutIngressInfoCache>,
+    ) -> roto::Verdict<(), ()>,
 >;
 
 pub const ROTO_FUNC_FILTER_NAME: &str = "bmp_in";
@@ -353,10 +357,10 @@ impl BmpTcpInRunner {
             self.roto_compiled.clone().and_then(|c| {
                 let mut c = c.lock().unwrap();
                 c.get_function(ROTO_FUNC_FILTER_NAME)
-                .inspect_err(|_|
-                    warn!("Loaded Roto script has no filter for bmp-in")
-                )
-                .ok()
+                    .inspect_err(|_| {
+                        warn!("Loaded Roto script has no filter for bmp-in")
+                    })
+                    .ok()
             });
 
         let mut roto_context = Ctx::empty();
@@ -407,30 +411,41 @@ impl BmpTcpInRunner {
             'inner: loop {
                 match self.process_until(listener.accept()).await {
                     ControlFlow::Continue(Ok((tcp_stream, client_addr))) => {
-
                         let query_ingress = IngressInfo::new()
                             .with_parent_ingress(unit_ingress_id)
                             .with_remote_addr(client_addr.ip())
-                            .with_ingress_type(ingress::IngressType::Bmp)
-                        ;
+                            .with_ingress_type(ingress::IngressType::Bmp);
                         let router_ingress_id;
                         // TODO the check for existing routers needs to go to where the
                         // InitiationMessage is processed. There we have the sysName/sysDesc.
                         // We can't fill up `query_ingress` appropriately here.
                         // So, this check _and_ the .register() needs to go into initiating.rs
-                        if let Some((ingress_id, _ingress_info)) = self.ingress_register.find_existing_bmp_router(&query_ingress) {
+                        if let Some((ingress_id, _ingress_info)) = self
+                            .ingress_register
+                            .find_existing_bmp_router(&query_ingress)
+                        {
                             router_ingress_id = ingress_id;
-                            self.gate.update_data(Update::IngressReappeared(ingress_id)).await;
+                            self.gate
+                                .update_data(Update::IngressReappeared(
+                                    ingress_id,
+                                ))
+                                .await;
                         } else {
-                            router_ingress_id = self.ingress_register.register();
-                            self.ingress_register.update_info(router_ingress_id, query_ingress);
+                            router_ingress_id =
+                                self.ingress_register.register();
+                            self.ingress_register.update_info(
+                                router_ingress_id,
+                                query_ingress,
+                            );
                         }
 
                         let state_machine = Arc::new(Mutex::new(Some(
                             self.router_connected(router_ingress_id),
                         )));
 
-                        let last_msg_at = Some(Arc::new(std::sync::RwLock::new(Utc::now())));
+                        let last_msg_at = Some(Arc::new(
+                            std::sync::RwLock::new(Utc::now()),
+                        ));
 
                         self.router_states
                             .insert(router_ingress_id, state_machine.clone());
@@ -476,7 +491,6 @@ impl BmpTcpInRunner {
                             router_handler,
                             tcp_stream,
                             client_addr,
-
                             router_ingress_id,
                             &self.router_states,
                             &self.router_info,

@@ -1,16 +1,16 @@
 //! Controlling the entire operation.
 
 use crate::common::file_io::TheFileIo;
-use crate::http_ng;
-use crate::roto_runtime::metrics::RotoMetricsWrapper;
-use crate::roto_runtime::types::FilterName;
-use crate::roto_runtime::types::RotoPackage;
-use crate::roto_runtime::create_runtime;
 use crate::comms::{
     DirectLink, Gate, GateAgent, GraphStatus, Link, DEF_UPDATE_QUEUE_LEN,
 };
 use crate::config::{Config, ConfigFile, Marked};
+use crate::http_ng;
 use crate::log::Terminate;
+use crate::roto_runtime::create_runtime;
+use crate::roto_runtime::metrics::RotoMetricsWrapper;
+use crate::roto_runtime::types::FilterName;
+use crate::roto_runtime::types::RotoPackage;
 use crate::targets::Target;
 use crate::tracing::Tracer;
 use crate::units::Unit;
@@ -112,13 +112,10 @@ impl Component {
         self.type_name
     }
 
-
-    pub fn roto_package(
-        &self,
-    ) -> &Option<Arc<RotoPackage>> {
+    pub fn roto_package(&self) -> &Option<Arc<RotoPackage>> {
         &self.roto_package
     }
-    
+
     pub fn roto_metrics(&self) -> &Option<Arc<RotoMetricsWrapper>> {
         &self.roto_metrics
     }
@@ -222,7 +219,6 @@ impl LinkReport {
     fn get_gate_id(&self, name: &str) -> Option<Uuid> {
         self.gates.get(name).copied()
     }
-
 }
 
 #[derive(Clone, Default)]
@@ -378,11 +374,15 @@ impl Manager {
         let ingresses = Arc::new(ingress::Register::new());
         let metrics: metrics::Collection = Default::default();
         let roto_metrics = Some(Arc::new(RotoMetricsWrapper::default()));
-        metrics.register("roto_metrics".into(), Arc::downgrade(roto_metrics.as_ref().unwrap()) as Weak<dyn metrics::Source>);
+        metrics.register(
+            "roto_metrics".into(),
+            Arc::downgrade(roto_metrics.as_ref().unwrap())
+                as Weak<dyn metrics::Source>,
+        );
         let http_ng_api = Arc::new(Mutex::new(http_ng::Api::new(
             Vec::with_capacity(1), // interfaces come from config, later on
             ingresses.clone(),
-            metrics.clone()
+            metrics.clone(),
         )));
 
         #[allow(
@@ -626,7 +626,7 @@ impl Manager {
         };
 
         let i = roto::FileTree::read(path);
-            // .map_err(|e| e.to_string())?;
+        // .map_err(|e| e.to_string())?;
         let roto_package = i
             .compile(&create_runtime().unwrap())
             .map_err(|e| e.to_string())?;
@@ -1067,7 +1067,7 @@ impl Manager {
             // to listen on, which does not happen here currently.
             // By doing that in the signal handler in main.rs, we effectively reload the http
             // servers twice, which is not nice.
-            
+
             arc_api.lock().unwrap().restart();
         });
     }
@@ -1183,19 +1183,22 @@ impl Manager {
 
     /// Reload the HTTP configuration (listening interfaces)
     pub fn reload_http_ng_config(&mut self, config: &Config) {
-        if let Ok(mut lock) = self.http_ng_api.lock(){
-           lock.set_interfaces(config.http_ng_listen.clone().into_iter().flatten());
+        if let Ok(mut lock) = self.http_ng_api.lock() {
+            lock.set_interfaces(
+                config.http_ng_listen.clone().into_iter().flatten(),
+            );
         }
     }
 
     /// Restart the HTTP API based on the passed Rotonda `Config`
     pub fn restart_http_ng_with_config(&mut self, config: &Config) {
-        if let Ok(mut lock) = self.http_ng_api.lock(){
-           lock.set_interfaces(config.http_ng_listen.clone().into_iter().flatten());
-           lock.restart();
+        if let Ok(mut lock) = self.http_ng_api.lock() {
+            lock.set_interfaces(
+                config.http_ng_listen.clone().into_iter().flatten(),
+            );
+            lock.restart();
         }
     }
-
 }
 
 //------------ Checkpoint ----------------------------------------------------
@@ -1344,6 +1347,10 @@ pub struct UnitSet {
 impl UnitSet {
     pub fn units(&self) -> &HashMap<String, Unit> {
         &self.units
+    }
+
+    pub fn units_mut(&mut self) -> &mut HashMap<String, Unit> {
+        &mut self.units
     }
 }
 

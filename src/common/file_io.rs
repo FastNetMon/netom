@@ -1,5 +1,5 @@
 //! Support for dumping of BMP messages to files for diagnostic purposes.
-//! 
+//!
 
 use std::path::Path;
 
@@ -48,10 +48,7 @@ pub trait FileIo: Default {
 #[cfg(not(test))]
 mod fileio {
     //! Filesystem I/O.
-    use std::{
-        io::Error,
-        path::Path,
-    };
+    use std::{io::Error, path::Path};
 
     use async_trait::async_trait;
     use tokio::io::AsyncWrite;
@@ -109,9 +106,10 @@ mod fileio {
             path: P,
         ) -> std::io::Result<String> {
             std::fs::read_to_string(path.as_ref()).map_err(|err| {
-                Error::other(
-                    format!("For path '{}': {err}", path.as_ref().display()),
-                )
+                Error::other(format!(
+                    "For path '{}': {err}",
+                    path.as_ref().display()
+                ))
             })
         }
 

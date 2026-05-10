@@ -638,6 +638,12 @@ impl RibUnitRunner {
                 self.gate.update_data(update).await;
             }
 
+            Update::PeerStats { .. } => {
+                // BMP Statistics Report — not a route, no RIB work to do.
+                // Forward to downstream so bmp-tcp-out can re-stream it.
+                self.gate.update_data(update).await;
+            }
+
             Update::Rtr(rtr_update) => {
                 use crate::units::RtrUpdate;
                 use rpki::rtr::Payload as RtrPayload;
@@ -675,7 +681,7 @@ impl RibUnitRunner {
                                             include_withdrawn: false,
                                             include_less_specifics: false,
                                             include_more_specifics: false,
-                                            mui: Some(u32::from(asn)), 
+                                            mui: Some(u32::from(asn)),
                                             include_history: IncludeHistory::None,
                                         },
                                         guard,
@@ -796,7 +802,7 @@ impl RibUnitRunner {
                                             include_withdrawn: false,
                                             include_less_specifics: false,
                                             include_more_specifics: false,
-                                            mui: Some(u32::from(asn)), 
+                                            mui: Some(u32::from(asn)),
                                             include_history: rotonda_store::match_options::IncludeHistory::None,
                                         },
                                         guard,
@@ -827,7 +833,7 @@ impl RibUnitRunner {
                                             if !set.insert(route_origin) {
                                                 warn!("VRP for {}-{} from{} already in HashSet", prefix, maxlen, asn);
                                             }
-                                            
+
                                         }
                                         RtrAction::Withdraw => {
                                             let mut dbg = false;

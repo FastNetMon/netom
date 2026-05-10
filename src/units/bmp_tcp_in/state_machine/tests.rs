@@ -113,8 +113,24 @@ fn statistics_report() {
     let res =
         processor.process_msg(Instant::now(), stats_report_msg_buf, None);
 
-    // Then
-    assert!(matches!(res.message_type, MessageType::Other));
+    // Then we forward the report verbatim as Update::PeerStats so
+    // bmp-tcp-out can re-stream it to its clients.
+    let MessageType::RoutingUpdate { ref update } = res.message_type else {
+        panic!(
+            "expected RoutingUpdate {{ Update::PeerStats }}, got {:?}",
+            res.message_type
+        );
+    };
+    let Update::PeerStats {
+        ingress_id: _,
+        body,
+    } = update
+    else {
+        panic!("expected Update::PeerStats, got {:?}", update);
+    };
+    // Body is the raw stats body — for a zero-count report that's just
+    // the 4-byte count field (no TLVs).
+    assert_eq!(&body[..], &0u32.to_be_bytes());
     assert!(matches!(res.next_state, BmpState::Dumping(_)));
 
     // Check the metrics

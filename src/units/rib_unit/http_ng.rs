@@ -1,30 +1,56 @@
-use std::{fmt::Display, io, net::{IpAddr, Ipv4Addr, Ipv6Addr}};
 use std::io::Write;
+use std::{
+    fmt::Display,
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+};
 
-use axum::{body::Body, extract::{Path, Query, State}, response::IntoResponse};
+use axum::{
+    body::Body,
+    extract::{Path, Query, State},
+    response::IntoResponse,
+};
 use bytes::Bytes;
 use inetnum::{addr::Prefix, asn::Asn};
 use log::{debug, warn};
-use routecore::{bgp::{communities::{LargeCommunity, StandardCommunity}, path_attributes::PathAttributeType, types::AfiSafiType}, bmp::message::RibType};
+use routecore::{
+    bgp::{
+        communities::{LargeCommunity, StandardCommunity},
+        path_attributes::PathAttributeType,
+        types::AfiSafiType,
+    },
+    bmp::message::RibType,
+};
 use serde::Deserialize;
-use serde_with::serde_as;
 use serde_with::formats::CommaSeparator;
+use serde_with::serde_as;
 use serde_with::StringWithSeparator;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::{http_ng::{Api, ApiError, ApiState}, ingress::IngressId, representation::{GenOutput, Json}, roto_runtime::types::PeerRibType, units::rib_unit::rpki::RovStatus};
+use crate::{
+    http_ng::{Api, ApiError, ApiState},
+    ingress::IngressId,
+    representation::{GenOutput, Json},
+    roto_runtime::types::PeerRibType,
+    units::rib_unit::rpki::RovStatus,
+};
 
 /// Add ingress register specific endpoints to a HTTP API
 pub fn register_routes(router: &mut Api) {
-    router.add_get("/ribs/ipv4unicast/routes/{prefix}/{prefix_len}", search_ipv4unicast);
+    router.add_get(
+        "/ribs/ipv4unicast/routes/{prefix}/{prefix_len}",
+        search_ipv4unicast,
+    );
     router.add_get("/ribs/ipv4unicast/routes", search_ipv4unicast_all);
-    router.add_get("/ribs/ipv6unicast/routes/{prefix}/{prefix_len}", search_ipv6unicast);
+    router.add_get(
+        "/ribs/ipv6unicast/routes/{prefix}/{prefix_len}",
+        search_ipv6unicast,
+    );
     router.add_get("/ribs/ipv6unicast/routes", search_ipv6unicast_all);
 
     // The 'hardcoded' afisafis above take precedence over this 'catch-all' one.
     router.add_get("/ribs/{afisafi}/routes", generic_afisafi_all);
-
 
     // Possible shortcuts:
     //router.add_get("/origin_asn/{asn}", search_origin_asn_shortcut);
@@ -46,16 +72,13 @@ enum SupportedAfiSafi {
     Ipv6Unicast,
 }
 
-
 #[serde_as]
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(rename_all(deserialize = "camelCase"))]
 pub struct QueryFilter {
-
     #[serde(default)]
     #[serde_as(as = "StringWithSeparator::<CommaSeparator, Include>")]
     pub include: Vec<Include>,
-
 
     pub ingress_id: Option<IngressId>,
 
@@ -75,7 +98,6 @@ pub struct QueryFilter {
 
     #[serde(rename = "filter[ribType]")]
     pub rib_type: Option<PeerRibType>,
-
 
     #[serde(rename = "filter[rovStatus]")]
     pub rov_status: Option<RovStatus>,
@@ -111,10 +133,8 @@ pub struct QueryFilter {
     #[serde(rename = "fields[pathAttributes]")]
     pub fields_path_attributes: Option<Vec<u8>>,
 
-
-
     #[serde(rename = "function[roto]")]
-    pub roto_function: Option<String>
+    pub roto_function: Option<String>,
 }
 
 impl QueryFilter {
@@ -152,9 +172,9 @@ impl StreamResponseWriter {
         }
         let chunk = Bytes::copy_from_slice(&self.buffer);
         self.buffer.clear();
-        self.sender
-            .blocking_send(Ok(chunk))
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "receiver dropped"))
+        self.sender.blocking_send(Ok(chunk)).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "receiver dropped")
+        })
     }
 }
 
@@ -184,7 +204,10 @@ fn stream_search_result(
         let _ = writer.flush();
     });
 
-    ([("content-type", "application/json")], Body::from_stream(stream))
+    (
+        [("content-type", "application/json")],
+        Body::from_stream(stream),
+    )
 }
 
 #[derive(Debug)]
@@ -201,7 +224,7 @@ impl std::str::FromStr for Include {
         match s {
             "moreSpecifics" => Ok(Include::MoreSpecifics),
             "lessSpecifics" => Ok(Include::LessSpecifics),
-            _ => Err(UnknownInclude)
+            _ => Err(UnknownInclude),
         }
     }
 }
@@ -209,9 +232,8 @@ impl std::str::FromStr for Include {
 async fn generic_afisafi_all(
     Path(afisafi): Path<SupportedAfiSafi>,
     filter: Query<QueryFilter>,
-    _state: State<ApiState>
+    _state: State<ApiState>,
 ) -> Result<Vec<u8>, ApiError> {
-
     dbg!(afisafi, filter);
     warn!("searching routes other than unicast not yet implemented");
     Err(ApiError::InternalServerError("TODO".into()))
@@ -220,15 +242,20 @@ async fn generic_afisafi_all(
 async fn search_ipv4unicast(
     Path((prefix, prefix_len)): Path<(Ipv4Addr, u8)>,
     Query(filter): Query<QueryFilter>,
-    state: State<ApiState>
+    state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-
-    let prefix = Prefix::new_v4(prefix, prefix_len).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let prefix = Prefix::new_v4(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let s = state.store.load();
     let search_result = match *s {
-        Some(ref store) => store.search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
+        Some(ref store) => store
+            .search_routes(AfiSafiType::Ipv4Unicast, prefix, filter)
             .map_err(ApiError::BadRequest)?,
-        None => return Err(ApiError::InternalServerError("store unavailable".into())),
+        None => {
+            return Err(ApiError::InternalServerError(
+                "store unavailable".into(),
+            ))
+        }
     };
 
     Ok(stream_search_result(search_result))
@@ -238,7 +265,7 @@ async fn search_ipv4unicast(
 // more-specifics. These go into the "included" part of the response.
 async fn search_ipv4unicast_all(
     mut filter: Query<QueryFilter>,
-    state: State<ApiState>
+    state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
     filter.enable_more_specifics();
     search_ipv4unicast(Path((0.into(), 0)), filter, state).await
@@ -247,15 +274,20 @@ async fn search_ipv4unicast_all(
 async fn search_ipv6unicast(
     Path((prefix, prefix_len)): Path<(Ipv6Addr, u8)>,
     Query(filter): Query<QueryFilter>,
-    state: State<ApiState>
+    state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
-
-    let prefix = Prefix::new_v6(prefix, prefix_len).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let prefix = Prefix::new_v6(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let s = state.store.load();
     let search_result = match *s {
-        Some(ref store) => store.search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
+        Some(ref store) => store
+            .search_routes(AfiSafiType::Ipv6Unicast, prefix, filter)
             .map_err(ApiError::BadRequest)?,
-        None => return Err(ApiError::InternalServerError("store unavailable".into())),
+        None => {
+            return Err(ApiError::InternalServerError(
+                "store unavailable".into(),
+            ))
+        }
     };
 
     Ok(stream_search_result(search_result))
@@ -265,7 +297,7 @@ async fn search_ipv6unicast(
 // more-specifics. These go into the "included" part of the response.
 async fn search_ipv6unicast_all(
     mut filter: Query<QueryFilter>,
-    state: State<ApiState>
+    state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
     filter.enable_more_specifics();
     search_ipv6unicast(Path((0.into(), 0)), filter, state).await

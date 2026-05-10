@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use log::{debug, error, warn};
 use inetnum::asn::Asn;
+use log::{debug, error, warn};
 use rotonda_store::prefix_record::RouteStatus;
 use routecore::bgp::message::{Message as BgpMsg, UpdateMessage};
 use smallvec::{smallvec, SmallVec};
@@ -28,18 +28,22 @@ use routecore::bgp::fsm::session::{
     Session,
 };
 
-use crate::ingress::IngressType;
-use crate::ingress::register::IngressState;
-use crate::roto_runtime::types::{
-    Output, OutputStreamMessage, PeerRibType, RotoOutputStream, explode_announcements, explode_withdrawals
-};
 use crate::comms::{Gate, GateStatus, Terminated};
-use crate::{ingress, roto_runtime};
+use crate::ingress::peer_stats::{
+    AfiSafiKey, BgpPeerStats, BgpPeerStatsRegistry,
+};
+use crate::ingress::register::IngressState;
+use crate::ingress::IngressType;
 use crate::payload::{Payload, RotondaRoute, Update};
+use crate::roto_runtime::types::{
+    explode_announcements, explode_withdrawals, Output, OutputStreamMessage,
+    PeerRibType, RotoOutputStream,
+};
 use crate::roto_runtime::Ctx;
 use crate::units::bgp_tcp_in::status_reporter::BgpTcpInStatusReporter;
 use crate::units::rib_unit::rpki::RtrCache;
 use crate::units::Unit;
+use crate::{ingress, roto_runtime};
 
 use super::peer_config::{CombinedConfig, ConfigExt};
 use super::unit::BgpTcpIn;
@@ -87,6 +91,7 @@ struct Processor {
     pdu_out_tx: mpsc::Sender<BgpMsg<Bytes>>,
     status_reporter: Arc<BgpTcpInStatusReporter>,
     ingresses: Arc<ingress::Register>,
+    peer_stats: Arc<BgpPeerStatsRegistry>,
 
     /// The 'overall' IngressId for the BGP-IN unit.
     ingress_id: ingress::IngressId,
@@ -101,6 +106,17 @@ struct Processor {
     rtr_cache: Arc<RtrCache>,
 }
 
+/// IANA AFI/SAFI wire codes for the [`RotondaRoute`] variants we
+/// currently support — used as the key for per-AFI/SAFI stat TLVs.
+fn rotonda_route_afi_safi(rr: &RotondaRoute) -> AfiSafiKey {
+    match rr {
+        RotondaRoute::Ipv4Unicast(..) => (1, 1),
+        RotondaRoute::Ipv6Unicast(..) => (2, 1),
+        RotondaRoute::Ipv4Multicast(..) => (1, 2),
+        RotondaRoute::Ipv6Multicast(..) => (2, 2),
+    }
+}
+
 impl Processor {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -112,6 +128,7 @@ impl Processor {
         pdu_out_tx: mpsc::Sender<BgpMsg<Bytes>>,
         status_reporter: Arc<BgpTcpInStatusReporter>,
         ingresses: Arc<ingress::Register>,
+        peer_stats: Arc<BgpPeerStatsRegistry>,
         ingress_id: ingress::IngressId,
         abort_handle: Arc<Mutex<Option<AbortHandle>>>,
     ) -> Self {
@@ -125,6 +142,7 @@ impl Processor {
             pdu_out_tx,
             status_reporter,
             ingresses,
+            peer_stats,
             ingress_id,
             abort_handle,
             rtr_cache: Default::default(),
@@ -148,6 +166,7 @@ impl Processor {
             pdu_out_tx,
             status_reporter: Default::default(),
             ingresses: Arc::new(ingress::Register::default()),
+            peer_stats: Arc::new(BgpPeerStatsRegistry::default()),
             ingress_id: 0,
             abort_handle: Arc::new(Mutex::new(None)),
             rtr_cache: Default::default(),
@@ -168,6 +187,12 @@ impl Processor {
         session.connected_addr().hash(&mut connection_id);
 
         let mut session_ingress_id = self.ingress_id;
+
+        // Per-peer stats handle, populated at SessionNegotiated time
+        // when we know which IngressId we're going to use (which may
+        // differ from self.ingress_id if we reused an existing entry
+        // for a reconnecting peer).
+        let mut peer_stats_handle: Option<Arc<BgpPeerStats>> = None;
 
         // Assigned when SessionNegotiated is received; used in cleanup to
         // avoid removing a replacement session's live_sessions entry.
@@ -369,6 +394,7 @@ impl Processor {
                                         received,
                                         bgp_msg,
                                         session_ingress_id,
+                                        peer_stats_handle.as_deref(),
                                     ).await;
                                     match update {
                                         Ok(update) => {
@@ -380,7 +406,19 @@ impl Processor {
                                     };
                                 }
                                 Some(roto::Verdict::Reject(_)) => {
-                                    // increase metrics and continue
+                                    // RFC 7854 §4.8 stat type 0:
+                                    // count NLRIs in this rejected
+                                    // UPDATE so a downstream BMP
+                                    // collector can attribute
+                                    // policy drops to this peer.
+                                    if let Some(ph) = peer_stats_handle.as_ref() {
+                                        let n = explode_announcements(&bgp_msg)
+                                            .map(|v| v.len())
+                                            .unwrap_or(0);
+                                        if n > 0 {
+                                            ph.inc_prefixes_rejected(n as u64);
+                                        }
+                                    }
                                     debug!("bgp-in roto Reject");
                                 }
                             }
@@ -525,6 +563,14 @@ impl Processor {
                                     )
                                 );
 
+                            // Acquire the per-peer stats entry now
+                            // that the IngressId is final. Reset the
+                            // per-AFI/SAFI gauge — if the entry was
+                            // reused from a prior session, its old
+                            // routes have just been withdrawn above.
+                            let ph = self.peer_stats.get_or_create(session_ingress_id);
+                            ph.reset_adj_rib_in();
+                            peer_stats_handle = Some(ph);
                         }
                         Some(Message::Attributes(_)) => unimplemented!(),
                     }
@@ -535,7 +581,9 @@ impl Processor {
         // Done, for whatever reason. Remove ourselves from the live sessions.
         // Only remove if this is still our session entry — a newer session
         // may have replaced us via collision resolution (RFC 4271 §6.8).
-        let should_withdraw = if let (Some(sid), Some(negotiated)) = (my_session_id, session.negotiated()) {
+        let should_withdraw = if let (Some(sid), Some(negotiated)) =
+            (my_session_id, session.negotiated())
+        {
             let key = (negotiated.remote_addr(), negotiated.remote_asn());
             let mut ls = live_sessions.lock().unwrap();
             if ls.get(&key).map(|(id, _, _, _, _)| *id) == Some(sid) {
@@ -546,9 +594,10 @@ impl Processor {
                     negotiated.remote_addr(),
                     ls.len()
                 );
-                self.ingresses.update_info(session_ingress_id,
+                self.ingresses.update_info(
+                    session_ingress_id,
                     ingress::IngressInfo::new()
-                    .with_state(IngressState::Disconnected)
+                        .with_state(IngressState::Disconnected),
                 );
                 true
             } else {
@@ -564,6 +613,10 @@ impl Processor {
                 .await;
             // Clean up the ingress register entry so it doesn't leak.
             self.ingresses.remove(session_ingress_id);
+            // And the per-peer stats — the periodic emitter would
+            // otherwise keep publishing a stale Stats Report for a
+            // peer that's gone.
+            self.peer_stats.remove(session_ingress_id);
         }
 
         (session, rx_sess)
@@ -585,6 +638,7 @@ impl Processor {
         received: std::time::Instant,
         bgp_msg: UpdateMessage<bytes::Bytes>,
         ingress_id: ingress::IngressId,
+        peer_stats: Option<&BgpPeerStats>,
     ) -> Result<Update, session::Error> {
         // When sending both v4 and v6 nlri using exabgp, exa sends a v4
         // NextHop in a v6 MP_REACH_NLRI, which is invalid.
@@ -619,26 +673,48 @@ impl Processor {
         let rr_reach = explode_announcements(&bgp_msg)?;
         let rr_unreach = explode_withdrawals(&bgp_msg)?;
 
-        payloads.extend(
-            rr_reach.into_iter().map(|rr| {
-                Payload::with_received(
-                    rr,
-                    None,
-                    received,
-                    ingress_id,
-                    RouteStatus::Active,
-                )
-            }),
-        );
+        // Update per-AFI/SAFI Adj-RIB-In counters before consuming
+        // the route lists. Bucket by AFI/SAFI so we take the
+        // per-peer write-lock at most once per (AFI, SAFI) per
+        // UPDATE message even when the message contains many NLRIs.
+        if let Some(ps) = peer_stats {
+            use std::collections::HashMap;
+            let mut adds: HashMap<AfiSafiKey, u64> = HashMap::new();
+            for rr in &rr_reach {
+                *adds.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
+            }
+            for (k, v) in adds {
+                ps.add_adj_rib_in(k, v);
+            }
 
-        payloads.extend(rr_unreach.into_iter().map(|rr|
+            let mut subs: HashMap<AfiSafiKey, u64> = HashMap::new();
+            for rr in &rr_unreach {
+                *subs.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
+            }
+            for (k, v) in subs {
+                ps.sub_adj_rib_in(k, v);
+            }
+        }
+
+        payloads.extend(rr_reach.into_iter().map(|rr| {
+            Payload::with_received(
+                rr,
+                None,
+                received,
+                ingress_id,
+                RouteStatus::Active,
+            )
+        }));
+
+        payloads.extend(rr_unreach.into_iter().map(|rr| {
             Payload::with_received(
                 rr,
                 None,
                 received,
                 ingress_id,
                 RouteStatus::Withdrawn,
-            )));
+            )
+        }));
 
         Ok(payloads.into())
     }
@@ -657,6 +733,7 @@ pub async fn handle_connection(
     status_reporter: Arc<BgpTcpInStatusReporter>,
     live_sessions: Arc<Mutex<super::unit::LiveSessions>>,
     ingresses: Arc<ingress::Register>,
+    peer_stats: Arc<BgpPeerStatsRegistry>,
     connector_ingress_id: ingress::IngressId,
     abort_handle: Arc<Mutex<Option<AbortHandle>>>,
 ) {
@@ -679,7 +756,6 @@ pub async fn handle_connection(
     let (sess_tx, sess_rx) = mpsc::channel::<Message>(100);
 
     let (pdu_out_tx, mut pdu_out_rx) = mpsc::channel(10);
-
 
     //  - depending on candidate_config, with or without DelayOpen
     //  Ugly use of temp bool here, because candidate_config is moved.
@@ -719,6 +795,7 @@ pub async fn handle_connection(
         pdu_out_tx,
         status_reporter,
         ingresses,
+        peer_stats,
         connector_ingress_id,
         abort_handle,
     );

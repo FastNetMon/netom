@@ -1,4 +1,8 @@
-use std::{borrow::Cow, str::FromStr, sync::{Arc, Mutex}};
+use std::{
+    borrow::Cow,
+    str::FromStr,
+    sync::{Arc, Mutex},
+};
 
 use inetnum::{addr::Prefix, asn::Asn};
 use log::warn;
@@ -13,7 +17,7 @@ pub type MutNamedAsnLists = Arc<Mutex<NamedAsnLists>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct NamedAsnLists {
-    pub inner: micromap::Map<Arc<str>, AsnList, ASN_LIST_COUNT>
+    pub inner: micromap::Map<Arc<str>, AsnList, ASN_LIST_COUNT>,
 }
 
 impl NamedAsnLists {
@@ -22,14 +26,15 @@ impl NamedAsnLists {
             warn!(
                 "maximum number of ASN lists defined ({ASN_LIST_COUNT}), \
                 not registering '{name}'
-            ");
+            "
+            );
         }
     }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct AsnList {
-    asns: SmallVec<[Asn; ASN_LIST_SIZE]>
+    asns: SmallVec<[Asn; ASN_LIST_SIZE]>,
 }
 
 impl AsnList {
@@ -51,10 +56,13 @@ impl FromStr for AsnList {
     type Err = Cow<'static, str>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let res = s.split_whitespace().flat_map(|s|
-            Asn::from_str(s)
-            .inspect_err(|e| warn!("failed to parse {s} as ASN: {e}"))
-        ).collect::<SmallVec<_>>();
+        let res = s
+            .split_whitespace()
+            .flat_map(|s| {
+                Asn::from_str(s)
+                    .inspect_err(|e| warn!("failed to parse {s} as ASN: {e}"))
+            })
+            .collect::<SmallVec<_>>();
         Ok(AsnList::new(res))
     }
 }
@@ -68,7 +76,7 @@ pub type MutNamedPrefixLists = Arc<Mutex<NamedPrefixLists>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct NamedPrefixLists {
-    pub inner: micromap::Map<Arc<str>, PrefixList, PREFIX_LIST_COUNT>
+    pub inner: micromap::Map<Arc<str>, PrefixList, PREFIX_LIST_COUNT>,
 }
 
 impl NamedPrefixLists {
@@ -84,7 +92,7 @@ impl NamedPrefixLists {
 
 #[derive(Clone, Debug, Default)]
 pub struct PrefixList {
-    prefixes: SmallVec<[Prefix; PREFIX_LIST_SIZE]>
+    prefixes: SmallVec<[Prefix; PREFIX_LIST_SIZE]>,
 }
 
 impl PrefixList {
@@ -103,10 +111,14 @@ impl FromStr for PrefixList {
     type Err = Cow<'static, str>;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let res = s.split_whitespace().flat_map(|s|
-            Prefix::from_str(s)
-            .inspect_err(|e| warn!("failed to parse {s} as prefix: {e}"))
-        ).collect::<SmallVec<_>>();
+        let res = s
+            .split_whitespace()
+            .flat_map(|s| {
+                Prefix::from_str(s).inspect_err(|e| {
+                    warn!("failed to parse {s} as prefix: {e}")
+                })
+            })
+            .collect::<SmallVec<_>>();
         Ok(PrefixList::new(res))
     }
 }

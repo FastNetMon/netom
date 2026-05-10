@@ -73,7 +73,11 @@ impl BmpTcpOutStatusReporter {
         sr_log!(error: self, "Internal error: {}", err);
     }
 
-    pub fn tls_handshake_error<T: Display>(&self, client_addr: SocketAddr, err: T) {
+    pub fn tls_handshake_error<T: Display>(
+        &self,
+        client_addr: SocketAddr,
+        err: T,
+    ) {
         sr_log!(warn: self, "TLS handshake failed for {}: {}", client_addr, err);
         self.metrics.tls_handshake_failures.fetch_add(1, SeqCst);
     }

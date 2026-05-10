@@ -19,7 +19,8 @@ use tokio::{io::AsyncRead, net::TcpStream};
 
 use crate::ingress::register::IngressState;
 use crate::roto_runtime::types::{
-    FilterName, Output, OutputStreamMessage, PeerRibType, RotoOutputStream, RotoScripts
+    FilterName, Output, OutputStreamMessage, PeerRibType, RotoOutputStream,
+    RotoScripts,
 };
 
 use crate::ingress::{self, IngressId};
@@ -173,7 +174,6 @@ impl RouterHandler {
         let mut router_id = hash32::FnvHasher::default();
         router_addr.hash(&mut router_id);
 
-
         // Ensure that on first use the metrics for the "unknown" router are
         // correctly initialised.
         // self.status_reporter.router_id_changed(router_addr);
@@ -288,9 +288,10 @@ impl RouterHandler {
             &bmp_state_lock.as_ref().unwrap().router_id(),
         );
 
-        ingress_register.update_info(ingress_id,
+        ingress_register.update_info(
+            ingress_id,
             ingress::IngressInfo::new()
-            .with_state(IngressState::Disconnected)
+                .with_state(IngressState::Disconnected),
         );
 
         // Signal withdrawal of all bgp sessions monitored via this BMP
@@ -301,14 +302,13 @@ impl RouterHandler {
             session_ids.len(),
             ingress_register.current_serial(),
         );
-        let entries: smallvec::SmallVec<[(ingress::IngressId, Option<ingress::IngressInfo>); 8]> =
-            session_ids
-                .into_iter()
-                .map(|id| (id, ingress_register.get(id)))
-                .collect();
-        self.gate
-            .update_data(Update::WithdrawBulk(entries))
-            .await;
+        let entries: smallvec::SmallVec<
+            [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
+        > = session_ids
+            .into_iter()
+            .map(|id| (id, ingress_register.get(id)))
+            .collect();
+        self.gate.update_data(Update::WithdrawBulk(entries)).await;
 
         // Signal withdrawal of all address families for this ingress_id.
         // XXX if ingress ids are assigned properly, i.e. on the BGP level
@@ -353,7 +353,6 @@ impl RouterHandler {
             msg.common_header().msg_type().into(),
         );
 
-
         // overwrite BMP-level provenance with BGP-level info, if any
         let pph = match &msg {
             Message::RouteMonitoring(msg) => Some(msg.per_peer_header()),
@@ -389,16 +388,15 @@ impl RouterHandler {
 
         //if let Some((ingress_id, _ingress_info)) =
         //    self.ingress_register.find_existing_peer(&query_ingress)
-        //{ 
+        //{
         //} else {
 
         //}
-        
+
         let ingress_info = if let Some(ref pph) = pph {
             ingress::IngressInfo::new()
                 .with_remote_asn(pph.asn())
                 .with_remote_addr(pph.address())
-            
         } else {
             ingress::IngressInfo::new()
                 .with_remote_asn(Asn::from_u32(0))
@@ -407,78 +405,86 @@ impl RouterHandler {
 
         let mut osms = smallvec![];
         let verdict;
-        { // lock scope
-        let mut ctx = self.roto_context.lock().unwrap();
+        {
+            // lock scope
+            let mut ctx = self.roto_context.lock().unwrap();
 
-        let mutiic = roto_runtime::IngressInfoCache::for_info_rc(
-            0 as IngressId, 
-            self.ingress_register.clone(),
-            ingress_info,
-        );
+            let mutiic = roto_runtime::IngressInfoCache::for_info_rc(
+                0 as IngressId,
+                self.ingress_register.clone(),
+                ingress_info,
+            );
 
-        verdict = self.roto_function.as_ref().map(|roto_function| {
-            roto_function.call(
-                &mut ctx,
-                roto::Val(msg.clone()),
-                roto::Val(mutiic),
-            )
-        });
-        
+            verdict = self.roto_function.as_ref().map(|roto_function| {
+                roto_function.call(
+                    &mut ctx,
+                    roto::Val(msg.clone()),
+                    roto::Val(mutiic),
+                )
+            });
 
-        let mut output_stream = ctx.output.borrow_mut();
-        if !output_stream.is_empty() {
-            for entry in output_stream.drain() {
-                let osm = match entry {
-                    Output::Prefix(_prefix) => {
-                        OutputStreamMessage::prefix(None, Some(ingress_id))
-                    }
-                    Output::Community(_u32) => {
-                        OutputStreamMessage::community(None, Some(ingress_id))
-                    }
-                    Output::Asn(_u32) => {
-                        OutputStreamMessage::asn(None, Some(ingress_id))
-                    }
-                    Output::Origin(_u32) => {
-                        OutputStreamMessage::origin(None, Some(ingress_id))
-                    }
-                    Output::PeerDown => {
-                        if let Message::PeerDownNotification(ref pdn) = msg {
-                            let pph = pdn.per_peer_header();
-                            OutputStreamMessage::peer_down(
-                                "mqtt".into(),
-                                "peerdown".into(),
-                                pph.address(),
-                                pph.asn(),
+            let mut output_stream = ctx.output.borrow_mut();
+            if !output_stream.is_empty() {
+                for entry in output_stream.drain() {
+                    let osm = match entry {
+                        Output::Prefix(_prefix) => {
+                            OutputStreamMessage::prefix(
+                                None,
                                 Some(ingress_id),
                             )
-                        } else {
-                            error!(
+                        }
+                        Output::Community(_u32) => {
+                            OutputStreamMessage::community(
+                                None,
+                                Some(ingress_id),
+                            )
+                        }
+                        Output::Asn(_u32) => {
+                            OutputStreamMessage::asn(None, Some(ingress_id))
+                        }
+                        Output::Origin(_u32) => OutputStreamMessage::origin(
+                            None,
+                            Some(ingress_id),
+                        ),
+                        Output::PeerDown => {
+                            if let Message::PeerDownNotification(ref pdn) =
+                                msg
+                            {
+                                let pph = pdn.per_peer_header();
+                                OutputStreamMessage::peer_down(
+                                    "mqtt".into(),
+                                    "peerdown".into(),
+                                    pph.address(),
+                                    pph.asn(),
+                                    Some(ingress_id),
+                                )
+                            } else {
+                                error!(
                                 "log_peer_down on a non-peerdownnotification"
                             );
-                            continue;
+                                continue;
+                            }
                         }
-                    }
-                    Output::Custom((id, local)) => {
-                        OutputStreamMessage::custom(
-                            id,
-                            local,
-                            Some(ingress_id),
-                        )
-                    }
-                    Output::Entry(entry) => {
-                        OutputStreamMessage::entry(
+                        Output::Custom((id, local)) => {
+                            OutputStreamMessage::custom(
+                                id,
+                                local,
+                                Some(ingress_id),
+                            )
+                        }
+                        Output::Entry(entry) => OutputStreamMessage::entry(
                             entry,
                             Some(ingress_id),
-                        )
-                    }
-
-                };
-                osms.push(osm);
+                        ),
+                    };
+                    osms.push(osm);
+                }
             }
-        }
         } // end of lock scope
-            
-        self.gate.update_data(Update::OutputStream(Box::new(osms))).await;
+
+        self.gate
+            .update_data(Update::OutputStream(Box::new(osms)))
+            .await;
         let next_state = match verdict {
             // Default action when no roto script is used
             // is Accept (i.e. None here).
@@ -708,9 +714,9 @@ mod tests {
 
                     // Fail with a fatal error to stop the reader polling for
                     // more data.
-                    Poll::Ready(
-                        Err(std::io::ErrorKind::ConnectionAborted.into())
-                    )
+                    Poll::Ready(Err(
+                        std::io::ErrorKind::ConnectionAborted.into()
+                    ))
                 }
             }
         }
@@ -780,8 +786,12 @@ mod tests {
             .unwrap();
 
         // Two bad messages
-        process_msg(&runner, bad_peer_down_msg.clone(), ingress_id).await.unwrap();
-        process_msg(&runner, bad_peer_down_msg, ingress_id).await.unwrap();
+        process_msg(&runner, bad_peer_down_msg.clone(), ingress_id)
+            .await
+            .unwrap();
+        process_msg(&runner, bad_peer_down_msg, ingress_id)
+            .await
+            .unwrap();
 
         let metrics = get_testable_metrics_snapshot(
             &runner.status_reporter.metrics().unwrap(),

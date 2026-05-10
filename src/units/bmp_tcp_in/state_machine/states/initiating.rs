@@ -80,7 +80,9 @@ impl BmpStateDetails<Initiating> {
                 self.ingress_register.update_info(
                     self.ingress_id,
                     ingress::IngressInfo::new()
-                        .with_state(ingress::register::IngressState::Connected)
+                        .with_state(
+                            ingress::register::IngressState::Connected,
+                        )
                         .with_name(
                             msg.information_tlvs()
                                 .find(|t| {
@@ -154,7 +156,6 @@ impl Initiable for Initiating {
         self.sys_desc = Some(sys_desc);
         self.sys_extra = sys_extra;
     }
-
 }
 
 #[cfg(test)]

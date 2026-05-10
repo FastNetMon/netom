@@ -302,11 +302,62 @@ pub async fn send_update_to_client(
             )
             .await
         }
+        Update::PeerStats { ingress_id, body } => {
+            send_peer_stats(
+                client,
+                *ingress_id,
+                body,
+                ingress_register,
+                forward_router_info,
+            )
+            .await
+        }
         _ => {
             // Other update types are ignored for BMP out
             true
         }
     }
+}
+
+/// Forward an upstream BMP Statistics Report (RFC 7854 §4.8) to the
+/// client. Ensures Peer Up has been re-streamed for this `ingress_id`
+/// (lazy peer-up mirrors what `send_payload_to_client` does for Route
+/// Monitoring), then re-encodes the stats body under a fresh per-peer
+/// header that matches what we already sent for this peer.
+async fn send_peer_stats(
+    client: &Arc<ClientState>,
+    ingress_id: IngressId,
+    body: &bytes::Bytes,
+    ingress_register: &Arc<register::Register>,
+    forward_router_info: bool,
+) -> bool {
+    if client.register_known_peer_if_absent(ingress_id).await {
+        if let Some(info) = ingress_register.get(ingress_id) {
+            let mut peer_info = PeerInfo::from_ingress_info(&info);
+            peer_info.admin_label = resolve_admin_label(
+                &info,
+                ingress_register,
+                forward_router_info,
+            );
+            let peer_up = bmp_builder::build_peer_up(&peer_info, false);
+            if !client.send_message(peer_up).await {
+                client.remove_known_peer(ingress_id).await;
+                return false;
+            }
+        }
+    }
+
+    let peer_info = match ingress_register.get(ingress_id) {
+        Some(ref info) => PeerInfo::from_ingress_info(info),
+        None => {
+            // Peer is gone (e.g. just torn down); drop the stats report
+            // rather than emit one with bogus PPH fields.
+            return true;
+        }
+    };
+
+    let msg = bmp_builder::build_statistics_report(&peer_info, body);
+    client.send_message(msg).await
 }
 
 /// Send a single Payload as a Route Monitoring BMP message.
