@@ -130,43 +130,78 @@ pub async fn perform_initial_dump(
     );
 
     // 4. Phase 2: Single RIB walk — send all routes for all peers interleaved
+    //
+    // The RIB iterator collects prefix records into a Vec under an
+    // epoch::pin() guard. For very large RIBs (tens of millions of routes)
+    // that collect is a multi-second CPU+memory burst — we run it on a
+    // blocking thread so the tokio runtime stays responsive (BGP ingest,
+    // metrics, other clients). The crossbeam_epoch Guard is !Send, so it
+    // can't span .await on a multi-threaded runtime; spawn_blocking keeps
+    // the Guard's life entirely on one thread.
     let rib_walk_start = Instant::now();
     let mut total_routes: usize = 0;
-    match rib.iter_all_prefix_records() {
-        Ok(prefix_records) => {
-            for prefix_record in prefix_records {
-                let prefix = prefix_record.prefix;
+    let rib_for_collect = rib.clone();
+    let collect_result = tokio::task::spawn_blocking(move || {
+        rib_for_collect.iter_all_prefix_records()
+    })
+    .await;
 
-                for route_record in prefix_record.meta {
-                    // Skip withdrawn routes
-                    if route_record.status == RouteStatus::Withdrawn {
-                        continue;
-                    }
-
-                    let ingress_id = route_record.multi_uniq_id;
-
-                    // Only send routes for peers we know about
-                    let peer_info = match peer_info_map.get(&ingress_id) {
-                        Some(pi) => pi,
-                        None => continue,
-                    };
-
-                    let pamap = &route_record.meta;
-                    let msg = bmp_builder::build_route_monitoring(
-                        peer_info, prefix, pamap, false,
-                    );
-                    total_routes += 1;
-                    if !client.send_message(msg).await {
-                        return false;
-                    }
-                }
-            }
-        }
-        Err(e) => {
+    let prefix_records = match collect_result {
+        Ok(Ok(records)) => records,
+        Ok(Err(e)) => {
             warn!(
                 "bmp-out dump for {}: failed to iterate RIB: {}",
                 client.remote_addr, e
             );
+            Vec::new()
+        }
+        Err(join_err) => {
+            warn!(
+                "bmp-out dump for {}: RIB iteration task failed: {}",
+                client.remote_addr, join_err
+            );
+            Vec::new()
+        }
+    };
+
+    info!(
+        "bmp-out dump for {}: collected {} prefix records in {:.2}s",
+        client.remote_addr,
+        prefix_records.len(),
+        rib_walk_start.elapsed().as_secs_f64(),
+    );
+
+    // Yield to the runtime every YIELD_EVERY routes so the per-route build
+    // loop doesn't monopolise its tokio worker between socket-induced yields.
+    // Withdrawn entries are already filtered out by iter_all_prefix_records.
+    const YIELD_EVERY: usize = 1024;
+    let mut since_yield: usize = 0;
+    for prefix_record in prefix_records {
+        let prefix = prefix_record.prefix;
+
+        for route_record in prefix_record.meta {
+            let ingress_id = route_record.multi_uniq_id;
+
+            // Only send routes for peers we know about
+            let peer_info = match peer_info_map.get(&ingress_id) {
+                Some(pi) => pi,
+                None => continue,
+            };
+
+            let pamap = &route_record.meta;
+            let msg = bmp_builder::build_route_monitoring(
+                peer_info, prefix, pamap, false,
+            );
+            total_routes += 1;
+            if !client.send_message(msg).await {
+                return false;
+            }
+
+            since_yield += 1;
+            if since_yield >= YIELD_EVERY {
+                tokio::task::yield_now().await;
+                since_yield = 0;
+            }
         }
     }
 
