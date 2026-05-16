@@ -898,6 +898,7 @@ where
                         .ingress_register
                         .get(existing_ingress_id)
                         .unwrap();
+                    adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
                     self.ingress_register
