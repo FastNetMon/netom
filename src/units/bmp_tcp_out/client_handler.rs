@@ -9,7 +9,8 @@ use rotonda_store::prefix_record::RouteStatus;
 
 use crate::{
     ingress::{
-        self, http_ng::QueryFilter, IngressId, IngressInfo, IngressType,
+        self, http_ng::QueryFilter, register::IngressState, IngressId,
+        IngressInfo, IngressType,
     },
     payload::{Payload, RotondaRoute, Update},
     units::rib_unit::rib::Rib,
@@ -68,15 +69,28 @@ pub async fn perform_initial_dump(
         return false;
     }
 
-    // 2. Find active BGP peers (BgpViaBmp, Bgp, and Mrt-replayed types)
+    // 2. Find active BGP peers (BgpViaBmp, Bgp, and Mrt-replayed types).
+    //
+    // For Bgp / BgpViaBmp we filter on IngressState::Connected so that
+    // peers preserved across flaps (bmp_tcp_in::peer_down keeps the
+    // register entry around for IngressId rebinding, bgp_tcp_in does the
+    // same) are not enumerated — their routes have been withdrawn and
+    // would otherwise show up as ZERO-ROUTE peers in the dump.
+    // Mrt ingresses do not track connection state (no lifecycle), so we
+    // include them unconditionally.
     let peers = {
         let mut all_peers = Vec::new();
         for ingress_type in
             [IngressType::BgpViaBmp, IngressType::Bgp, IngressType::Mrt]
         {
             let type_name = format!("{:?}", ingress_type);
+            let ingress_state = match ingress_type {
+                IngressType::Mrt => None,
+                _ => Some(IngressState::Connected),
+            };
             let filter = QueryFilter {
                 ingress_type: Some(ingress_type),
+                ingress_state,
                 ..Default::default()
             };
             let found = ingress_register.search(filter);

@@ -455,9 +455,14 @@ impl Register {
     ) -> Option<(IngressId, IngressInfo)> {
         let lock = self.info.read().unwrap();
         for (id, info) in lock.iter() {
+            // peer_rib_type discriminates pre-policy vs post-policy variants
+            // of the same (peer_addr, peer_asn). Without it, a BMP exporter
+            // sending both pre- and post-policy Adj-RIB-In for the same peer
+            // would collapse into a single ingress_id and routes would
+            // alternately overwrite each other in the RIB.
             if find_existing_for!(info, query,
                 {parent_ingress, remote_addr, remote_asn},
-                {rib_type, peer_type, distinguisher, vrf_name}
+                {rib_type, peer_rib_type, peer_type, distinguisher, vrf_name}
             ) {
                 //log::debug!("found existing peer, id {id}");
                 return Some((*id, info.clone()));

@@ -552,7 +552,12 @@ impl Processor {
                                     //.with_name("some-bgp-session".to_string())
                                     .with_remote_addr(negotiated.remote_addr())
                                     .with_remote_asn(negotiated.remote_asn())
-                                    .with_peer_rib_type(PeerRibType::OutPost)
+                                    // Direct BGP: routes received from the peer
+                                    // are this router's Adj-RIB-In after import
+                                    // policy. The previous OutPost default
+                                    // surfaced these as Adj-RIB-Out (BMP O bit
+                                    // set) when restreamed via bmp-out.
+                                    .with_peer_rib_type(PeerRibType::InPost)
                                     .with_local_capabilities(
                                         negotiated.local_capabilities()
                                         .to_vec()

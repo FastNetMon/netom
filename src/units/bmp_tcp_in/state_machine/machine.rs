@@ -446,6 +446,17 @@ pub trait PeerAware {
         pph: &PerPeerHeader<Bytes>,
     ) -> Option<&SessionConfig>;
 
+    /// Find any previously-seen PPH that matches the given one in peer identity
+    /// (peer_type, distinguisher, address, asn, bgp_id) but may differ in
+    /// L/A/O policy bits. Used to synthesize a missing PeerState when the
+    /// router sends RouteMonitoring with policy bits the original PeerUp
+    /// didn't have — works in both directions (PeerUp pre→RouteMon post and
+    /// PeerUp post→RouteMon pre).
+    fn find_sibling_pph(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+    ) -> Option<PerPeerHeader<Bytes>>;
+
     /// Copy over all we know from one (existing) entry to a new one, for a given ingress_id.
     ///
     /// This is used when get_peer_config returns no known config for a RouteMon message and we
@@ -620,6 +631,18 @@ where
                 if peer.synthesized {
                     (peer.ingress_id, register.remove(peer.ingress_id))
                 } else {
+                    // Non-synthesized entries are preserved in the
+                    // register so the next PeerUp can rebind the same
+                    // IngressId via find_existing_peer. Flip the state
+                    // to Disconnected so downstream filters (e.g. the
+                    // bmp-out dump) skip peers that currently have no
+                    // routes in the RIB.
+                    register.update_info(
+                        peer.ingress_id,
+                        ingress::IngressInfo::new().with_state(
+                            ingress::register::IngressState::Disconnected,
+                        ),
+                    );
                     (peer.ingress_id, None)
                 }
             };
@@ -849,8 +872,54 @@ where
                     }
                     // We just successfully added this, so the unwrap is safe
                     self.details.get_peer_config(&pph).unwrap()
+                } else if let Some(sibling_pph) =
+                    self.details.find_sibling_pph(&pph)
+                {
+                    // Bidirectional fallback (RFC 7854 §5 + RFC 8671): the
+                    // upstream router sent a RouteMonitoring with L/A/O bits
+                    // that don't match any PeerUp we received, but we DO know
+                    // about a sibling PeerUp with the same peer identity
+                    // (peer_type, distinguisher, address, asn, bgp_id) and
+                    // different policy bits. Synthesize a new PeerState for
+                    // this RouteMon's PPH, cloning the sibling. Without this,
+                    // pre-policy RouteMons paired with post-policy PeerUps —
+                    // common in real BMP exporter configurations — get dropped.
+                    warn!(
+                        "RouteMonitoring with no matching PeerUp; synthesizing \
+                         from sibling PeerUp (peer={}, asn={}, rib_type={:?})",
+                        pph.address(), pph.asn(), pph.rib_type()
+                    );
+                    let new_ingress_id = self.ingress_register.register();
+                    let existing_ingress_id = self
+                        .details
+                        .get_peer_ingress_id(&sibling_pph)
+                        .unwrap();
+                    let mut adapted_ingress_info = self
+                        .ingress_register
+                        .get(existing_ingress_id)
+                        .unwrap();
+                    adapted_ingress_info.peer_rib_type =
+                        Some((pph.is_post_policy(), pph.rib_type()).into());
+                    self.ingress_register
+                        .update_info(new_ingress_id, adapted_ingress_info);
+                    if !self.details.add_cloned_peer_config(
+                        &sibling_pph,
+                        &pph,
+                        new_ingress_id,
+                    ) {
+                        return self.mk_invalid_message_result(
+                            format!(
+                                "Could not synthesize PPH/PeerState from sibling \
+                                 for RouteMonitoring: {}",
+                                msg.per_peer_header()
+                            ),
+                            Some(false),
+                            Some(Bytes::copy_from_slice(msg.as_ref())),
+                        );
+                    }
+                    self.details.get_peer_config(&pph).unwrap()
                 } else {
-                    warn!("RouteMonitoring message received for which no (null-flagged) PeerUp has been observed.");
+                    warn!("RouteMonitoring message received for which no PeerUp has been observed (any policy variant).");
                     self.status_reporter.peer_unknown(self.router_id.clone());
 
                     return self.mk_invalid_message_result(
@@ -1323,6 +1392,7 @@ impl PeerAware for PeerStates {
         let mut query_ingress = ingress::IngressInfo::new()
             .with_ingress_type(ingress::IngressType::BgpViaBmp)
             .with_parent_ingress(bmp_ingress_id)
+            .with_state(ingress::register::IngressState::Connected)
             .with_remote_addr(pph.address())
             .with_remote_asn(pph.asn())
             .with_rib_type(pph.rib_type())
@@ -1368,8 +1438,12 @@ impl PeerAware for PeerStates {
             //debug!("no existing ingress_id for BGP in BMP");
             peer_ingress_id = ingress_register.register();
             existing_peer_ingress_id = None;
-            ingress_register.update_info(peer_ingress_id, query_ingress);
         }
+        // Always re-apply the PeerUp's IngressInfo. On rebind this flips
+        // the preserved entry's state back to Connected and refreshes
+        // capabilities/vrf etc. update_info merges Some-fields only, so
+        // unrelated stored data on the existing entry is left intact.
+        ingress_register.update_info(peer_ingress_id, query_ingress);
 
         let _ = self.0.entry(pph.clone()).or_insert_with(|| {
             added = true;
@@ -1428,6 +1502,23 @@ impl PeerAware for PeerStates {
         pph: &PerPeerHeader<Bytes>,
     ) -> Option<&SessionConfig> {
         self.0.get(pph).map(|peer_state| &peer_state.session_config)
+    }
+
+    fn find_sibling_pph(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+    ) -> Option<PerPeerHeader<Bytes>> {
+        self.0
+            .keys()
+            .find(|k| {
+                k != &pph
+                    && k.peer_type() == pph.peer_type()
+                    && k.distinguisher() == pph.distinguisher()
+                    && k.address() == pph.address()
+                    && k.asn() == pph.asn()
+                    && k.bgp_id() == pph.bgp_id()
+            })
+            .cloned()
     }
 
     fn add_cloned_peer_config(

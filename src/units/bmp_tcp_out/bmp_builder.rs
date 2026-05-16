@@ -12,6 +12,7 @@ use routecore::bmp::message::PeerType;
 
 use crate::ingress::IngressInfo;
 use crate::payload::{RotondaPaMap, RotondaRoute};
+use crate::roto_runtime::types::PeerRibType;
 
 // BMP message types (RFC 7854 Section 4.1)
 const BMP_MSG_ROUTE_MONITORING: u8 = 0;
@@ -73,13 +74,29 @@ impl PeerInfo {
         let peer_asn = info.remote_asn.unwrap_or(Asn::from_u32(0));
         let peer_distinguisher = info.distinguisher.unwrap_or([0u8; 8]);
 
-        // Peer flags: bit 7 = IPv6 (V), bit 6 = post-policy (L), bit 5 = adj-rib-out (A)
+        // Peer flags (RFC 7854 §4.2 + RFC 8671):
+        //   V (0x80) = IPv6 peer address
+        //   L (0x40) = post-policy Adj-RIB-In/Out
+        //   A (0x20) = legacy 2-byte AS path format
+        //   O (0x10) = Adj-RIB-Out (RFC 8671)
+        //
+        // Preserve the upstream router's L/O bits when known so downstream
+        // consumers can distinguish pre-policy / post-policy / Adj-RIB-In /
+        // Adj-RIB-Out variants of the same (peer_addr, peer_asn). For peers
+        // whose origin doesn't carry this (MRT, direct BGP), fall back to
+        // post-policy Adj-RIB-In which is the most semantically useful
+        // default for restreamed BMP.
         let mut peer_flags = 0u8;
         if peer_address.is_ipv6() {
-            peer_flags |= 0x80; // V flag
+            peer_flags |= 0x80;
         }
-        // Default to post-policy for BMP restreaming
-        peer_flags |= 0x40; // L flag
+        match info.peer_rib_type {
+            Some(PeerRibType::InPost) => peer_flags |= 0x40,
+            Some(PeerRibType::InPre) => { /* L=0, O=0 */ }
+            Some(PeerRibType::OutPost) => peer_flags |= 0x40 | 0x10,
+            Some(PeerRibType::OutPre) => peer_flags |= 0x10,
+            Some(PeerRibType::Loc) | None => peer_flags |= 0x40,
+        }
 
         PeerInfo {
             peer_type,

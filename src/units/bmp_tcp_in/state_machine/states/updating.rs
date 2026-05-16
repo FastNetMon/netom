@@ -133,6 +133,16 @@ impl BmpStateDetails<Updating> {
         >::new();
         for pph in self.details.get_peers() {
             if let Some(id) = self.details.get_peer_ingress_id(pph) {
+                // Mark Disconnected before snapshotting: a Termination
+                // message ends the session without per-peer PeerDowns,
+                // so children would otherwise stay Connected and show
+                // up as zero-route peers in bmp-out initial dumps.
+                self.ingress_register.update_info(
+                    id,
+                    ingress::IngressInfo::new().with_state(
+                        ingress::register::IngressState::Disconnected,
+                    ),
+                );
                 let info = self.ingress_register.get(id);
                 entries.push((id, info));
             }
@@ -269,6 +279,13 @@ impl PeerAware for Updating {
         pph: &PerPeerHeader<Bytes>,
     ) -> Option<&SessionConfig> {
         self.peer_states.get_peer_config(pph)
+    }
+
+    fn find_sibling_pph(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+    ) -> Option<PerPeerHeader<Bytes>> {
+        self.peer_states.find_sibling_pph(pph)
     }
 
     fn remove_peer(

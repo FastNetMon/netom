@@ -302,6 +302,17 @@ impl RouterHandler {
             session_ids.len(),
             ingress_register.current_serial(),
         );
+        // Flip each child to Disconnected before snapshotting. When the
+        // BMP TCP session drops without per-peer PeerDown messages, the
+        // BgpViaBmp children would otherwise stay marked Connected and
+        // get enumerated as zero-route peers by the bmp-out initial dump
+        // (it filters on IngressState::Connected).
+        for id in &session_ids {
+            ingress_register.update_info(
+                *id,
+                ingress::IngressInfo::new().with_state(IngressState::Disconnected),
+            );
+        }
         let entries: smallvec::SmallVec<
             [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
         > = session_ids
