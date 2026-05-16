@@ -484,6 +484,26 @@ impl RibUnitRunner {
         }
     }
 
+    /// Run `Rib::mark_ingress_active` on the blocking pool.
+    ///
+    /// Same rationale as `signal_withdraws_blocking`: it walks the same
+    /// roaring bitmap atomic and serialises through `withdraw_lock`, so
+    /// running it inline on a tokio worker can stall the pipeline while
+    /// waiting for the lock and/or while doing the bitmap walk itself.
+    async fn mark_ingress_active_blocking(
+        &self,
+        ingress_id: ingress::IngressId,
+    ) {
+        let rib = self.rib.load().clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            rib.mark_ingress_active(ingress_id);
+        })
+        .await
+        {
+            error!("mark_ingress_active blocking task failed: {}", e);
+        }
+    }
+
     pub async fn run(
         self,
         mut sources: NonEmpty<DirectLink>,
@@ -639,7 +659,7 @@ impl RibUnitRunner {
 
             Update::IngressReappeared(ingress_id) => {
                 debug!("Got IngressReappeared for {ingress_id}");
-                self.rib.load().mark_ingress_active(ingress_id);
+                self.mark_ingress_active_blocking(ingress_id).await;
                 self.gate.update_data(update).await;
             }
 

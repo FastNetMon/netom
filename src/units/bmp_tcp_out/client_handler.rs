@@ -176,6 +176,9 @@ pub async fn perform_initial_dump(
     // Withdrawn entries are already filtered out by iter_all_prefix_records.
     const YIELD_EVERY: usize = 1024;
     let mut since_yield: usize = 0;
+    let mut routes_per_ingress: HashMap<IngressId, usize> =
+        HashMap::with_capacity(peer_info_map.len());
+    let mut skipped_unknown: HashMap<IngressId, usize> = HashMap::new();
     for prefix_record in prefix_records {
         let prefix = prefix_record.prefix;
 
@@ -185,7 +188,10 @@ pub async fn perform_initial_dump(
             // Only send routes for peers we know about
             let peer_info = match peer_info_map.get(&ingress_id) {
                 Some(pi) => pi,
-                None => continue,
+                None => {
+                    *skipped_unknown.entry(ingress_id).or_insert(0) += 1;
+                    continue;
+                }
             };
 
             let pamap = &route_record.meta;
@@ -193,6 +199,7 @@ pub async fn perform_initial_dump(
                 peer_info, prefix, pamap, false,
             );
             total_routes += 1;
+            *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
             if !client.send_message(msg).await {
                 return false;
             }
@@ -212,6 +219,48 @@ pub async fn perform_initial_dump(
         total_routes,
         rib_walk_elapsed.as_secs_f64(),
     );
+
+    // Diagnostic: per-peer breakdown of sent routes. Highlight any peer that
+    // is in peer_info_map but had zero routes sent — those are the silent
+    // drops we're hunting.
+    let mut peer_rows: Vec<(IngressId, &PeerInfo, usize)> = peer_info_map
+        .iter()
+        .map(|(id, pi)| (*id, pi, routes_per_ingress.get(id).copied().unwrap_or(0)))
+        .collect();
+    peer_rows.sort_by_key(|(_, _, count)| std::cmp::Reverse(*count));
+    let zero_count = peer_rows.iter().filter(|(_, _, c)| *c == 0).count();
+    info!(
+        "bmp-out dump for {}: per-peer RIB-walk counts: {} peers with routes, {} peers with ZERO routes",
+        client.remote_addr,
+        peer_rows.len() - zero_count,
+        zero_count,
+    );
+    for (id, pi, count) in &peer_rows {
+        if *count == 0 {
+            info!(
+                "bmp-out dump for {}: ZERO-ROUTE peer ingress_id={} AS{} {}",
+                client.remote_addr, id, pi.peer_asn, pi.peer_address,
+            );
+        }
+    }
+    if !skipped_unknown.is_empty() {
+        let total_skipped: usize = skipped_unknown.values().sum();
+        info!(
+            "bmp-out dump for {}: skipped {} routes across {} unknown ingress_ids (not in peer_info_map)",
+            client.remote_addr,
+            total_skipped,
+            skipped_unknown.len(),
+        );
+        let mut rows: Vec<(IngressId, usize)> =
+            skipped_unknown.into_iter().collect();
+        rows.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+        for (id, c) in rows.iter().take(20) {
+            info!(
+                "bmp-out dump for {}: skipped unknown ingress_id={} routes={}",
+                client.remote_addr, id, c
+            );
+        }
+    }
 
     // 5. Phase 3: Send End-of-RIB markers for every AFI/SAFI advertised in
     // the synthetic Peer Up OPENs. Even an empty table needs an EoR marker.
@@ -245,32 +294,43 @@ pub async fn perform_initial_dump(
         dump_elapsed.as_secs_f64(),
     );
 
-    // 4. Drain buffered updates while holding the phase write lock. This keeps
-    // updates arriving at dump completion from being buffered after the
-    // one-time drain.
-    let mut phase = client.phase.write().await;
-    let buffered = client.take_buffered_updates().await;
-    debug!(
-        "Draining {} buffered updates for client {}",
-        buffered.len(),
-        client.remote_addr
-    );
+    // 4. Drain the dump buffer in chunks. Holding `phase.write()` across
+    // the entire drain (potentially tens of millions of updates accumulated
+    // during a long RIB walk) parks `direct_update` on `phase.read()` for
+    // the duration, which then parks rib's `update_data` and cascades back
+    // to bmp-in stalling on its sockets — the whole pipeline freezes for
+    // many minutes. Instead: take a batch, release the lock, send it;
+    // re-acquire and check if more arrived. When we reacquire and find the
+    // buffer empty, we transition to Live atomically (no DU can be mid-push
+    // because `buffer_update_if_dumping` holds `phase.read()` across the
+    // `dump_buffer.lock()` acquisition).
+    loop {
+        let mut phase = client.phase.write().await;
+        let buffered = client.take_buffered_updates().await;
+        if buffered.is_empty() {
+            *phase = ClientPhase::Live;
+            break;
+        }
+        debug!(
+            "Draining batch of {} buffered updates for client {}",
+            buffered.len(),
+            client.remote_addr
+        );
+        drop(phase); // release before slow sends; new DU calls re-buffer
 
-    for update in buffered {
-        if !send_update_to_client(
-            client,
-            &update,
-            ingress_register,
-            forward_router_info,
-        )
-        .await
-        {
-            return false;
+        for update in buffered {
+            if !send_update_to_client(
+                client,
+                &update,
+                ingress_register,
+                forward_router_info,
+            )
+            .await
+            {
+                return false;
+            }
         }
     }
-
-    // 5. Transition to Live phase after buffered updates are sent
-    *phase = ClientPhase::Live;
     status_reporter.dump_completed(client.remote_addr);
 
     true

@@ -220,8 +220,15 @@ impl DirectUpdate for BmpTcpOutRunner {
         self.metrics
             .updates_received
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let clients = self.clients.read().await;
-        for (_id, client) in clients.iter() {
+        // Snapshot client Arcs and drop the RwLock guard before any await
+        // that can park. Holding `clients.read()` across
+        // `buffer_update_if_dumping().await` deadlocks the writer task's
+        // cleanup path, which needs `clients.write()` after a disconnect.
+        let snapshot: Vec<Arc<ClientState>> = {
+            let clients = self.clients.read().await;
+            clients.values().cloned().collect()
+        };
+        for client in &snapshot {
             match client.buffer_update_if_dumping(update.clone()).await {
                 BufferUpdateResult::Buffered => {}
                 BufferUpdateResult::Overflow => {

@@ -352,6 +352,7 @@ impl MrtInRunner {
                         )
                     }
                     AfiSafiType::Ipv6Unicast => {
+                        let raw_attr = normalize_mrt_mp_reach(raw_attr, 2, 1, &prefix);
                         RotondaRoute::Ipv6Unicast(
                             prefix.try_into().map_err(MrtError::other)?,
                             RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
@@ -612,6 +613,105 @@ impl MrtInRunner {
             }
         }
     }
+}
+
+/// Rewrite a TABLE_DUMP_V2 MRT path-attribute blob so its MP_REACH_NLRI is in
+/// BGP wire format instead of MRT-truncated format.
+///
+/// RFC 6396 §4.3.4 says RIB entries store only `NH_LEN(1) + NH(NH_LEN)` in the
+/// MP_REACH_NLRI value (AFI/SAFI/Reserved/NLRI are implicit from the table
+/// subtype). Standard BGP wire format is `AFI(2) + SAFI(1) + NH_LEN(1) +
+/// NH(NH_LEN) + Reserved(1) + NLRI`. Downstream consumers that parse the
+/// blob with a wire-format BGP parser otherwise misread offsets and emit
+/// malformed BGP UPDATEs for some peers (whose next-hop's 3rd byte gives a
+/// nh_len bgpkit-parser rejects).
+fn normalize_mrt_mp_reach(
+    raw_attr: Vec<u8>,
+    afi: u16,
+    safi: u8,
+    prefix: &inetnum::addr::Prefix,
+) -> Vec<u8> {
+    // Encode the prefix as wire-format NLRI: prefix_len byte + ceil(len/8) bytes.
+    let nlri: Vec<u8> = {
+        let prefix_len = prefix.len();
+        let num_bytes = (prefix_len as usize).div_ceil(8);
+        let mut buf = Vec::with_capacity(1 + num_bytes);
+        buf.push(prefix_len);
+        match prefix.addr() {
+            std::net::IpAddr::V4(v4) => buf.extend_from_slice(&v4.octets()[..num_bytes]),
+            std::net::IpAddr::V6(v6) => buf.extend_from_slice(&v6.octets()[..num_bytes]),
+        }
+        buf
+    };
+
+    let mut out = Vec::with_capacity(raw_attr.len() + 16);
+    let mut pos = 0;
+    while pos < raw_attr.len() {
+        if pos + 2 > raw_attr.len() {
+            out.extend_from_slice(&raw_attr[pos..]);
+            break;
+        }
+        let flags = raw_attr[pos];
+        let type_code = raw_attr[pos + 1];
+        let (attr_len, header_len) = if flags & 0x10 != 0 {
+            if pos + 4 > raw_attr.len() {
+                out.extend_from_slice(&raw_attr[pos..]);
+                break;
+            }
+            (
+                ((raw_attr[pos + 2] as usize) << 8) | (raw_attr[pos + 3] as usize),
+                4,
+            )
+        } else {
+            if pos + 3 > raw_attr.len() {
+                out.extend_from_slice(&raw_attr[pos..]);
+                break;
+            }
+            (raw_attr[pos + 2] as usize, 3)
+        };
+        let total = header_len + attr_len;
+        if pos + total > raw_attr.len() {
+            out.extend_from_slice(&raw_attr[pos..]);
+            break;
+        }
+
+        if type_code == 14 {
+            let mrt_value = &raw_attr[pos + header_len..pos + total];
+            if !mrt_value.is_empty() {
+                let nh_len = mrt_value[0] as usize;
+                if mrt_value.len() >= 1 + nh_len {
+                    let nh = &mrt_value[1..1 + nh_len];
+                    let new_value_len = 2 + 1 + 1 + nh.len() + 1 + nlri.len();
+                    let use_extended = new_value_len > 255;
+                    let new_flags = if use_extended {
+                        flags | 0x10
+                    } else {
+                        flags & !0x10
+                    };
+                    out.push(new_flags);
+                    out.push(14);
+                    if use_extended {
+                        out.extend_from_slice(&(new_value_len as u16).to_be_bytes());
+                    } else {
+                        out.push(new_value_len as u8);
+                    }
+                    out.extend_from_slice(&afi.to_be_bytes());
+                    out.push(safi);
+                    out.push(nh_len as u8);
+                    out.extend_from_slice(nh);
+                    out.push(0); // Reserved
+                    out.extend_from_slice(&nlri);
+                    pos += total;
+                    continue;
+                }
+            }
+            // malformed MP_REACH; pass through unchanged so the consumer can decide.
+        }
+
+        out.extend_from_slice(&raw_attr[pos..pos + total]);
+        pos += total;
+    }
+    out
 }
 
 #[derive(Debug)]

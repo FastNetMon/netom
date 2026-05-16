@@ -47,11 +47,13 @@ pub struct Rib {
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
     path_attribute_interner: Arc<PathAttributeInterner>,
-    // Serialises calls into `withdraw_for_ingress`. rotonda-store 0.5.0's
+    // Serialises every writer to the per-store `withdrawn_muis_bmin`
+    // roaring bitmap: `withdraw_for_ingress` (mark_mui_as_withdrawn) AND
+    // `mark_ingress_active` (mark_mui_as_active). rotonda-store 0.5.0's
     // `TreeBitMap::update_withdrawn_muis_bmin` has a CAS retry loop that
     // never reloads its `expected` value, so any concurrent writer that
     // loses a CAS race livelocks indefinitely. Holding this mutex around
-    // every withdraw guarantees there's only ever one in flight.
+    // every call guarantees there's only ever one in flight.
     withdraw_lock: Arc<Mutex<()>>,
 }
 
@@ -462,6 +464,13 @@ impl Rib {
         &self,
         ingress_id: IngressId,
     ) {
+        // Same hazard as `withdraw_for_ingress`: `mark_mui_as_active_*`
+        // walks `update_withdrawn_muis_bmin`, whose CAS retry loop
+        // livelocks under concurrent writers. Serialise with the
+        // withdraw path.
+        let _guard = self.withdraw_lock.lock().unwrap_or_else(|poisoned| {
+            poisoned.into_inner()
+        });
         if let Err(e) = (*self.unicast)
             .as_ref()
                 .unwrap()
