@@ -31,7 +31,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::{
     http_ng::{Api, ApiError, ApiState},
     ingress::IngressId,
-    representation::{GenOutput, Json},
+    representation::{GenOutput, Json, OutputFormat},
     roto_runtime::types::PeerRibType,
     units::rib_unit::rpki::RovStatus,
 };
@@ -135,6 +135,9 @@ pub struct QueryFilter {
 
     #[serde(rename = "function[roto]")]
     pub roto_function: Option<String>,
+
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 impl QueryFilter {
@@ -198,14 +201,23 @@ fn stream_search_result(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(64);
     let stream = ReceiverStream::new(rx);
 
+    let format = search_result.query_filter().format;
+
     tokio::task::spawn_blocking(move || {
         let mut writer = StreamResponseWriter::new(tx);
-        let _ = search_result.write(&mut Json(&mut writer));
+        match format {
+            OutputFormat::Json => {
+                let _ = search_result.write(&mut Json(&mut writer));
+            }
+            OutputFormat::Jsonl => {
+                let _ = search_result.write_jsonl(&mut writer);
+            }
+        }
         let _ = writer.flush();
     });
 
     (
-        [("content-type", "application/json")],
+        [("content-type", format.content_type())],
         Body::from_stream(stream),
     )
 }

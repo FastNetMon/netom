@@ -979,11 +979,108 @@ impl SearchResult {
         self.ingress_info.get(&ingress_id)
     }
 
+    pub fn query_filter(&self) -> &QueryFilter {
+        &self.query_filter
+    }
+
     fn id_and_info(&self, ingress_id: IngressId) -> Option<IdAndInfo<'_>> {
         self.ingress_info
             .get(&ingress_id)
             .map(|info| (ingress_id, info).into())
     }
+
+    /// Write one JSON object per line (NDJSON / JSONL).
+    ///
+    /// Each line is a flat record uniquely identified by (prefix, ingressId).
+    /// A `section` field marks whether the line came from the matched prefix
+    /// itself or from the more-/less-specifics include sets, so no data is
+    /// lost relative to the nested JSON shape.
+    pub fn write_jsonl<W: std::io::Write>(
+        &self,
+        target: &mut W,
+    ) -> Result<(), crate::representation::OutputError> {
+        if let Some(prefix) = self.query_result.prefix {
+            for record in &self.query_result.records {
+                self.write_jsonl_line(target, prefix, record, "data")?;
+            }
+        }
+        if let Some(set) = self.query_result.more_specifics.as_ref() {
+            self.write_jsonl_recordset(target, set, "moreSpecifics")?;
+        }
+        if let Some(set) = self.query_result.less_specifics.as_ref() {
+            self.write_jsonl_recordset(target, set, "lessSpecifics")?;
+        }
+        Ok(())
+    }
+
+    fn write_jsonl_recordset<W: std::io::Write>(
+        &self,
+        target: &mut W,
+        set: &RecordSet<RotondaPaMap>,
+        section: &'static str,
+    ) -> Result<(), crate::representation::OutputError> {
+        for pr in set.v4.iter().chain(set.v6.iter()) {
+            for record in &pr.meta {
+                self.write_jsonl_line(target, pr.prefix, record, section)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn write_jsonl_line<W: std::io::Write>(
+        &self,
+        target: &mut W,
+        prefix: Prefix,
+        record: &Record<RotondaPaMap>,
+        section: &'static str,
+    ) -> Result<(), crate::representation::OutputError> {
+        let query_filter = &self.query_filter;
+        let ingress = self.id_and_info(record.multi_uniq_id);
+        let status = RouteStatusWrapper(record.status);
+        if query_filter.fields_path_attributes.is_some() {
+            let line = JsonlLineFiltered {
+                prefix,
+                section,
+                status,
+                ingress,
+                pamap: RotondaPaMapWithQueryFilter(&record.meta, query_filter),
+            };
+            serde_json::to_writer(&mut *target, &line)?;
+        } else {
+            let line = JsonlLine {
+                prefix,
+                section,
+                status,
+                ingress,
+                pamap: &record.meta,
+            };
+            serde_json::to_writer(&mut *target, &line)?;
+        }
+        target.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+#[derive(Serialize)]
+struct JsonlLine<'a, 'b> {
+    prefix: Prefix,
+    section: &'static str,
+    status: RouteStatusWrapper,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress: Option<IdAndInfo<'b>>,
+    #[serde(flatten)]
+    pamap: &'a RotondaPaMap,
+}
+
+#[derive(Serialize)]
+struct JsonlLineFiltered<'a, 'b, 'c> {
+    prefix: Prefix,
+    section: &'static str,
+    status: RouteStatusWrapper,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ingress: Option<IdAndInfo<'b>>,
+    #[serde(flatten)]
+    pamap: RotondaPaMapWithQueryFilter<'a, 'c>,
 }
 
 impl Serialize for SearchResult {

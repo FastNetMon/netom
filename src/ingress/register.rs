@@ -338,6 +338,24 @@ impl Register {
             .map(|info| (id, info.clone()).into())
     }
 
+    /// Filter all ingresses and emit one JSON object per line (JSONL/NDJSON).
+    ///
+    /// The returned buffer ends with a trailing newline after the last record,
+    /// which is the conventional shape for `application/x-ndjson`.
+    pub fn search_jsonl(&self, filter: QueryFilter) -> Vec<u8> {
+        let mut out = Vec::new();
+        let lock = self.info.read().unwrap();
+        for (&ingress_id, ingress_info) in
+            lock.iter().filter(|(_, info)| filter.filter(info))
+        {
+            let entry = IdAndInfo::from((ingress_id, ingress_info));
+            if serde_json::to_writer(&mut out, &entry).is_ok() {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
     /// Filter all ingresses based on a passed filter and return them
     pub fn search(&self, filter: QueryFilter) -> Vec<OwnedIdAndInfo> {
         // ALternatively, simply clone the entire thing and release the read-lock asap.

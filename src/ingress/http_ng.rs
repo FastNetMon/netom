@@ -10,7 +10,7 @@ use serde::Deserialize;
 use crate::{
     http_ng::{Api, ApiError, ApiState},
     ingress::{register::IngressState, IngressId, IngressInfo, IngressType},
-    representation::Json,
+    representation::{Json, OutputFormat},
     roto_runtime::types::PeerRibType,
 };
 
@@ -44,20 +44,19 @@ impl IngressApi {
         Query(filter): Query<QueryFilter>,
         state: State<ApiState>,
     ) -> Result<impl IntoResponse, ApiError> {
-        // Approach #1:
-        //let raw = serde_json::json!(
-        //    {"data": state.ingress_register.search()}
-        //);
-        //Ok(raw.to_string())
-
-        // Alternative approach:
-        let mut raw = String::from("{\"data\":").into_bytes();
-        let _ = state
-            .ingress_register
-            .search_and_output(filter, Json(&mut raw));
-
-        raw.push(b'}');
-        Ok(([("content-type", "application/json")], raw))
+        let format = filter.format;
+        let body = match format {
+            OutputFormat::Json => {
+                let mut raw = String::from("{\"data\":").into_bytes();
+                let _ = state
+                    .ingress_register
+                    .search_and_output(filter, Json(&mut raw));
+                raw.push(b'}');
+                raw
+            }
+            OutputFormat::Jsonl => state.ingress_register.search_jsonl(filter),
+        };
+        Ok(([("content-type", format.content_type())], body))
     }
 }
 
@@ -78,6 +77,9 @@ pub struct QueryFilter {
 
     #[serde(rename = "filter[peerAsn]")]
     pub remote_asn: Option<Asn>,
+
+    #[serde(default)]
+    pub format: OutputFormat,
 }
 
 impl QueryFilter {

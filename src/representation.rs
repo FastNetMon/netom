@@ -29,6 +29,28 @@ pub trait GenOutput<T> {
 
 pub struct Json<W: std::io::Write>(pub W);
 pub struct Cli<W: std::io::Write>(pub W);
+
+/// Output format selector for HTTP list endpoints.
+///
+/// `Json` is the default nested representation. `Jsonl` emits one JSON object
+/// per line (NDJSON / `application/x-ndjson`), suitable for `jq -c`, `wc -l`
+/// and other line-oriented pipeline tools.
+#[derive(Clone, Copy, Debug, Default, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OutputFormat {
+    #[default]
+    Json,
+    Jsonl,
+}
+
+impl OutputFormat {
+    pub fn content_type(self) -> &'static str {
+        match self {
+            OutputFormat::Json => "application/json",
+            OutputFormat::Jsonl => "application/x-ndjson",
+        }
+    }
+}
 // For Html, GenOutput is implemented on the specific Html structs (deriving RsHtml) directly.
 
 // Generate a GenOutput<Json<_>> using serde_json.
@@ -84,6 +106,14 @@ impl From<serde_json::Error> for OutputError {
             } else {
                 OutputErrorType::Other
             },
+        }
+    }
+}
+
+impl From<std::io::Error> for OutputError {
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            error_type: OutputErrorType::Io(err),
         }
     }
 }
