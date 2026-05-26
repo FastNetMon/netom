@@ -284,13 +284,6 @@ impl PeerAware for Updating {
         self.peer_states.find_sibling_pph(pph)
     }
 
-    fn remove_peer(
-        &mut self,
-        pph: &PerPeerHeader<Bytes>,
-    ) -> Option<PeerState> {
-        self.peer_states.remove_peer(pph)
-    }
-
     fn remove_peer_identity_siblings(
         &mut self,
         pph: &PerPeerHeader<Bytes>,

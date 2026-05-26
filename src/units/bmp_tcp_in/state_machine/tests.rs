@@ -8,7 +8,7 @@ use inetnum::{addr::Prefix, asn::Asn};
 //    builtin::{BuiltinTypeValue, NlriStatus, RouteContext},
 //    typevalue::TypeValue,
 //};
-use routecore::bmp::message::{Message as BmpMsg, PerPeerHeader};
+use routecore::bmp::message::{Message as BmpMsg, PerPeerHeader, RibType};
 
 use crate::{
     bgp::encode::{mk_per_peer_header, Announcements, Prefixes},
@@ -176,6 +176,30 @@ fn peer_up_with_eor_capable_peer() {
     //               ^ 1 connected router
     //                                 ^ 1 up peer
     //              and the peer is EoR capable ^
+}
+
+#[test]
+fn peer_down_decrements_eor_capable_peer_metric() {
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (pph, peer_up_msg_buf) =
+        mk_eor_capable_peer_up_notification_msg("127.0.0.1", 12345);
+    let peer_down_msg_buf = mk_peer_down_notification_msg(&pph);
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+    assert_metrics(&processor, ("Dumping", [1, 0, 0, 0, 0, 0, 1, 0, 1, 0]));
+
+    let processor = processor
+        .process_msg(Instant::now(), peer_down_msg_buf, None)
+        .next_state;
+
+    assert_metrics(&processor, ("Dumping", [1, 0, 0, 0, 0, 0, 0, 0, 0, 0]));
 }
 
 #[test]
@@ -659,6 +683,141 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
         );
     } else {
         unreachable!("expected Dumping after PeerDown");
+    }
+}
+
+#[test]
+fn peer_down_cleans_up_when_pph_variant_was_never_synthesized() {
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (_pph_pre, peer_up_msg_buf, real_pph_pre) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+
+    let mut pph_post = mk_per_peer_header("127.0.0.1", 12345);
+    pph_post.peer_flags = 0x40;
+    let route_mon_post_msg_buf = mk_route_monitoring_msg(&pph_post);
+
+    let mut pph_unknown_variant = mk_per_peer_header("127.0.0.1", 12345);
+    pph_unknown_variant.peer_flags = 0x20;
+    let peer_down_msg_buf =
+        mk_peer_down_notification_msg(&pph_unknown_variant);
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    let original_ingress_id = if let BmpState::Dumping(p) = &processor {
+        p.details
+            .peer_states
+            .get_peer_ingress_id(&real_pph_pre)
+            .expect("ingress for genuine peer")
+    } else {
+        unreachable!("expected Dumping after PeerUp");
+    };
+
+    let processor = processor
+        .process_msg(Instant::now(), route_mon_post_msg_buf, None)
+        .next_state;
+
+    let synthesized_ingress_id = if let BmpState::Dumping(p) = &processor {
+        assert_eq!(p.details.peer_states.get_peers().count(), 2);
+        p.details
+            .peer_states
+            .get_peers()
+            .filter_map(|pph| p.details.peer_states.get_peer_ingress_id(pph))
+            .find(|id| *id != original_ingress_id)
+            .expect("synthesized ingress_id distinct from original")
+    } else {
+        unreachable!("expected Dumping after RouteMonitoring");
+    };
+
+    let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
+
+    let MessageType::RoutingUpdate { update } = res.message_type else {
+        panic!(
+            "expected RoutingUpdate after PeerDown, got {:?}",
+            res.message_type
+        );
+    };
+    let entries = match update {
+        Update::WithdrawBulk(entries) => entries,
+        other => panic!(
+            "expected WithdrawBulk withdrawing both ingresses, got {:?}",
+            other
+        ),
+    };
+    assert_eq!(entries.len(), 2, "WithdrawBulk should cover both ingresses");
+    assert!(entries.iter().any(|(id, _)| *id == original_ingress_id));
+    assert!(entries.iter().any(|(id, _)| *id == synthesized_ingress_id));
+
+    if let BmpState::Dumping(p) = &res.next_state {
+        assert!(p.details.peer_states.is_empty());
+        assert!(p.ingress_register.get(synthesized_ingress_id).is_none());
+        assert!(p.ingress_register.get(original_ingress_id).is_some());
+    } else {
+        unreachable!("expected Dumping after PeerDown");
+    }
+}
+
+#[test]
+fn synthesized_peer_from_nulled_flags_updates_rib_type() {
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (_pph_pre, peer_up_msg_buf, real_pph_pre) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+
+    let mut pph_out = mk_per_peer_header("127.0.0.1", 12345);
+    pph_out.peer_flags = 0x10;
+    let route_mon_out_msg_buf = mk_route_monitoring_msg(&pph_out);
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    let original_ingress_id = if let BmpState::Dumping(p) = &processor {
+        p.details
+            .peer_states
+            .get_peer_ingress_id(&real_pph_pre)
+            .expect("ingress for genuine peer")
+    } else {
+        unreachable!("expected Dumping after PeerUp");
+    };
+
+    let processor = processor
+        .process_msg(Instant::now(), route_mon_out_msg_buf, None)
+        .next_state;
+
+    if let BmpState::Dumping(p) = &processor {
+        let synthesized_ingress_id = p
+            .details
+            .peer_states
+            .get_peers()
+            .filter_map(|pph| p.details.peer_states.get_peer_ingress_id(pph))
+            .find(|id| *id != original_ingress_id)
+            .expect("synthesized ingress_id distinct from original");
+        let synthesized_info =
+            p.ingress_register.get(synthesized_ingress_id).unwrap();
+        assert_eq!(synthesized_info.rib_type, Some(RibType::AdjRibOut));
+        assert_eq!(
+            synthesized_info.peer_rib_type,
+            Some(crate::roto_runtime::types::PeerRibType::OutPre)
+        );
+    } else {
+        unreachable!("expected Dumping after RouteMonitoring");
     }
 }
 

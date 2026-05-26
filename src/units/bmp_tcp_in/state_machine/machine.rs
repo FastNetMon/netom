@@ -435,23 +435,11 @@ pub trait PeerAware {
 
     fn get_peers(&self) -> Keys<'_, PerPeerHeader<Bytes>, PeerState>;
 
-    /// Remove all details about a peer.
-    ///
-    /// Returns true if the peer details (config, pending EoRs, announced routes, etc) were removed, false if the peer
-    /// is not known.
-    fn remove_peer(
-        &mut self,
-        pph: &PerPeerHeader<Bytes>,
-    ) -> Option<PeerState>;
-
     /// Remove every remaining PeerState whose peer identity matches
     /// `pph` (same peer_type/distinguisher/address/asn/bgp_id, only the
-    /// peer flags differ). Used by `peer_down` to reap any siblings of
-    /// the just-removed entry - synthesized clones produced by the
-    /// rib_type/policy-flag workaround in `route_monitoring()`, or, if
-    /// the PeerDown carries a synthesized PPH itself, the original
-    /// non-synthesized sibling. The exact-match entry must already be
-    /// removed via `remove_peer` before calling this.
+    /// peer flags differ). Used by `peer_down` to reap every view of a
+    /// logical peer, including synthesized clones produced by the
+    /// rib_type/policy-flag workaround in `route_monitoring()`.
     fn remove_peer_identity_siblings(
         &mut self,
         pph: &PerPeerHeader<Bytes>,
@@ -603,18 +591,16 @@ where
         //let withdrawals = self.mk_withdrawals_for_peers_routes(&pph);
         //let withdrawals = vec![];
 
-        if let Some(removed_peer) = self.details.remove_peer(&pph) {
-            // Reap any sibling PeerState that shares this peer's
-            // identity. The rib_type/policy-flag workaround in
-            // route_monitoring() can create entries keyed on a
-            // synthesized post-policy PPH alongside the original
-            // pre-policy PPH (or vice versa). Whichever flavor of PPH
-            // the PeerDown carries, every view of this logical peer
-            // must come down - otherwise FSM map entries leak,
-            // ingress_ids leak in the global register, and routes
-            // stored under those ingresses are never withdrawn.
-            let identity_siblings =
-                self.details.remove_peer_identity_siblings(&pph);
+        let removed_peers = self.details.remove_peer_identity_siblings(&pph);
+        if !removed_peers.is_empty() {
+            // Reap every PeerState that shares this peer's identity. The
+            // rib_type/policy-flag workaround in route_monitoring() can
+            // create entries keyed on a synthesized post-policy PPH alongside
+            // the original pre-policy PPH (or vice versa). Whichever flavor
+            // of PPH the PeerDown carries, every view of this logical peer
+            // must come down - otherwise FSM map entries leak, ingress_ids
+            // leak in the global register, and routes stored under those
+            // ingresses are never withdrawn.
 
             self.status_reporter.routing_update(UpdateReportMessage {
                 router_id: self.router_id.clone(),
@@ -628,13 +614,13 @@ where
                 last_invalid_withdrawal: None,
             });
 
-            let eor_capable = self.details.is_peer_eor_capable(&pph);
-
-            // Don't announce this above as it will cause metric
-            // underflow from 0 to MAX if there were no peers
-            // currently up.
-            self.status_reporter
-                .peer_down(self.router_id.clone(), eor_capable);
+            for peer in removed_peers.iter().filter(|peer| !peer.synthesized)
+            {
+                self.status_reporter.peer_down(
+                    self.router_id.clone(),
+                    Some(peer.eor_capable),
+                );
+            }
 
             // Build the WithdrawBulk and clean up the global ingress
             // register. Synthesized ingresses are dropped so they
@@ -670,27 +656,23 @@ where
                 }
             };
 
-            let removed_entry =
-                entry_for(&removed_peer, &self.ingress_register);
-            let sibling_entries: Vec<(
+            let entries: Vec<(
                 ingress::IngressId,
                 Option<ingress::IngressInfo>,
-            )> = identity_siblings
+            )> = removed_peers
                 .iter()
                 .map(|s| entry_for(s, &self.ingress_register))
                 .collect();
 
-            if sibling_entries.is_empty() && !removed_peer.synthesized {
+            if removed_peers.len() == 1 && !removed_peers[0].synthesized {
                 self.mk_routing_update_result(Update::Withdraw(
-                    removed_peer.ingress_id,
+                    removed_peers[0].ingress_id,
                     None,
                 ))
             } else {
-                let mut entries = SmallVec::<
+                let entries = entries.into_iter().collect::<SmallVec<
                     [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
-                >::new();
-                entries.push(removed_entry);
-                entries.extend(sibling_entries);
+                >>();
                 self.mk_routing_update_result(Update::WithdrawBulk(entries))
             }
 
@@ -867,6 +849,7 @@ where
                         .ingress_register
                         .get(existing_ingress_id)
                         .unwrap();
+                    adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
                     warn!("Registered a new ingress_id {} based on PeerUp with ingress_id {}, info {:?}",
@@ -1614,14 +1597,6 @@ impl PeerAware for PeerStates {
             .map(|(k, _)| k.clone())
             .collect();
         keys.into_iter().filter_map(|k| self.0.remove(&k)).collect()
-    }
-
-    //fn remove_peer(&mut self, pph: &PerPeerHeader<Bytes>) -> bool {
-    fn remove_peer(
-        &mut self,
-        pph: &PerPeerHeader<Bytes>,
-    ) -> Option<PeerState> {
-        self.0.remove(pph) //.is_some()
     }
 
     fn is_peer_eor_capable(
