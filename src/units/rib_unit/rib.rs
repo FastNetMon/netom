@@ -9,7 +9,7 @@ use std::{
 
 use chrono::{Duration, Utc};
 use inetnum::{addr::Prefix, asn::Asn};
-use log::{debug, error, trace, warn};
+use log::{debug, error, info, trace, warn};
 use rotonda_store::{
     epoch,
     errors::{FatalResult, PrefixStoreError},
@@ -1081,6 +1081,62 @@ impl Rib {
         filter: QueryFilter,
         target: &mut W,
     ) -> Result<(), crate::representation::OutputError> {
+        // Full-RIB dumps hold an epoch guard across the whole walk, which
+        // pins concurrent withdraw/insert garbage in the store until the
+        // walk completes. Log entry+exit so heavy dumps are attributable
+        // when RSS spikes correlate with HTTP activity.
+        let dump_start = std::time::Instant::now();
+        let ingress_filter = filter.ingress_id;
+        let has_roto = filter.roto_function.is_some();
+        info!(
+            "rib dump start: afisafi={afisafi} query_prefix={query_prefix} \
+             ingress_filter={ingress_filter:?} has_roto={has_roto}"
+        );
+        let mut prefixes_scanned: u64 = 0;
+        let mut prefixes_emitted: u64 = 0;
+        let mut records_emitted: u64 = 0;
+
+        let res = self.write_jsonl_stream_inner(
+            afisafi,
+            query_prefix,
+            filter,
+            target,
+            &mut prefixes_scanned,
+            &mut prefixes_emitted,
+            &mut records_emitted,
+        );
+
+        let elapsed = dump_start.elapsed();
+        let outcome = match &res {
+            Ok(_) => "ok",
+            Err(_) => "err",
+        };
+        // Warn on dumps that hold the epoch guard long enough to matter
+        // for reclamation latency; info otherwise.
+        let log_msg = format!(
+            "rib dump end: afisafi={afisafi} outcome={outcome} \
+             elapsed_ms={} prefixes_scanned={prefixes_scanned} \
+             prefixes_emitted={prefixes_emitted} records_emitted={records_emitted}",
+            elapsed.as_millis()
+        );
+        if elapsed >= std::time::Duration::from_secs(2) {
+            warn!("{log_msg}");
+        } else {
+            info!("{log_msg}");
+        }
+        res
+    }
+
+    fn write_jsonl_stream_inner<W: std::io::Write>(
+        &self,
+        afisafi: AfiSafiType,
+        query_prefix: Prefix,
+        filter: QueryFilter,
+        target: &mut W,
+        prefixes_scanned: &mut u64,
+        prefixes_emitted: &mut u64,
+        records_emitted: &mut u64,
+    ) -> Result<(), crate::representation::OutputError> {
         let guard = &epoch::pin();
 
         let store = match afisafi {
@@ -1142,6 +1198,8 @@ impl Rib {
             };
 
         for mut pr in iter {
+            *prefixes_scanned += 1;
+
             // 1. Filter out withdrawn records
             pr.meta.retain(|r| r.status != RouteStatus::Withdrawn);
             if pr.meta.is_empty() {
@@ -1159,6 +1217,8 @@ impl Rib {
                 continue;
             }
 
+            *prefixes_emitted += 1;
+
             // Determine if the prefix is the query prefix itself
             let section = if pr.prefix == query_prefix {
                 "data"
@@ -1167,6 +1227,7 @@ impl Rib {
             };
 
             for record in &pr.meta {
+                *records_emitted += 1;
                 let ingress = ingress_info
                     .get(&record.multi_uniq_id)
                     .map(|info| (record.multi_uniq_id, info).into());
