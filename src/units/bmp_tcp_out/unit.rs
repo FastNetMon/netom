@@ -278,15 +278,16 @@ impl DirectUpdate for BmpTcpOutRunner {
                     {
                         self.status_reporter
                             .buffer_overflow(client.remote_addr);
-                        // try_send: if the writer's mpsc is already full
-                        // of dump messages, the disconnect signal will
-                        // ride the queue naturally — we don't want to
-                        // stall direct_update (and therefore the whole
-                        // upstream pipeline) waiting for a slot. If the
-                        // queue is so full that try_send fails, the
-                        // writer is already overloaded and will exit on
-                        // the next write_all error anyway.
-                        let _ = client.tx.try_send(Vec::new());
+                        // Out-of-band signal: the writer task selects on
+                        // this notify alongside its mpsc, so it observes
+                        // shutdown even when the message queue is full
+                        // of dump messages. Using `tx.try_send(empty)`
+                        // here (the previous approach) silently lost the
+                        // signal whenever the mpsc was already saturated,
+                        // leaving the client in a zombie state where the
+                        // buffer was frozen at the cap but the writer
+                        // and dump task kept running.
+                        client.disconnect_notify.notify_one();
                     }
                 }
                 BufferUpdateResult::NotDumping => {
@@ -576,19 +577,31 @@ impl BmpTcpOutRunner {
         // Spawn writer task
         let status_reporter = self.status_reporter.clone();
         let clients_for_writer = self.clients.clone();
+        let disconnect_notify = client.disconnect_notify.clone();
 
         let mut writer = writer;
 
         crate::tokio::spawn(
             &format!("bmp-out-writer[{}]", client_addr),
             async move {
-                while let Some(msg) = rx.recv().await {
-                    if msg.is_empty() {
-                        // Empty message signals disconnect
-                        break;
-                    }
-                    if writer.write_all(&msg).await.is_err() {
-                        break;
+                // Select between the message channel and the out-of-band
+                // disconnect notify so that an overflow signal reaches us
+                // even when the mpsc is saturated with dump messages.
+                // The in-band empty-Vec marker is kept as a fallback for
+                // other code paths that may still use it.
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = disconnect_notify.notified() => break,
+                        msg = rx.recv() => match msg {
+                            Some(msg) => {
+                                if msg.is_empty() { break; }
+                                if writer.write_all(&msg).await.is_err() {
+                                    break;
+                                }
+                            }
+                            None => break,
+                        }
                     }
                 }
 

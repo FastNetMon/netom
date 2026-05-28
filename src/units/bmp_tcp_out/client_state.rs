@@ -1,11 +1,14 @@
 use std::{
     collections::HashSet,
     net::SocketAddr,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    },
 };
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
 
 use crate::ingress::IngressId;
@@ -74,6 +77,14 @@ pub struct ClientState {
     /// overflow" log line and queued another empty-Vec disconnect signal
     /// behind the still-draining dump messages.
     pub disconnect_pending: AtomicBool,
+
+    /// Out-of-band shutdown signal for the writer task. Used because the
+    /// in-band empty-Vec marker rides the same mpsc as dump messages — at
+    /// the moment of overflow that channel is full, so a `try_send` of
+    /// the empty Vec returns `Err` and the signal is silently dropped. A
+    /// `Notify` permit, by contrast, is held until consumed, so the
+    /// writer is guaranteed to observe it.
+    pub disconnect_notify: Arc<Notify>,
 }
 
 impl ClientState {
@@ -97,6 +108,7 @@ impl ClientState {
             max_buffer_bytes,
             buffered_bytes: AtomicUsize::new(0),
             disconnect_pending: AtomicBool::new(false),
+            disconnect_notify: Arc::new(Notify::new()),
         }
     }
 
