@@ -1123,12 +1123,16 @@ impl GenOutput<&mut Routes> for crate::units::rib_unit::rib::SearchResult {
         &self,
         target: &mut &mut Routes,
     ) -> Result<(), crate::representation::OutputError> {
-        dbg!(self.query_result.more_specifics.as_ref().unwrap().v4.len());
-        dbg!(self.query_result.more_specifics.as_ref().unwrap().v6.len());
-        debug!(
-            "in write, current Routes.routes.len: {}",
-            target.routes.len()
-        );
+        // Cap the number of prefix rows materialized into the page. The
+        // peer_asn / peer_ip / short-prefix views issue a /0 + moreSpecifics
+        // query that returns every route in the RIB; without a bound, a
+        // full-table RIB renders into one multi-hundred-MB HTML String and a
+        // few concurrent requests OOM the process. This caps the rendered
+        // output and the sustained memory; `write` is called once for v4 and
+        // once for v6, accumulating into the same page, so the bound is on the
+        // cumulative row count. (The transient store recordset built by
+        // search_routes is not bounded here.)
+        const MAX_ROWS: usize = 50_000;
 
         if let Some(prefix) = self.query_result.prefix {
             let routes =
@@ -1141,6 +1145,13 @@ impl GenOutput<&mut Routes> for crate::units::rib_unit::rib::SearchResult {
         let more_specifics =
             self.query_result.more_specifics.as_ref().unwrap();
         for r in more_specifics.v4.iter().chain(&more_specifics.v6) {
+            if target.more_specifics.len() >= MAX_ROWS {
+                warn!(
+                    "webui routes view truncated at {MAX_ROWS} prefixes; \
+                     narrow the query (by peer or prefix) for the full set"
+                );
+                break;
+            }
             let routes = self.collect_routes(r.meta.iter());
             if !routes.is_empty() {
                 target.more_specifics.push((r.prefix, routes));
@@ -1150,13 +1161,14 @@ impl GenOutput<&mut Routes> for crate::units::rib_unit::rib::SearchResult {
         let less_specifics =
             self.query_result.less_specifics.as_ref().unwrap();
         for r in less_specifics.v4.iter().chain(&less_specifics.v6) {
+            if target.less_specifics.len() >= MAX_ROWS {
+                break;
+            }
             let routes = self.collect_routes(r.meta.iter());
             if !routes.is_empty() {
                 target.less_specifics.push((r.prefix, routes));
             }
         }
-
-        debug!("end of write, Routes.routes.len: {}", target.routes.len());
 
         Ok(())
     }
