@@ -76,7 +76,7 @@ use crossbeam_utils::atomic::AtomicCell;
 use futures::future::{select, Either, Future};
 use futures::pin_mut;
 use inetnum::addr::Prefix;
-use log::{error, log_enabled, trace, Level};
+use log::{error, log_enabled, trace, warn, Level};
 use rotonda_store::match_options::MatchOptions;
 use serde::Deserialize;
 use tokio::sync::mpsc::Sender;
@@ -558,35 +558,52 @@ impl Gate {
         {
             let mut closed_sender_found = false;
             for (uuid, sender) in clone_senders.guard().iter() {
-                if !sender.is_closed() {
-                    if log_enabled!(Level::Trace) {
-                        let clone_txt = if self.is_clone() {
-                            format!("{} clone of ", self.clone_id())
-                        } else {
-                            String::new()
-                        };
-                        trace!(
-                            "Gate[{} ({}{})]: Notifying clone {} of command '{}'",
+                // Never block and never panic here. `notify_clones` runs
+                // inline in the parent gate's `process()` loop, so awaiting a
+                // full clone channel would freeze the whole unit, and the
+                // previous `.expect()` on `send().await` crashed the gate task
+                // on a clone-drop race (TOCTOU: the clone closes its receiver
+                // at drop time but the `DetachClone` that prunes `clone_senders`
+                // is only enqueued, so a just-dropped sender is still present
+                // here). `try_send` avoids both failure modes.
+                //
+                // A clone whose 16-slot command queue is full is one that does
+                // not drain its commands — e.g. the bgp-in peer-stats emitter,
+                // which only ever calls `update_data` and never `process()`.
+                // Such a clone never acts on commands anyway, so dropping the
+                // command is correct; previously this filled the queue and the
+                // parent's blocking send hung the unit after ~16 reconfigure /
+                // report-links cycles.
+                match sender.try_send(cmd.clone()) {
+                    Ok(()) => {
+                        if log_enabled!(Level::Trace) {
+                            let clone_txt = if self.is_clone() {
+                                format!("{} clone of ", self.clone_id())
+                            } else {
+                                String::new()
+                            };
+                            trace!(
+                                "Gate[{} ({}{})]: Notified clone {} of command '{}'",
+                                self.name,
+                                clone_txt,
+                                self.id(),
+                                uuid,
+                                cmd
+                            );
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        closed_sender_found = true;
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(
+                            "Gate[{} ({})]: clone {} command queue full, dropping '{}' (clone is not draining its commands)",
                             self.name,
-                            clone_txt,
                             self.id(),
                             uuid,
                             cmd
                         );
                     }
-                    sender.send(cmd.clone()).await.expect(
-                        "Internal error: failed to notify cloned gate",
-                    );
-                } else {
-                    if log_enabled!(Level::Trace) {
-                        let clone_txt = if self.is_clone() {
-                            format!("{} clone of ", self.clone_id())
-                        } else {
-                            String::new()
-                        };
-                        trace!("Gate[{} ({}{})]: Unable to notify clone {} of command '{}': sender is closed", self.name, clone_txt, self.id(), uuid, cmd);
-                    }
-                    closed_sender_found = true;
                 }
             }
 
