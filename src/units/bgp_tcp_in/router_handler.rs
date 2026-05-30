@@ -616,12 +616,36 @@ impl Processor {
             self.gate
                 .update_data(Update::Withdraw(session_ingress_id, None))
                 .await;
-            // Clean up the ingress register entry so it doesn't leak.
-            self.ingresses.remove(session_ingress_id);
-            // And the per-peer stats — the periodic emitter would
-            // otherwise keep publishing a stale Stats Report for a
-            // peer that's gone.
-            self.peer_stats.remove(session_ingress_id);
+            // A reconnecting session for the same (remote_addr, remote_asn)
+            // may have reused this ingress id (the reuse / collision-
+            // resolution paths above match on the peer tuple and ignore
+            // IngressState) while we were tearing down. Re-check ownership
+            // under the live_sessions lock — held across the check and the
+            // removal so a concurrent reconnect cannot insert in between — and
+            // only reclaim the register/stats entries if no live session now
+            // owns the id. Otherwise we would delete the registration and
+            // per-peer stats out from under the live, reconnected session
+            // (its stats would then be silently dropped by the periodic
+            // emitter and its peer-header metadata lost downstream).
+            let ls = live_sessions.lock().unwrap();
+            let reclaimed_by_new_session = ls
+                .values()
+                .any(|(_, _, _, _, id)| *id == session_ingress_id);
+            if !reclaimed_by_new_session {
+                // Clean up the ingress register entry so it doesn't leak.
+                self.ingresses.remove(session_ingress_id);
+                // And the per-peer stats — the periodic emitter would
+                // otherwise keep publishing a stale Stats Report for a
+                // peer that's gone.
+                self.peer_stats.remove(session_ingress_id);
+            } else {
+                debug!(
+                    "ingress {} reclaimed by a newer session; skipping \
+                     register/stats cleanup",
+                    session_ingress_id
+                );
+            }
+            drop(ls);
         }
 
         (session, rx_sess)
