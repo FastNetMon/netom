@@ -473,6 +473,15 @@ impl Register {
     ) -> Option<(IngressId, IngressInfo)> {
         let lock = self.info.read().unwrap();
         for (id, info) in lock.iter() {
+            // Only rebind to a Disconnected peer: a Connected entry belongs to
+            // a peer that is currently up (in this or a stale session), and
+            // reusing its mui would let two live peers write the same RIB
+            // records. Legitimate reuse (a flapped peer within a session, or a
+            // peer of a reconnected session) always finds the prior entry in
+            // the Disconnected state.
+            if info.state == Some(IngressState::Connected) {
+                continue;
+            }
             // peer_rib_type discriminates pre-policy vs post-policy variants
             // of the same (peer_addr, peer_asn). Without it, a BMP exporter
             // sending both pre- and post-policy Adj-RIB-In for the same peer
@@ -507,6 +516,14 @@ impl Register {
         let lock = self.info.read().unwrap();
         log::debug!("query: {query:?}");
         for (id, info) in lock.iter() {
+            // Never adopt an id that is still Connected: another (possibly
+            // stale half-open) session is using it. Reusing it would put two
+            // live sessions on one id, and the stale session's teardown would
+            // later withdraw the live one's routes and unmap it. A stale
+            // session must drop to Disconnected before its id can be reused.
+            if info.state == Some(IngressState::Connected) {
+                continue;
+            }
             if find_existing_for!(info, query,
                 {parent_ingress, remote_addr, ingress_type},
                 {name}

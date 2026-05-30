@@ -523,10 +523,10 @@ fn peer_down_cleans_up_synthesized_siblings() {
         .find(|(id, _)| *id == synthesized_ingress_id)
         .expect("WithdrawBulk should include the synthesized ingress_id");
     assert!(
-        synth_entry.1.is_some(),
-        "synthesized ingress entry must carry an inline IngressInfo \
-         snapshot - otherwise BMP out would race the register cleanup \
-         and emit a Peer Down with default PPH"
+        synth_entry.1.is_none(),
+        "Layer D: synthesized peers are now kept (Disconnected) on teardown \
+         rather than removed, so the WithdrawBulk snapshot is None; bmp-out \
+         looks the PPH up in the register, which still holds the entry"
     );
 
     if let BmpState::Dumping(p) = &res.next_state {
@@ -534,9 +534,15 @@ fn peer_down_cleans_up_synthesized_siblings() {
             p.details.peer_states.is_empty(),
             "peer_states map should be empty after PeerDown"
         );
-        assert!(
-            p.ingress_register.get(synthesized_ingress_id).is_none(),
-            "synthesized ingress {} should be deregistered after PeerDown",
+        // Layer D: synthesized peers are kept as Disconnected (for mui reuse
+        // on reconnect), not deregistered.
+        assert_eq!(
+            p.ingress_register
+                .get(synthesized_ingress_id)
+                .and_then(|i| i.state),
+            Some(crate::ingress::register::IngressState::Disconnected),
+            "synthesized ingress {} should be kept as Disconnected after \
+             PeerDown (Layer D)",
             synthesized_ingress_id
         );
         assert!(
@@ -649,9 +655,9 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
         .find(|(id, _)| *id == synthesized_ingress_id)
         .expect("WithdrawBulk should include the synthesized ingress_id");
     assert!(
-        synth_entry.1.is_some(),
-        "synthesized ingress entry must carry an inline IngressInfo \
-         snapshot - its register entry has just been removed"
+        synth_entry.1.is_none(),
+        "Layer D: synthesized peers are kept (Disconnected) on teardown, so \
+         the WithdrawBulk snapshot is None; bmp-out reads the register entry"
     );
     let orig_entry = entries
         .iter()
@@ -670,9 +676,13 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
              the original (non-synthesized) sibling that the previous \
              cleanup left behind"
         );
-        assert!(
-            p.ingress_register.get(synthesized_ingress_id).is_none(),
-            "synthesized ingress {} should be deregistered after PeerDown",
+        assert_eq!(
+            p.ingress_register
+                .get(synthesized_ingress_id)
+                .and_then(|i| i.state),
+            Some(crate::ingress::register::IngressState::Disconnected),
+            "synthesized ingress {} should be kept as Disconnected after \
+             PeerDown (Layer D)",
             synthesized_ingress_id
         );
         assert!(
@@ -759,7 +769,12 @@ fn peer_down_cleans_up_when_pph_variant_was_never_synthesized() {
 
     if let BmpState::Dumping(p) = &res.next_state {
         assert!(p.details.peer_states.is_empty());
-        assert!(p.ingress_register.get(synthesized_ingress_id).is_none());
+        assert_eq!(
+            p.ingress_register
+                .get(synthesized_ingress_id)
+                .and_then(|i| i.state),
+            Some(crate::ingress::register::IngressState::Disconnected)
+        );
         assert!(p.ingress_register.get(original_ingress_id).is_some());
     } else {
         unreachable!("expected Dumping after PeerDown");

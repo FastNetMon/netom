@@ -565,6 +565,43 @@ impl RibUnitRunner {
         // them.
         waitpoint.running().await;
 
+        // Layer C: periodically reclaim BMP peers that Layer D keeps as
+        // Disconnected (for mui reuse) but that never reconnected, so their
+        // mark-withdrawn records don't accumulate indefinitely. A Weak handle
+        // lets the task exit once the unit is torn down; the (blocking) sweep
+        // runs on the blocking pool so it never stalls a tokio worker.
+        {
+            let gc_rib = Arc::downgrade(&arc_self.rib);
+            crate::tokio::spawn(&"rib-gc".to_string(), async move {
+                const GC_INTERVAL: std::time::Duration =
+                    std::time::Duration::from_secs(300);
+                let mut interval = tokio::time::interval(GC_INTERVAL);
+                interval.tick().await; // consume the immediate first tick
+                let mut candidates: HashSet<ingress::IngressId> =
+                    HashSet::new();
+                loop {
+                    interval.tick().await;
+                    let Some(rib_swap) = gc_rib.upgrade() else {
+                        break; // rib unit gone; stop sweeping
+                    };
+                    let rib = rib_swap.load().clone();
+                    drop(rib_swap);
+                    let prev = std::mem::take(&mut candidates);
+                    candidates = match tokio::task::spawn_blocking(
+                        move || rib.gc_disconnected_bmp_peers(prev),
+                    )
+                    .await
+                    {
+                        Ok(next) => next,
+                        Err(e) => {
+                            error!("rib GC sweep task failed: {e}");
+                            HashSet::new()
+                        }
+                    };
+                }
+            });
+        }
+
         loop {
             match arc_self.gate.process().await {
                 Ok(status) => {

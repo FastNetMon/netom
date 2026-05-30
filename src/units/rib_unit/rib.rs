@@ -218,6 +218,22 @@ impl Rib {
             });
         }
 
+        // A reused mui (e.g. a synthesized peer whose session reconnected,
+        // or any peer that rebinds) may still be flagged withdrawn in the
+        // store's global `withdrawn_muis_bmin` from its previous teardown. A
+        // plain insert does not clear that flag, so the re-announced routes
+        // would be masked as withdrawn (the global flag overrides the local
+        // record status). Clear it on the first active (re)announcement.
+        // `mui_is_withdrawn_*` is a cheap lock-free bitmap check; the
+        // lock-taking `mark_ingress_active` only fires on the rare
+        // withdrawn->active transition, after which subsequent routes for this
+        // mui see it already active.
+        if route_status == RouteStatus::Active
+            && (store.mui_is_withdrawn_v4(mui) || store.mui_is_withdrawn_v6(mui))
+        {
+            self.mark_ingress_active(mui);
+        }
+
         let pubrec = Record::new(
             mui,
             ltime,
@@ -674,6 +690,54 @@ impl Rib {
         {
             error!("failed to mark MUI as active in multicast v6 rib: {e}")
         }
+    }
+
+    /// Layer C garbage-collection sweep. Reclaims the records of BMP-monitored
+    /// peers (`IngressType::BgpViaBmp`) that have stayed `Disconnected` across
+    /// at least one full sweep interval — i.e. peers torn down that did not
+    /// reconnect. Without this, the peers that Layer D keeps as Disconnected
+    /// (for mui reuse) would hold their mark-withdrawn records forever if they
+    /// never came back.
+    ///
+    /// Uses a two-sweep set rather than per-entry timestamps: `prev` is the
+    /// set seen Disconnected on the previous sweep; any still Disconnected now
+    /// have been idle for >= one interval and are reclaimed. Returns the set
+    /// to pass to the next sweep.
+    pub fn gc_disconnected_bmp_peers(
+        &self,
+        prev: HashSet<IngressId>,
+    ) -> HashSet<IngressId> {
+        let disconnected: HashSet<IngressId> = self
+            .ingress_register
+            .cloned_info()
+            .into_iter()
+            .filter(|(_, i)| {
+                i.state
+                    == Some(ingress::register::IngressState::Disconnected)
+                    && i.ingress_type
+                        == Some(ingress::IngressType::BgpViaBmp)
+            })
+            .map(|(id, _)| id)
+            .collect();
+
+        let to_reclaim: Vec<IngressId> =
+            disconnected.intersection(&prev).copied().collect();
+
+        if !to_reclaim.is_empty() {
+            self.remove_for_ingresses(&to_reclaim);
+            for id in &to_reclaim {
+                self.ingress_register.remove(*id);
+            }
+            info!(
+                "rib GC: reclaimed {} BMP peer(s) idle (Disconnected) for \
+                 >= one GC interval",
+                to_reclaim.len()
+            );
+        }
+
+        // Reclaimed ids are now gone from the register, so they won't appear
+        // in the next sweep's snapshot; returning the full current set is fine.
+        disconnected
     }
 
     pub fn match_prefix(

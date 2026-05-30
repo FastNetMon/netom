@@ -647,34 +647,29 @@ where
             // register. Synthesized ingresses are dropped so they
             // don't accumulate across peer flaps; the original
             // (non-synthesized) ingress is preserved so the next
-            // PeerUp can rebind it via find_existing_peer. For
-            // synthesized entries we snapshot the IngressInfo inline
-            // so downstream consumers (BMP out) can build a Peer Down
-            // with the correct PPH instead of falling back to
-            // IngressInfo::default() once the register entry is gone.
+            // Both synthesized and non-synthesized peers are preserved in the
+            // register as Disconnected (Layer D), so the next session can
+            // rebind the same IngressId via find_existing_peer — synthesized
+            // peers through the RouteMonitoring fallback, non-synthesized ones
+            // through PeerUp. Their RIB records are kept (mark-withdrawn) and
+            // reclaimed later by the rib unit's periodic GC sweep if the peer
+            // never reconnects. The `None` snapshot is fine for downstream
+            // (bmp-out) because the register entry still exists for lookup.
+            // Flipping to Disconnected also makes filters (e.g. the bmp-out
+            // dump) skip peers that currently have no active routes.
             let entry_for = |peer: &PeerState,
                              register: &Arc<ingress::Register>|
              -> (
                 ingress::IngressId,
                 Option<ingress::IngressInfo>,
             ) {
-                if peer.synthesized {
-                    (peer.ingress_id, register.remove(peer.ingress_id))
-                } else {
-                    // Non-synthesized entries are preserved in the
-                    // register so the next PeerUp can rebind the same
-                    // IngressId via find_existing_peer. Flip the state
-                    // to Disconnected so downstream filters (e.g. the
-                    // bmp-out dump) skip peers that currently have no
-                    // routes in the RIB.
-                    register.update_info(
-                        peer.ingress_id,
-                        ingress::IngressInfo::new().with_state(
-                            ingress::register::IngressState::Disconnected,
-                        ),
-                    );
-                    (peer.ingress_id, None)
-                }
+                register.update_info(
+                    peer.ingress_id,
+                    ingress::IngressInfo::new().with_state(
+                        ingress::register::IngressState::Disconnected,
+                    ),
+                );
+                (peer.ingress_id, None)
             };
 
             let entries: Vec<(
@@ -863,7 +858,6 @@ where
 
                     warn!("RouteMonitoring message received for which no PeerUp has been observed, \
                             but there was a matching PeerUp with all peer flags 0 (Adj-RIB-In Pre-policy)");
-                    let new_ingress_id = self.ingress_register.register();
                     let existing_ingress_id = self
                         .details
                         .get_peer_ingress_id(&pph_nulled_flags)
@@ -875,7 +869,20 @@ where
                     adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
-                    warn!("Registered a new ingress_id {} based on PeerUp with ingress_id {}, info {:?}",
+                    adapted_ingress_info.state =
+                        Some(ingress::register::IngressState::Connected);
+                    // Layer D reuse: if this synthesized (peer, policy) was
+                    // seen in a prior session and kept as Disconnected, rebind
+                    // its IngressId instead of minting a fresh one each session.
+                    // The Connected-guard in find_existing_peer ensures we
+                    // never adopt one a live session is using; re-announced
+                    // routes reactivate the mui via the rib insert path.
+                    let new_ingress_id = self
+                        .ingress_register
+                        .find_existing_peer(&adapted_ingress_info)
+                        .map(|(id, _)| id)
+                        .unwrap_or_else(|| self.ingress_register.register());
+                    warn!("Synthesized ingress_id {} based on PeerUp with ingress_id {}, info {:?}",
                         new_ingress_id, existing_ingress_id, adapted_ingress_info
                     );
                     self.ingress_register
@@ -918,7 +925,6 @@ where
                          from sibling PeerUp (peer={}, asn={}, rib_type={:?})",
                         pph.address(), pph.asn(), pph.rib_type()
                     );
-                    let new_ingress_id = self.ingress_register.register();
                     let existing_ingress_id = self
                         .details
                         .get_peer_ingress_id(&sibling_pph)
@@ -930,6 +936,14 @@ where
                     adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
+                    adapted_ingress_info.state =
+                        Some(ingress::register::IngressState::Connected);
+                    // Layer D reuse (see the nulled-flags arm above).
+                    let new_ingress_id = self
+                        .ingress_register
+                        .find_existing_peer(&adapted_ingress_info)
+                        .map(|(id, _)| id)
+                        .unwrap_or_else(|| self.ingress_register.register());
                     self.ingress_register
                         .update_info(new_ingress_id, adapted_ingress_info);
                     if !self.details.add_cloned_peer_config(
@@ -1414,16 +1428,16 @@ impl PeerStates {
     /// Tear down every peer tracked here in the global `register`, applying
     /// the same synthesized-vs-non-synthesized policy as `peer_down`:
     /// synthesized entries are removed (they exist only to bridge a missing
-    /// PeerUp; without removal they accumulate across BMP session flaps);
-    /// non-synthesized entries are flipped to Disconnected so the next
-    /// PeerUp can rebind the same IngressId via `find_existing_peer`.
+    /// PeerUp / RouteMonitoring fallback can rebind the same IngressId via
+    /// `find_existing_peer` (Layer D reuse). All peers — synthesized and not —
+    /// are flipped to Disconnected and kept in the register; their RIB records
+    /// are kept (mark-withdrawn) and reclaimed later by the rib unit's periodic
+    /// GC sweep if the peer never reconnects.
     ///
     /// Returns (ingress_id, snapshot) tuples in the shape used by
-    /// `Update::WithdrawBulk`: for synthesized entries the snapshot is the
-    /// just-removed `IngressInfo` (downstream consumers, e.g. bmp-out, need
-    /// it to construct a PeerDown PPH after the register entry is gone); for
-    /// non-synthesized entries the snapshot is `None` (downstream can look
-    /// it up in the register, which still holds the entry).
+    /// `Update::WithdrawBulk`. The snapshot is always `None`: downstream
+    /// consumers (e.g. bmp-out) look the PPH up in the register, which still
+    /// holds the (now Disconnected) entry.
     pub fn disconnect_into_register(
         &self,
         register: &ingress::Register,
@@ -1431,17 +1445,13 @@ impl PeerStates {
         self.0
             .values()
             .map(|peer| {
-                if peer.synthesized {
-                    (peer.ingress_id, register.remove(peer.ingress_id))
-                } else {
-                    register.update_info(
-                        peer.ingress_id,
-                        ingress::IngressInfo::new().with_state(
-                            ingress::register::IngressState::Disconnected,
-                        ),
-                    );
-                    (peer.ingress_id, None)
-                }
+                register.update_info(
+                    peer.ingress_id,
+                    ingress::IngressInfo::new().with_state(
+                        ingress::register::IngressState::Disconnected,
+                    ),
+                );
+                (peer.ingress_id, None)
             })
             .collect()
     }
