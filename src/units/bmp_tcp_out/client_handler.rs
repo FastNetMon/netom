@@ -664,7 +664,7 @@ async fn send_payload_to_client(
         &payload.rx_value,
         is_withdrawal,
     ) {
-        client.send_message(msg).await
+        client.send_message_mode(msg, blocking).await
     } else {
         true // Skip if we can't build the message
     }
