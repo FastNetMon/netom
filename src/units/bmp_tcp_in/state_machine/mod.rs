@@ -12,4 +12,7 @@ pub(super) use {
     processing::MessageType,
 };
 
-pub use {machine::BmpState, metrics::BmpStateMachineMetrics};
+pub use {
+    machine::{BmpState, BmpStateIdx},
+    metrics::BmpStateMachineMetrics,
+};

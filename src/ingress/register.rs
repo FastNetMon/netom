@@ -494,12 +494,12 @@ impl Register {
     /// For the BMP router level, the comparison is based on the parent
     /// `ingress_id` and the remote address (both must be set).
     ///
-    /// NB: ideally the sysName is also included when looking for existing routers. This is
-    /// currently not trivial without a larger refactor. As a result, multiple BMP exporters coming
-    /// from the same remote IP address connecting to the same Rotonda BMP unit will be seen as one
-    /// and the same, potentionally causing confusing issues. The workaround is not checking for
-    /// existing routers, causing increased memory use. As multiple exporters coming from one and
-    /// the same IP address is presumably unlikely, we keep the check as-is for now.
+    /// The `name` (sysName) is included so that multiple BMP exporters
+    /// connecting from the same remote IP address (e.g. behind a NAT) are kept
+    /// distinct. The query's `name` is only known once the Initiation message
+    /// has been parsed, so this is called from the `Initiating` state handler
+    /// (not at TCP-accept). Exporters that send no sysName share the
+    /// "no-sysname" sentinel, falling back to remote-address matching.
     pub fn find_existing_bmp_router(
         &self,
         query: &IngressInfo,
@@ -509,7 +509,7 @@ impl Register {
         for (id, info) in lock.iter() {
             if find_existing_for!(info, query,
                 {parent_ingress, remote_addr, ingress_type},
-                //{name} // to include the sysName in this check, we first need to refactor the BMP unit
+                {name}
             ) {
                 log::debug!("found matching bmp router, id {id}");
                 return Some((*id, info.clone()));

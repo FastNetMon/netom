@@ -40,9 +40,13 @@ use crate::{
 };
 
 use super::io::FatalError;
-use super::state_machine::{BmpState, BmpStateMachineMetrics, MessageType};
+use super::state_machine::{
+    BmpState, BmpStateIdx, BmpStateMachineMetrics, MessageType,
+};
+use super::types::RouterInfo;
 use super::unit::{RotoFunc, TracingMode};
 use super::util::format_source_id;
+use crate::common::frim::FrimMap;
 
 pub struct RouterHandler {
     gate: Gate,
@@ -148,25 +152,44 @@ impl RouterHandler {
         router_addr: SocketAddr,
         ingress_id: IngressId,
         ingress_register: Arc<ingress::Register>,
+        // The per-connection maps, so we can re-key them if the Initiation
+        // message reveals this is a reconnect of a known router (see
+        // read_from_router). Returns the final ingress id (the provisional
+        // one, or the existing one we rebound to) so the caller cleans up the
+        // right keys.
+        router_states: Arc<FrimMap<IngressId, Arc<Mutex<Option<BmpState>>>>>,
+        router_info: Arc<FrimMap<IngressId, Arc<RouterInfo>>>,
         // we need access to the ingress Register to register new IDs, for
         // every peer / session in the BMP connection
-    ) {
+    ) -> IngressId {
         // Discard the write half of the TCP stream as we are a "monitoring
         // station" and per the BMP RFC 7584 specification _"No BMP message is
         // ever sent from the monitoring station to the monitored router"_.
         // See: https://datatracker.ietf.org/doc/html/rfc7854#section-3.2
         let (rx, _tx) = tcp_stream.split();
-        self.read_from_router(rx, router_addr, ingress_id, ingress_register)
-            .await;
+        self.read_from_router(
+            rx,
+            router_addr,
+            ingress_id,
+            ingress_register,
+            router_states,
+            router_info,
+        )
+        .await
     }
 
     async fn read_from_router<T: AsyncRead + Unpin>(
         &self,
         rx: T,
         router_addr: SocketAddr,
-        ingress_id: IngressId,
+        mut ingress_id: IngressId,
         ingress_register: Arc<ingress::Register>,
-    ) {
+        router_states: Arc<FrimMap<IngressId, Arc<Mutex<Option<BmpState>>>>>,
+        router_info: Arc<FrimMap<IngressId, Arc<RouterInfo>>>,
+    ) -> IngressId {
+        // Whether we've settled this connection's ingress id (after the
+        // Initiation message resolves identity / a possible reconnect rebind).
+        let mut rebind_resolved = false;
         // Setup BMP streaming
         let mut stream =
             BmpStream::new(rx, self.gate.clone(), self.tracing_mode.clone());
@@ -277,6 +300,55 @@ impl RouterHandler {
                                 .remove_router_metrics(&router_id);
                             break;
                         }
+
+                        // After the Initiation message the state machine may
+                        // have rebound this connection to an existing router's
+                        // ingress id (a reconnect; see the Initiating handler).
+                        // Adopt it exactly once: re-key the per-connection
+                        // maps, free the now-unused provisional id, and tell
+                        // downstream the router reappeared. We keep checking
+                        // until the SM leaves Initiating, so a stray
+                        // pre-Initiation message can't make us settle early.
+                        if !rebind_resolved {
+                            let resolved = {
+                                let lock = self.state_machine.lock().await;
+                                lock.as_ref()
+                                    .map(|s| (s.ingress_id(), s.state_idx()))
+                            };
+                            if let Some((resolved_id, idx)) = resolved {
+                                if resolved_id != ingress_id {
+                                    debug!(
+                                        "BMP router reconnect: re-keying \
+                                         provisional ingress {ingress_id} -> \
+                                         {resolved_id}"
+                                    );
+                                    router_states.remove(&ingress_id);
+                                    router_states.insert(
+                                        resolved_id,
+                                        self.state_machine.clone(),
+                                    );
+                                    if let Some(ri) =
+                                        router_info.remove(&ingress_id)
+                                    {
+                                        router_info.insert(resolved_id, ri);
+                                    }
+                                    ingress_register.remove(ingress_id);
+                                    self.gate
+                                        .update_data(
+                                            Update::IngressReappeared(
+                                                resolved_id,
+                                            ),
+                                        )
+                                        .await;
+                                    ingress_id = resolved_id;
+                                    rebind_resolved = true;
+                                } else if idx != BmpStateIdx::Initiating {
+                                    // Settled on the provisional id (a new
+                                    // router); stop checking.
+                                    rebind_resolved = true;
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -337,6 +409,10 @@ impl RouterHandler {
         self.gate
             .update_data(Update::UpstreamStatusChange(new_status))
             .await;
+
+        // The (possibly rebound) id this connection settled on, so the caller
+        // removes the correct keys from router_states / router_info.
+        ingress_id
     }
 
     async fn process_msg(
@@ -664,6 +740,8 @@ mod tests {
             router_addr,
             source_id,
             Arc::new(ingress::Register::default()),
+            Arc::new(FrimMap::default()),
+            Arc::new(FrimMap::default()),
         );
 
         // Simulate the unit terminating. Without this the reader continues
@@ -755,6 +833,8 @@ mod tests {
                 router_addr,
                 source_id,
                 Arc::new(ingress::Register::default()),
+                Arc::new(FrimMap::default()),
+                Arc::new(FrimMap::default()),
             )
             .await;
 

@@ -363,6 +363,55 @@ impl Rib {
         }
     }
 
+    /// Physically remove every record for these ingress ids from the RIB,
+    /// reclaiming their memory — as opposed to `withdraw_for_ingresses`, which
+    /// only marks them withdrawn (a status bit) and keeps the records around.
+    ///
+    /// This is for ids that are gone for good: synthesized BMP peers that mint
+    /// a fresh ingress id every session and never rebind, so mark-withdraw
+    /// would leak one record slot per announced prefix forever. Disconnected
+    /// parents that may reappear must keep going through
+    /// `withdraw_for_ingresses` instead.
+    pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
+        if ids.is_empty() {
+            return;
+        }
+
+        // `remove_mui` clears the per-store `withdrawn_muis_bmin` bitmap (via
+        // mark_mui_as_active), the same CAS that livelocks under concurrent
+        // writers, so it must hold `withdraw_lock` just like the mark path.
+        // See the `withdraw_lock` field comment.
+        let _guard = self
+            .withdraw_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        for &id in ids {
+            if let Some(store) = (*self.unicast).as_ref() {
+                match store.remove_mui(id) {
+                    Ok((records, emptied)) => debug!(
+                        "removed MUI {id} from unicast rib: \
+                         {records} records, {emptied} prefixes emptied"
+                    ),
+                    Err(e) => error!(
+                        "failed to remove MUI {id} from unicast rib: {e}"
+                    ),
+                }
+            }
+            if let Some(store) = (*self.multicast).as_ref() {
+                match store.remove_mui(id) {
+                    Ok((records, emptied)) => debug!(
+                        "removed MUI {id} from multicast rib: \
+                         {records} records, {emptied} prefixes emptied"
+                    ),
+                    Err(e) => error!(
+                        "failed to remove MUI {id} from multicast rib: {e}"
+                    ),
+                }
+            }
+        }
+    }
+
     pub fn compact_withdrawn_attributes_for_ingress(
         &self,
         ingress_id: IngressId,

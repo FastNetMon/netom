@@ -497,6 +497,30 @@ impl RibUnitRunner {
         }
     }
 
+    /// Run `Rib::remove_for_ingresses` on the blocking pool.
+    ///
+    /// Same rationale as `signal_withdraws_blocking`: physical removal walks
+    /// the store and serialises through `withdraw_lock`, so running it inline
+    /// on a tokio worker can stall the whole pipeline. Used for ingresses that
+    /// are gone for good (synthesized peers already removed from the register),
+    /// where mark-withdraw would leak their records forever.
+    async fn signal_removes_blocking(
+        &self,
+        ids: Vec<ingress::IngressId>,
+    ) {
+        if ids.is_empty() {
+            return;
+        }
+        let rib = self.rib.load().clone();
+        if let Err(e) = tokio::task::spawn_blocking(move || {
+            rib.remove_for_ingresses(&ids);
+        })
+        .await
+        {
+            error!("remove blocking task failed: {}", e);
+        }
+    }
+
     /// Run `Rib::mark_ingress_active` on the blocking pool.
     ///
     /// Same rationale as `signal_withdraws_blocking`: it walks the same
@@ -664,9 +688,26 @@ impl RibUnitRunner {
 
             Update::WithdrawBulk(ref entries) => {
                 debug!("got WithdrawBulk for {} ids", entries.len());
-                let ids: Vec<_> =
-                    entries.iter().map(|(id, _)| (*id, None)).collect();
-                self.signal_withdraws_blocking(ids).await;
+                // Partition on the inline IngressInfo snapshot. `Some(info)`
+                // means a synthesized peer that bmp-in has *already* removed
+                // from the ingress register (it minted a fresh id this session
+                // and won't rebind) — gone for good, so physically reclaim its
+                // records. `None` means a Disconnected parent that may rebind
+                // via find_existing_peer and be reactivated by
+                // IngressReappeared — keep mark-withdraw so its records survive
+                // until then.
+                let mut mark: Vec<(ingress::IngressId, Option<AfiSafiType>)> =
+                    Vec::new();
+                let mut remove: Vec<ingress::IngressId> = Vec::new();
+                for (id, info) in entries.iter() {
+                    if info.is_some() {
+                        remove.push(*id);
+                    } else {
+                        mark.push((*id, None));
+                    }
+                }
+                self.signal_withdraws_blocking(mark).await;
+                self.signal_removes_blocking(remove).await;
                 self.gate.update_data(update).await;
             }
 

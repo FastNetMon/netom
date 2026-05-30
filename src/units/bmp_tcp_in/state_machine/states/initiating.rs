@@ -65,47 +65,76 @@ impl BmpStateDetails<Initiating> {
 
     #[allow(dead_code)]
     pub fn process_msg(
-        self,
+        mut self,
         bmp_msg: BmpMsg<Bytes>,
         _trace_id: Option<u8>,
     ) -> ProcessingResult {
         match bmp_msg {
             // already verified upstream
             BmpMsg::InitiationMessage(msg) => {
-                // TODO we need to do the find_existing_bmp_router check here instead of in the
-                // handler/unit, because here we have the sysName to use in the ingress query.
-                // That means that registering a new ID should also move here.
-                // With that, we'll have no ingress ID for this tcp connection until this point,
-                // but that should be fine.
-                self.ingress_register.update_info(
-                    self.ingress_id,
-                    ingress::IngressInfo::new()
-                        .with_state(
-                            ingress::register::IngressState::Connected,
-                        )
-                        .with_name(
-                            msg.information_tlvs()
-                                .find(|t| {
-                                    t.typ() == InformationTlvType::SysName
-                                })
-                                .map(|t| {
-                                    String::from_utf8_lossy(t.value())
-                                        .to_string()
-                                })
-                                .unwrap_or("no-sysname".to_string()),
-                        )
-                        .with_desc(
-                            msg.information_tlvs()
-                                .find(|t| {
-                                    t.typ() == InformationTlvType::SysDesc
-                                })
-                                .map(|t| {
-                                    String::from_utf8_lossy(t.value())
-                                        .to_string()
-                                })
-                                .unwrap_or("no-sysdesc".to_string()),
-                        ),
-                );
+                // Resolve this connection's router identity now that the
+                // Initiation message gives us the sysName. At TCP-accept a
+                // provisional ingress id was registered carrying
+                // {parent_ingress, remote_addr, ingress_type}; we fold in the
+                // sysName/sysDesc and look for an existing (reconnecting)
+                // router with the same identity. Doing the lookup here (rather
+                // than at accept, before any sysName is known) is what keeps
+                // distinct exporters behind a single NAT/IP from collapsing
+                // onto one ingress id.
+                let sys_name = msg
+                    .information_tlvs()
+                    .find(|t| t.typ() == InformationTlvType::SysName)
+                    .map(|t| String::from_utf8_lossy(t.value()).to_string())
+                    .unwrap_or("no-sysname".to_string());
+                let sys_desc = msg
+                    .information_tlvs()
+                    .find(|t| t.typ() == InformationTlvType::SysDesc)
+                    .map(|t| String::from_utf8_lossy(t.value()).to_string())
+                    .unwrap_or("no-sysdesc".to_string());
+
+                // Build the identity query from the provisional entry (it
+                // already holds parent_ingress + remote_addr + ingress_type)
+                // plus the sysName. The provisional entry has no `name` yet,
+                // so find_existing_bmp_router cannot match it against itself.
+                let identity = self
+                    .ingress_register
+                    .get(self.ingress_id)
+                    .unwrap_or_default()
+                    .with_state(ingress::register::IngressState::Connected)
+                    .with_name(sys_name)
+                    .with_desc(sys_desc);
+
+                match self.ingress_register.find_existing_bmp_router(&identity)
+                {
+                    Some((existing_id, _))
+                        if existing_id != self.ingress_id =>
+                    {
+                        // Reconnect of a known router (same parent_ingress +
+                        // remote_addr + sysName). Adopt its id so this
+                        // session's peers rebind to their previous muis.
+                        // Initiation is the first message, so nothing has been
+                        // bound to the provisional id yet; the connection
+                        // handler re-keys its maps, frees the provisional id,
+                        // and emits IngressReappeared once it sees the change.
+                        log::info!(
+                            "BMP router reconnect: adopting existing ingress \
+                             {existing_id} for sysName {:?} (provisional was \
+                             {})",
+                            identity.name,
+                            self.ingress_id,
+                        );
+                        self.ingress_register
+                            .update_info(existing_id, identity);
+                        self.ingress_id = existing_id;
+                    }
+                    _ => {
+                        // New router (or a distinct one behind the same NAT):
+                        // keep the provisional id, now fully identified.
+                        self.ingress_register
+                            .update_info(self.ingress_id, identity);
+                    }
+                }
+
                 let res = self.initiate(msg);
 
                 match res.message_type {

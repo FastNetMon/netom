@@ -237,7 +237,7 @@ where
 }
 
 impl BmpState {
-    pub fn _ingress_id(&self) -> ingress::IngressId {
+    pub fn ingress_id(&self) -> ingress::IngressId {
         match self {
             BmpState::Initiating(v) => v.ingress_id,
             BmpState::Dumping(v) => v.ingress_id,

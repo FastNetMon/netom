@@ -415,29 +415,18 @@ impl BmpTcpInRunner {
                             .with_parent_ingress(unit_ingress_id)
                             .with_remote_addr(client_addr.ip())
                             .with_ingress_type(ingress::IngressType::Bmp);
-                        let router_ingress_id;
-                        // TODO the check for existing routers needs to go to where the
-                        // InitiationMessage is processed. There we have the sysName/sysDesc.
-                        // We can't fill up `query_ingress` appropriately here.
-                        // So, this check _and_ the .register() needs to go into initiating.rs
-                        if let Some((ingress_id, _ingress_info)) = self
-                            .ingress_register
-                            .find_existing_bmp_router(&query_ingress)
-                        {
-                            router_ingress_id = ingress_id;
-                            self.gate
-                                .update_data(Update::IngressReappeared(
-                                    ingress_id,
-                                ))
-                                .await;
-                        } else {
-                            router_ingress_id =
-                                self.ingress_register.register();
-                            self.ingress_register.update_info(
-                                router_ingress_id,
-                                query_ingress,
-                            );
-                        }
+                        // Register a provisional ingress id for this TCP
+                        // connection. The router's real identity (incl.
+                        // sysName) and any rebind to an existing id on
+                        // reconnect is resolved once the Initiation message
+                        // arrives (see initiating.rs and
+                        // RouterHandler::read_from_router) — the sysName isn't
+                        // known until then, and resolving here on remote_addr
+                        // alone would conflate distinct exporters behind a NAT.
+                        let router_ingress_id =
+                            self.ingress_register.register();
+                        self.ingress_register
+                            .update_info(router_ingress_id, query_ingress);
 
                         let state_machine = Arc::new(Mutex::new(Some(
                             self.router_connected(router_ingress_id),
@@ -640,11 +629,21 @@ impl ConfigAcceptor for BmpTcpInRunner {
         let tcp_stream = tcp_stream.into_inner().unwrap();
 
         crate::tokio::spawn(&child_name, async move {
-            router_handler
-                .run(tcp_stream, client_addr, ingress_id, ingress_register)
+            // run() returns the id the connection settled on: the provisional
+            // id, or an existing router's id if the Initiation message
+            // revealed a reconnect. Remove the keys it actually ended up under.
+            let final_ingress_id = router_handler
+                .run(
+                    tcp_stream,
+                    client_addr,
+                    ingress_id,
+                    ingress_register,
+                    router_states.clone(),
+                    router_info.clone(),
+                )
                 .await;
-            router_states.remove(&ingress_id);
-            router_info.remove(&ingress_id);
+            router_states.remove(&final_ingress_id);
+            router_info.remove(&final_ingress_id);
         });
     }
 }
