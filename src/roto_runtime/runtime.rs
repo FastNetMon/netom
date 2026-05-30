@@ -1549,12 +1549,7 @@ fn announcements_count(bgp_update: &BgpUpdateMessage<Bytes>) -> u64 {
 
 fn withdrawals_count(bgp_update: &BgpUpdateMessage<Bytes>) -> u64 {
     if let Ok(iter) = bgp_update.withdrawals() {
-        let res = iter.count().try_into().unwrap_or(u32::MAX);
-        if res > 0 {
-            dbg!(res, bgp_update.afi_safis());
-            eprintln!("{}", bgp_update.fmt_pcap_string());
-        }
-        res
+        iter.count().try_into().unwrap_or(u32::MAX)
     } else {
         0
     }
