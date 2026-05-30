@@ -91,6 +91,76 @@ impl FileRunner {
         }
     }
 
+    /// Write one output record to the target file.
+    ///
+    /// Returns `Err` on any I/O or serialization failure instead of
+    /// panicking, so the run loop can log and degrade gracefully rather than
+    /// taking the whole target task down on a transient/environmental write
+    /// fault.
+    async fn write_record(
+        &mut self,
+        m: OutputStreamMessageRecord,
+    ) -> std::io::Result<()> {
+        let Some(dst) = self.target_file.as_mut() else {
+            return Ok(());
+        };
+
+        if let OutputStreamMessageRecord::Entry(ref e) = m {
+            if let Some(ref custom_str) = e.custom {
+                if e.timestamp != chrono::DateTime::UNIX_EPOCH {
+                    dst.write_all(
+                        format!(
+                            "[{}] ",
+                            e.timestamp.to_rfc3339_opts(
+                                SecondsFormat::Secs,
+                                true
+                            )
+                        )
+                        .as_ref(),
+                    )
+                    .await?;
+                }
+                dst.write_all(custom_str.as_ref()).await?;
+                dst.write_all(b"\n").await?;
+                return Ok(());
+            }
+        }
+
+        match self.config.format {
+            Format::Csv => {
+                let mut wrt = csv::WriterBuilder::new()
+                    .has_headers(false)
+                    .from_writer(vec![]);
+                wrt.serialize(m)
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                let bytes = wrt
+                    .into_inner()
+                    .map_err(|e| std::io::Error::other(e.to_string()))?;
+                dst.write_all(&bytes).await?;
+            }
+            Format::Json => {
+                if let Ok(bytes) = serde_json::to_vec(&m) {
+                    dst.write_all(&bytes).await?;
+                    dst.write_all(b"\n").await?;
+                }
+            }
+            Format::JsonMin => {
+                if let OutputStreamMessageRecord::Entry(e) = m {
+                    if let Ok(bytes) =
+                        serde_json::to_vec(&e.into_minimal())
+                    {
+                        dst.write_all(&bytes).await?;
+                        dst.write_all(b"\n").await?;
+                    }
+                } else if let Ok(bytes) = serde_json::to_vec(&m) {
+                    dst.write_all(&bytes).await?;
+                    dst.write_all(b"\n").await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn run(
         mut self,
         mut sources: Link,
@@ -178,72 +248,21 @@ impl FileRunner {
                         Update::OutputStream(msgs) => {
                             for m in *msgs {
                                 let m = m.into_record();
-                                if let Some(dst) = self.target_file.as_mut() {
-                                    if let OutputStreamMessageRecord::Entry(
-                                        ref e,
-                                    ) = m
-                                    {
-                                        if let Some(ref custom_str) = e.custom
-                                        {
-                                            if e.timestamp != chrono::DateTime::UNIX_EPOCH {
-                                                dst.write_all(
-                                                    format!(
-                                                        "[{}] ",
-                                                        e.timestamp.to_rfc3339_opts(SecondsFormat::Secs, true)
-                                                    ).as_ref()
-                                                ).await.unwrap();
-                                            }
-                                            dst.write_all(
-                                                custom_str.as_ref(),
-                                            )
-                                            .await
-                                            .unwrap();
-                                            dst.write_all(b"\n")
-                                                .await
-                                                .unwrap();
-                                            continue;
-                                        }
-                                    }
-                                    match self.config.format {
-                                        Format::Csv => {
-                                            let mut wrt =
-                                                csv::WriterBuilder::new()
-                                                    .has_headers(false)
-                                                    .from_writer(vec![]);
-                                            wrt.serialize(m).unwrap();
-                                            dst.write_all(
-                                                &wrt.into_inner().unwrap(),
-                                            )
-                                            .await
-                                            .unwrap();
-                                        }
-                                        Format::Json => {
-                                            if let Ok(bytes) =
-                                                serde_json::to_vec(&m)
-                                            {
-                                                dst.write_all(&bytes)
-                                                    .await
-                                                    .unwrap();
-                                                dst.write_all(b"\n")
-                                                    .await
-                                                    .unwrap();
-                                            }
-                                        }
-                                        Format::JsonMin => {
-                                            if let OutputStreamMessageRecord::Entry(e) = m {
-                                                if let Ok(bytes) = serde_json::to_vec(&e.into_minimal()) {
-                                                    dst.write_all(&bytes).await.unwrap();
-                                                    dst.write_all(b"\n").await.unwrap();
-                                                }
-                                            } else {
-                                                // same as Json case
-                                                if let Ok(bytes) = serde_json::to_vec(&m) {
-                                                    dst.write_all(&bytes).await.unwrap();
-                                                    dst.write_all(b"\n").await.unwrap();
-                                                }
-                                            }
-                                        }
-                                    }
+                                // A write failure (disk full, read-only FS,
+                                // broken FIFO/EPIPE, ...) must not panic and
+                                // kill the target task -- doing so silently
+                                // lost all file output for the life of the
+                                // process. Log it and drop the rest of this
+                                // batch; the next update retries (mirrors the
+                                // error-swallowing `flush()` already used).
+                                if let Err(e) = self.write_record(m).await {
+                                    warn!(
+                                        "file-out: write to {} failed: {e}; \
+                                         dropping remaining records in this \
+                                         batch",
+                                        self.config.filename.display()
+                                    );
+                                    break;
                                 }
                             }
                         }
