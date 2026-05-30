@@ -70,7 +70,7 @@ pub(super) struct MqttRunner<C> {
     component: Component,
     config: Arc<ArcSwap<Config>>,
     client: Arc<ArcSwapOption<C>>,
-    pub_q_tx: Option<mpsc::UnboundedSender<SenderMsg>>,
+    pub_q_tx: Option<mpsc::Sender<SenderMsg>>,
     status_reporter: Arc<MqttStatusReporter>,
     ingresses: Arc<ingress::Register>,
 }
@@ -102,7 +102,7 @@ where
     #[cfg(test)]
     pub fn mock(
         config: Arc<ArcSwap<Config>>,
-        pub_q_tx: Option<mpsc::UnboundedSender<SenderMsg>>,
+        pub_q_tx: Option<mpsc::Sender<SenderMsg>>,
     ) -> (Self, Arc<MqttStatusReporter>) {
         let metrics = Arc::new(MqttMetrics::new());
 
@@ -138,7 +138,13 @@ where
         let component = &mut self.component;
         let _unit_name = component.name().clone();
 
-        let (pub_q_tx, pub_q_rx) = mpsc::unbounded_channel();
+        // Bound the internal publish queue (previously unbounded, so a
+        // broker that was slow/unreachable grew it without limit -> OOM).
+        // Size it from `queue_size`, the same knob that bounds rumqttc's
+        // request channel; clamp to >= 1 since channel(0) panics.
+        let pub_q_capacity =
+            (self.config.load().queue_size as usize).max(1);
+        let (pub_q_tx, pub_q_rx) = mpsc::channel(pub_q_capacity);
         self.pub_q_tx = Some(pub_q_tx);
 
         let arc_self = Arc::new(self);
@@ -163,7 +169,7 @@ where
         self: &Arc<Self>,
         mut sources: Option<NonEmpty<DirectLink>>,
         mut cmd_rx: mpsc::Receiver<TargetCommand>,
-        mut pub_q_rx: mpsc::UnboundedReceiver<SenderMsg>,
+        mut pub_q_rx: mpsc::Receiver<SenderMsg>,
     ) -> Result<(), Terminated>
     where
         <F as ConnectionFactory>::EventLoopType: 'static,
@@ -192,7 +198,7 @@ where
         mut connection: Connection<C>,
         sources: &mut Option<NonEmpty<DirectLink>>,
         cmd_rx: &mut mpsc::Receiver<TargetCommand>,
-        pub_q_rx: &mut mpsc::UnboundedReceiver<SenderMsg>,
+        pub_q_rx: &mut mpsc::Receiver<SenderMsg>,
     ) -> Result<(), Terminated> {
         while connection.active() {
             tokio::select! {
@@ -475,11 +481,18 @@ where
                 for osm in *msgs {
                     if let Some(msg) = self.output_stream_message_to_msg(osm)
                     {
-                        if let Err(err) =
-                            self.pub_q_tx.as_ref().unwrap().send(msg)
-                        //.await
-                        {
-                            error!("failed to send MQTT message: {err}");
+                        // Non-blocking enqueue: direct_update runs inline on
+                        // the gate fan-out, so it must not park. On a full
+                        // bounded queue (broker slow/unreachable) drop the
+                        // message and count it rather than grow memory.
+                        match self.pub_q_tx.as_ref().unwrap().try_send(msg) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                self.status_reporter.queue_full_drop();
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                error!("MQTT publish queue closed");
+                            }
                         }
                     }
                 }

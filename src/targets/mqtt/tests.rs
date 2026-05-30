@@ -598,7 +598,7 @@ fn mk_mqtt_runner_task() -> (
     // Warning: If either tx or cmd_tx are dropped the spawned runner will
     // exit, so hold on to them, don't do `let _ =` as that will drop them
     // immediately.
-    let (pub_q_tx, pub_q_rx) = mpsc::unbounded_channel();
+    let (pub_q_tx, pub_q_rx) = mpsc::channel(100);
     let (cmd_tx, cmd_rx) = mpsc::channel(100);
 
     let config = mk_mqtt_runner_config();

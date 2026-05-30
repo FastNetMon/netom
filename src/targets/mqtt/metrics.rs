@@ -17,6 +17,7 @@ pub struct MqttMetrics {
     pub connection_lost_count: AtomicUsize,
     pub connection_error_count: AtomicUsize,
     pub publish_error_count: AtomicUsize,
+    pub queue_full_drop_count: AtomicUsize,
     pub in_flight_count: AtomicU16,
     // pub not_acknowledged_count: AtomicUsize,
     topics: Arc<FrimMap<Arc<String>, Arc<TopicMetrics>>>,
@@ -86,6 +87,12 @@ impl MqttMetrics {
         MetricType::Counter,
         MetricUnit::Total,
     );
+    const QUEUE_FULL_DROP_COUNT_METRIC: Metric = Metric::new(
+        "mqtt_target_queue_full_drop_count",
+        "the number of messages dropped because the internal publish queue was full (broker slow or unreachable)",
+        MetricType::Counter,
+        MetricUnit::Total,
+    );
     const IN_FLIGHT_COUNT_PER_TOPIC_METRIC: Metric = Metric::new(
         "mqtt_target_in_flight_count",
         "the number of messages requested for publication but not yet sent to the MQTT broker per topic",
@@ -132,6 +139,11 @@ impl metrics::Source for MqttMetrics {
             &Self::PUBLISH_ERROR_COUNT_PER_TOPIC_METRIC,
             Some(unit_name),
             self.publish_error_count.load(SeqCst),
+        );
+        target.append_simple(
+            &Self::QUEUE_FULL_DROP_COUNT_METRIC,
+            Some(unit_name),
+            self.queue_full_drop_count.load(SeqCst),
         );
         // target.append_simple(
         //     &Self::PUBLISH_NOT_ACKNOWLEDGED_COUNT_METRIC,

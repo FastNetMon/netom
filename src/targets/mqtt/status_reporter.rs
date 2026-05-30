@@ -89,6 +89,13 @@ impl MqttStatusReporter {
         self.metrics.publish_error_count.fetch_add(1, SeqCst);
     }
 
+    /// A message was dropped because the bounded internal publish queue was
+    /// full (broker slow/unreachable). Metric-only: incrementing without a
+    /// log line avoids flooding logs during a sustained broker outage.
+    pub fn queue_full_drop(&self) {
+        self.metrics.queue_full_drop_count.fetch_add(1, SeqCst);
+    }
+
     pub fn inflight_update(&self, inflight: u16) {
         self.metrics.in_flight_count.store(inflight, SeqCst);
     }
