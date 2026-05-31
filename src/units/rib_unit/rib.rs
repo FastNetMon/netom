@@ -117,7 +117,7 @@ impl Rib {
     /// * `bmp-out buffered` large/growing ⇒ a slow consumer's dump backlog.
     /// * `RSS` is the bottom line — cross-check it against the sum of the above
     ///   to see whether the leak is accounted for here or somewhere unmeasured.
-    pub fn report_memory(&self) {
+    pub fn report_memory(&self, status_split: bool) {
         use crate::mem_stats::{
             bmp_out_snapshot, fmt_bytes, fmt_count, read_rss_bytes,
         };
@@ -181,6 +181,59 @@ impl Rib {
             reg.state_unset,
             reg.bgp_via_bmp,
         );
+
+        // Optional Active/Withdrawn split of the per-(prefix, mui) route
+        // slots. `routes/variants` counts every physically-resident slot
+        // regardless of status, so a runaway count with flat prefixes is
+        // either (a) Withdrawn slots retained under still-live peers — a
+        // mark-withdrawn graveyard that only whole-mui removal reclaims — or
+        // (b) slots under muis that have left the ingress register entirely
+        // and so are invisible to the Disconnected-only GC. The withdrawn %
+        // distinguishes status; `store-muis` vs the `ingress total` line
+        // above distinguishes (a) (roughly equal) from (b) (store-muis far
+        // larger).
+        //
+        // This walks every record in the store (cost ~ a full RIB dump, and
+        // it pins epoch garbage for the whole walk), so it only runs when the
+        // rib unit's `memstat_status_split` config flag is on (hot-reloadable;
+        // off by default). Leave it off for normal operation.
+        if status_split {
+            for (label, store) in [
+                ("unicast", self.unicast.as_ref()),
+                ("multicast", self.multicast.as_ref()),
+            ] {
+                let Some(store) = store else {
+                    continue;
+                };
+                let guard = &epoch::pin();
+                let mut active = 0usize;
+                let mut withdrawn = 0usize;
+                let mut muis: HashSet<u32> = HashSet::new();
+                for pr in store.prefixes_iter(guard).flatten() {
+                    for r in pr.meta.iter() {
+                        muis.insert(r.multi_uniq_id);
+                        if r.status == RouteStatus::Withdrawn {
+                            withdrawn += 1;
+                        } else {
+                            active += 1;
+                        }
+                    }
+                }
+                let total = active + withdrawn;
+                let pct = if total > 0 {
+                    withdrawn as f64 * 100.0 / total as f64
+                } else {
+                    0.0
+                };
+                info!(
+                    "memstat: {label} route-status active={} withdrawn={} \
+                     ({pct:.1}% withdrawn) store-muis={}",
+                    fmt_count(active),
+                    fmt_count(withdrawn),
+                    fmt_count(muis.len()),
+                );
+            }
+        }
     }
 
     pub fn insert(

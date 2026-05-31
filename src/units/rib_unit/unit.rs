@@ -184,6 +184,13 @@ pub struct RibUnit {
     /// Whether identical path attribute blobs are shared between stored routes.
     #[serde(default)]
     pub deduplicate_path_attributes: bool,
+
+    /// Whether the periodic `memstat` report includes an Active/Withdrawn
+    /// route-status split. This walks every record in the store (cost ~ a full
+    /// RIB dump and it pins epoch garbage for the walk), so it is off by
+    /// default; enable it briefly for leak diagnosis. Hot-reloadable.
+    #[serde(default)]
+    pub memstat_status_split: bool,
 }
 
 impl RibUnit {
@@ -199,6 +206,7 @@ impl RibUnit {
             self.filter_name.unwrap_or_default(),
             self.retain_withdrawn_attributes,
             self.deduplicate_path_attributes,
+            self.memstat_status_split,
         )
         .map_err(|_| Terminated)?
         .run(self.sources, waitpoint)
@@ -233,6 +241,7 @@ pub struct RibUnitRunner {
     status_reporter: Arc<RibUnitStatusReporter>,
     retain_withdrawn_attributes: Arc<AtomicBool>,
     deduplicate_path_attributes: Arc<AtomicBool>,
+    memstat_status_split: Arc<AtomicBool>,
     _process_metrics: Arc<TokioTaskMetrics>,
     #[allow(dead_code)] // this will go
     tracer: Arc<Tracer>,
@@ -263,6 +272,7 @@ impl RibUnitRunner {
         filter_name: FilterName,
         retain_withdrawn_attributes: bool,
         deduplicate_path_attributes: bool,
+        memstat_status_split: bool,
     ) -> Result<Self, PrefixStoreError> {
         let unit_name = component.name().clone();
         let gate = Arc::new(gate);
@@ -380,6 +390,9 @@ impl RibUnitRunner {
             deduplicate_path_attributes: Arc::new(AtomicBool::new(
                 deduplicate_path_attributes,
             )),
+            memstat_status_split: Arc::new(AtomicBool::new(
+                memstat_status_split,
+            )),
             filter_name,
             _process_metrics,
             rib_merge_update_stats,
@@ -445,6 +458,7 @@ impl RibUnitRunner {
             status_reporter,
             retain_withdrawn_attributes,
             deduplicate_path_attributes,
+            memstat_status_split: Arc::new(AtomicBool::new(false)),
             rtr_cache: Default::default(),
             filter_name,
             _process_metrics,
@@ -611,6 +625,7 @@ impl RibUnitRunner {
         // it briefly locks the interner shards and the register.
         {
             let stats_rib = Arc::downgrade(&arc_self.rib);
+            let stats_split = arc_self.memstat_status_split.clone();
             crate::tokio::spawn(&"rib-memstat".to_string(), async move {
                 const MEMSTAT_INTERVAL: std::time::Duration =
                     std::time::Duration::from_secs(300);
@@ -623,8 +638,9 @@ impl RibUnitRunner {
                     };
                     let rib = rib_swap.load().clone();
                     drop(rib_swap);
+                    let split = stats_split.load(Ordering::Relaxed);
                     if let Err(e) = tokio::task::spawn_blocking(move || {
-                        rib.report_memory()
+                        rib.report_memory(split)
                     })
                     .await
                     {
@@ -649,6 +665,8 @@ impl RibUnitRunner {
                                         new_retain_withdrawn_attributes,
                                     deduplicate_path_attributes:
                                         new_deduplicate_path_attributes,
+                                    memstat_status_split:
+                                        new_memstat_status_split,
                                 }),
                         } => {
                             arc_self.status_reporter.reconfigured();
@@ -658,6 +676,10 @@ impl RibUnitRunner {
                             );
                             arc_self.deduplicate_path_attributes.store(
                                 new_deduplicate_path_attributes,
+                                Ordering::Relaxed,
+                            );
+                            arc_self.memstat_status_split.store(
+                                new_memstat_status_split,
                                 Ordering::Relaxed,
                             );
 
