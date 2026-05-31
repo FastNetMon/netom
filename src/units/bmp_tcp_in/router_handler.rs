@@ -65,6 +65,9 @@ pub struct RouterHandler {
     #[allow(dead_code)]
     rtr_cache: Arc<RtrCache>,
     ingress_register: Arc<ingress::Register>,
+    /// Drop Adj-RIB-In post-policy Route Monitoring at ingest (see the unit's
+    /// `ignore_post_policy_routes` config). Captured at connection accept.
+    ignore_post_policy_routes: bool,
 }
 
 impl RouterHandler {
@@ -81,6 +84,7 @@ impl RouterHandler {
         last_msg_at: Option<Arc<RwLock<DateTime<Utc>>>>,
         bmp_metrics: Arc<BmpStateMachineMetrics>,
         ingress_register: Arc<ingress::Register>,
+        ignore_post_policy_routes: bool,
     ) -> Self {
         Self {
             gate,
@@ -95,6 +99,7 @@ impl RouterHandler {
             bmp_metrics,
             rtr_cache: Default::default(),
             ingress_register,
+            ignore_post_policy_routes,
         }
     }
 
@@ -140,6 +145,7 @@ impl RouterHandler {
             roto_function: None,
             roto_context: Arc::new(std::sync::Mutex::new(Ctx::empty())),
             ingress_register: Default::default(),
+            ignore_post_policy_routes: false,
         };
 
         (mock, gate_agent, parent_gate)
@@ -440,6 +446,31 @@ impl RouterHandler {
             bmp_state.router_id(),
             msg.common_header().msg_type().into(),
         );
+
+        // Optionally drop Adj-RIB-In *post-policy* Route Monitoring at ingest.
+        //
+        // CAVEAT — this unconditionally discards ALL post-policy routes. It is
+        // only safe (loses no information) when every peer is ALSO monitored
+        // pre-policy, so the post-policy stream is pure duplication. That was
+        // true of the deployment this was built for (a fleet where 0 peers
+        // were post-policy-only), but it is NOT a BMP guarantee: a peer
+        // monitored only in post-policy mode would lose all its routes here.
+        // Leave the `ignore_post_policy_routes` config off unless you have
+        // verified your exporters always send pre-policy too. PeerUp/PeerDown
+        // still flow through, so FSM peer state stays consistent (the peer is
+        // registered but stores no routes); the win is skipping the duplicate
+        // post-policy (prefix, mui) slots — typically a large share of RIB
+        // memory on big BMP fleets.
+        if self.ignore_post_policy_routes {
+            if let Message::RouteMonitoring(ref rm) = msg {
+                if rm.per_peer_header().is_post_policy() {
+                    // Restore the state machine we took above and return
+                    // without processing this message.
+                    *bmp_state_lock = Some(bmp_state);
+                    return Ok(());
+                }
+            }
+        }
 
         // overwrite BMP-level provenance with BGP-level info, if any
         let pph = match &msg {

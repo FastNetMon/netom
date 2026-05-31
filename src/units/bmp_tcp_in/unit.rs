@@ -144,6 +144,19 @@ pub struct BmpTcpIn {
 
     #[serde(default)]
     pub tracing_mode: TracingMode,
+
+    /// Drop BMP Adj-RIB-In *post-policy* Route Monitoring at ingest, storing
+    /// only pre-policy routes.
+    ///
+    /// CAVEAT — this discards ALL post-policy routes. It only avoids data loss
+    /// when every peer is ALSO monitored pre-policy (so post-policy is pure
+    /// duplication). That holds in deployments where no peer is monitored
+    /// post-policy-only; it is NOT a BMP guarantee. On a large fleet where
+    /// post-policy merely duplicates pre-policy, enabling this removes the
+    /// duplicate (prefix, mui) slots — often a large share of RIB memory.
+    /// Off by default. Applies to connections accepted after a (re)configure.
+    #[serde(default)]
+    pub ignore_post_policy_routes: bool,
 }
 
 impl BmpTcpIn {
@@ -221,6 +234,7 @@ impl BmpTcpIn {
             tracer,
             tracing_mode,
             ingress_register,
+            self.ignore_post_policy_routes,
         )
         .run::<_, _, StandardTcpStream, BmpTcpInRunner>(Arc::new(
             StandardTcpListenerFactory,
@@ -281,6 +295,7 @@ struct BmpTcpInRunner {
     tracer: Arc<Tracer>,
     tracing_mode: Arc<ArcSwap<TracingMode>>,
     ingress_register: Arc<ingress::Register>,
+    ignore_post_policy_routes: bool,
 }
 
 impl BmpTcpInRunner {
@@ -307,6 +322,7 @@ impl BmpTcpInRunner {
         tracer: Arc<Tracer>,
         tracing_mode: Arc<ArcSwap<TracingMode>>,
         ingress_register: Arc<ingress::Register>,
+        ignore_post_policy_routes: bool,
     ) -> Self {
         Self {
             component,
@@ -325,6 +341,7 @@ impl BmpTcpInRunner {
             tracer,
             tracing_mode,
             ingress_register,
+            ignore_post_policy_routes,
         }
     }
 
@@ -352,6 +369,7 @@ impl BmpTcpInRunner {
             ingress_register: Arc::default(),
             roto_compiled: Default::default(),
             roto_metrics: Default::default(),
+            ignore_post_policy_routes: false,
         };
 
         (runner, gate_agent)
@@ -491,6 +509,7 @@ impl BmpTcpInRunner {
                             last_msg_at,
                             self.bmp_metrics.clone(),
                             self.ingress_register.clone(),
+                            self.ignore_post_policy_routes,
                         );
 
                         F::accept_config(
@@ -536,6 +555,8 @@ impl BmpTcpInRunner {
                                     router_id_template: new_router_id_template,
                                     filter_name: new_filter_name,
                                     tracing_mode: new_tracing_mode,
+                                    ignore_post_policy_routes:
+                                        new_ignore_post_policy_routes,
                                 }),
                         } => {
                             // Runtime reconfiguration of this unit has
@@ -552,6 +573,10 @@ impl BmpTcpInRunner {
                             self.router_id_template
                                 .store(new_router_id_template.into());
                             self.tracing_mode.store(new_tracing_mode.into());
+                            // Plain field (not shared/ArcSwap): read at accept
+                            // time, so this takes effect for new connections.
+                            self.ignore_post_policy_routes =
+                                new_ignore_post_policy_routes;
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -782,6 +807,7 @@ mod tests {
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
+            ignore_post_policy_routes: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -848,6 +874,7 @@ mod tests {
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
+            ignore_post_policy_routes: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -918,6 +945,7 @@ mod tests {
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
+            ignore_post_policy_routes: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1077,6 +1105,7 @@ mod tests {
             ingress_register: Arc::new(ingress::Register::default()),
             roto_compiled: None,
             roto_metrics: Default::default(),
+            ignore_post_policy_routes: false,
         };
 
         (runner, gate_agent, status_reporter)

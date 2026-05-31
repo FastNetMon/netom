@@ -208,10 +208,15 @@ impl Rib {
                 let guard = &epoch::pin();
                 let mut active = 0usize;
                 let mut withdrawn = 0usize;
-                let mut muis: HashSet<u32> = HashSet::new();
+                // Per-mui total slot count (active + withdrawn), so a runaway
+                // count can be attributed to the fattest sessions. The key
+                // (mui == ingress_id) cross-references the /ingresses API to a
+                // concrete (router, peer, pre/post) — use it to target which
+                // sessions to stop monitoring or filter.
+                let mut per_mui: HashMap<u32, usize> = HashMap::new();
                 for pr in store.prefixes_iter(guard).flatten() {
                     for r in pr.meta.iter() {
-                        muis.insert(r.multi_uniq_id);
+                        *per_mui.entry(r.multi_uniq_id).or_insert(0) += 1;
                         if r.status == RouteStatus::Withdrawn {
                             withdrawn += 1;
                         } else {
@@ -230,8 +235,36 @@ impl Rib {
                      ({pct:.1}% withdrawn) store-muis={}",
                     fmt_count(active),
                     fmt_count(withdrawn),
-                    fmt_count(muis.len()),
+                    fmt_count(per_mui.len()),
                 );
+
+                // Per-mui route-count histogram: the top sessions by slot count
+                // plus how many muis sit above coarse thresholds. Lets a leak
+                // ("a mui past its peer's real table") be told apart from scale
+                // ("many fat full-table sessions"), and ranks filtering targets.
+                if !per_mui.is_empty() {
+                    let mut counts: Vec<(u32, usize)> =
+                        per_mui.into_iter().collect();
+                    counts.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                    let over_1m =
+                        counts.iter().filter(|(_, c)| *c > 1_000_000).count();
+                    let over_100k =
+                        counts.iter().filter(|(_, c)| *c > 100_000).count();
+                    let max = counts.first().map(|(_, c)| *c).unwrap_or(0);
+                    let top: String = counts
+                        .iter()
+                        .take(10)
+                        .map(|(mui, c)| format!("{mui}={}", fmt_count(*c)))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    info!(
+                        "memstat: {label} per-mui max={} muis>1M={} \
+                         muis>100k={} top10[mui=routes]: {top}",
+                        fmt_count(max),
+                        over_1m,
+                        over_100k,
+                    );
+                }
             }
         }
     }
