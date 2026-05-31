@@ -75,6 +75,7 @@ roto               = { version = "0.7" } # 0.8 available, requires changes
 rotonda-store      = { workspace = true }
 serde_with         = "3"
 smallvec           = { version = "1.15", features = ["const_generics", "const_new", "union"] }
+socket2            = "0.6" # TCP keepalive on accepted bmp-out sockets; already pulled in transitively by tokio
 tokio-metrics      = { version = "0.4", default-features = false }
 uuid               = { version = "1.20", features = ["v4", "fast-rng"] }
 sha2               = "0.10"

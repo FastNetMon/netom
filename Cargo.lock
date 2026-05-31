@@ -1062,7 +1062,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1529,7 +1529,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -2057,7 +2057,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2712,6 +2712,7 @@ dependencies = [
  "serde_with",
  "sha2",
  "smallvec",
+ "socket2 0.6.3",
  "syslog",
  "tokio",
  "tokio-metrics",
@@ -2725,7 +2726,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#ad2a3318806d3b0c16f48c159918793e2bbdc5bb"
+source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#b4742ed307d734308ac81a3f983698ae0a196728"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2737,6 +2738,7 @@ dependencies = [
  "rand 0.9.2",
  "roaring",
  "routecore 0.5.2",
+ "rustc-hash",
  "serde",
  "serde_derive",
  "serde_json",
@@ -2909,7 +2911,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3314,7 +3316,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

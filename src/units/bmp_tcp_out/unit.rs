@@ -11,6 +11,7 @@ use log::{debug, error, warn};
 use non_empty_vec::NonEmpty;
 use serde::Deserialize;
 use serde_with::{serde_as, DisplayFromStr};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::AsyncWriteExt,
     net::TcpListener,
@@ -255,6 +256,22 @@ impl BmpTcpOut {
 
 /// Type alias for a boxed async writer (plain TCP or TLS).
 type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Unpin + Send>;
+
+/// Max time a single socket write may stall before the client is dropped.
+///
+/// The read half of every accepted connection is discarded, so a half-open
+/// or stuck consumer has no other liveness signal: its writer would block in
+/// `write_all` indefinitely while its per-client `dump_buffer` stays pinned
+/// at the (potentially multi-GB) cap. A client that reads even slowly keeps
+/// each `write_all` returning well within this window; only a consumer that
+/// has stopped advancing the TCP window for this long is dropped.
+const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// TCP keepalive idle time before the first probe is sent.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+
+/// Interval between TCP keepalive probes once they start.
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 struct BmpTcpOutRunner {
     gate: Arc<Gate>,
@@ -523,6 +540,27 @@ impl BmpTcpOutRunner {
                                 continue;
                             }
 
+                            // Enable TCP keepalive so a half-open consumer
+                            // (the read half is discarded below) is eventually
+                            // reset by the kernel rather than pinning its
+                            // per-client buffer forever. Set on the raw socket
+                            // before the split, so it covers both the plain
+                            // and TLS paths.
+                            {
+                                let ka = TcpKeepalive::new()
+                                    .with_time(TCP_KEEPALIVE_IDLE)
+                                    .with_interval(TCP_KEEPALIVE_INTERVAL);
+                                if let Err(e) = SockRef::from(&tcp_stream)
+                                    .set_tcp_keepalive(&ka)
+                                {
+                                    debug!(
+                                        "bmp-out: failed to set TCP keepalive \
+                                         for {}: {}",
+                                        client_addr, e
+                                    );
+                                }
+                            }
+
                             if let Some(ref acceptor) = tls_acceptor {
                                 // Spawn TLS handshake off the accept loop so a
                                 // slow/stalled client cannot block new accepts or
@@ -641,8 +679,26 @@ impl BmpTcpOutRunner {
                         msg = rx.recv() => match msg {
                             Some(msg) => {
                                 if msg.is_empty() { break; }
-                                if writer.write_all(&msg).await.is_err() {
-                                    break;
+                                // Bound each write: a consumer that has stopped
+                                // advancing the TCP window would otherwise block
+                                // here forever with its buffer pinned at the cap.
+                                match tokio::time::timeout(
+                                    WRITE_STALL_TIMEOUT,
+                                    writer.write_all(&msg),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(_)) => break,
+                                    Err(_) => {
+                                        warn!(
+                                            "bmp-out: writer for {} stalled \
+                                             >{}s, dropping client",
+                                            client_addr,
+                                            WRITE_STALL_TIMEOUT.as_secs()
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             None => break,
@@ -711,6 +767,14 @@ impl BmpTcpOutRunner {
                             "Initial dump failed for client {}",
                             client_addr
                         );
+                        // Don't rely on a socket fault to reap this client:
+                        // wake the writer task (via disconnect_notify), which
+                        // removes the registry entry and drops the
+                        // Arc<ClientState>, freeing its (up to the cap) dump
+                        // buffer. Today every dump failure follows a writer
+                        // exit, but this makes release independent of that
+                        // coupling.
+                        client.request_disconnect();
                     }
                 } else {
                     // No RIB available yet - just send initiation and go live
