@@ -8,6 +8,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use log::warn;
 use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
 
@@ -221,7 +222,21 @@ impl ClientState {
             match self.tx.try_send(msg) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.request_disconnect();
+                    // Live queue exhausted: this client's writer task can't
+                    // drain the bounded live-forwarding queue as fast as the
+                    // shared pipeline is feeding it. Flag for disconnect
+                    // rather than back-pressuring the pipeline. Log once —
+                    // gated on winning the disconnect CAS — so a sustained
+                    // burst against an already-flagged client doesn't spam.
+                    if self.request_disconnect() {
+                        warn!(
+                            "bmp-out: live queue depth ({}) exhausted for \
+                             client {}, disconnecting slow consumer (it will \
+                             reconnect and re-dump)",
+                            self.tx.max_capacity(),
+                            self.remote_addr,
+                        );
+                    }
                     false
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
@@ -243,10 +258,16 @@ impl ClientState {
     /// Flag this client for disconnect and wake its writer task. Idempotent:
     /// the first caller wins the CAS and fires the notify exactly once, so
     /// concurrent overflow / live-backpressure events don't double-signal.
-    pub fn request_disconnect(&self) {
-        if !self.disconnect_pending.swap(true, Ordering::SeqCst) {
+    ///
+    /// Returns `true` if this call won the CAS (i.e. it transitioned the
+    /// client into the disconnecting state); callers use this to emit the
+    /// disconnect-reason log line exactly once.
+    pub fn request_disconnect(&self) -> bool {
+        let won = !self.disconnect_pending.swap(true, Ordering::SeqCst);
+        if won {
             self.disconnect_notify.notify_one();
         }
+        won
     }
 
     /// Add a peer to the known peers set.

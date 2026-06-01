@@ -102,6 +102,26 @@ pub struct BmpTcpOut {
     #[serde(default = "BmpTcpOut::default_max_client_buffer_bytes")]
     pub max_client_buffer_bytes: usize,
 
+    /// Depth of the per-client live-forwarding queue (message count).
+    ///
+    /// After the initial dump completes a client enters Live phase, where
+    /// `direct_update` forwards each route as a BMP message via a
+    /// non-blocking `try_send` into this bounded queue; the per-client
+    /// writer task drains it to the socket. The live path runs inline on
+    /// the shared ingest pipeline and must never park on one slow consumer
+    /// (doing so head-of-line-blocks every other client and stalls route
+    /// ingestion process-wide), so when this queue fills the client is
+    /// flagged for disconnect and dropped rather than back-pressured — it
+    /// reconnects and re-dumps.
+    ///
+    /// This is the load-bearing knob for slow-consumer tolerance: a deeper
+    /// queue absorbs larger live bursts (peer flaps, RR reannouncements)
+    /// before shedding the client, at the cost of more pinned memory per
+    /// client (≈ depth × average BMP message size). Default 1024. Distinct
+    /// from `max_client_buffer*`, which bound only the dump phase.
+    #[serde(default = "BmpTcpOut::default_live_queue_depth")]
+    pub live_queue_depth: usize,
+
     /// ACL: list of allowed IP prefixes/addresses (required).
     /// Only IPs matching at least one entry are allowed to connect.
     /// Supports exact IPs and CIDR prefixes, both IPv4 and IPv6.
@@ -200,6 +220,7 @@ impl BmpTcpOut {
             self.sys_descr,
             self.max_client_buffer,
             self.max_client_buffer_bytes,
+            self.live_queue_depth,
             self.forward_router_info,
             self.fan_in_peer_distinguisher,
             self.acl,
@@ -249,6 +270,15 @@ impl BmpTcpOut {
         1024 * 1024 * 1024
     }
 
+    /// 1024 messages — ~150 KB of queued BMP messages at the average
+    /// RouteMonitoring size. Small enough to shed a slow consumer quickly,
+    /// large enough to ride out brief writer hiccups. Raise it to tolerate
+    /// slower consumers / larger live bursts at the cost of more pinned
+    /// memory per client.
+    fn default_live_queue_depth() -> usize {
+        1024
+    }
+
     fn default_forward_router_info() -> bool {
         true
     }
@@ -282,6 +312,7 @@ struct BmpTcpOutRunner {
     sys_descr: String,
     max_client_buffer: usize,
     max_client_buffer_bytes: usize,
+    live_queue_depth: usize,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     acl: Vec<PrefixOrExact>,
@@ -390,6 +421,7 @@ impl BmpTcpOutRunner {
         sys_descr: String,
         max_client_buffer: usize,
         max_client_buffer_bytes: usize,
+        live_queue_depth: usize,
         forward_router_info: bool,
         fan_in_peer_distinguisher: FanInPeerDistinguisher,
         acl: Vec<PrefixOrExact>,
@@ -408,6 +440,7 @@ impl BmpTcpOutRunner {
             sys_descr,
             max_client_buffer,
             max_client_buffer_bytes,
+            live_queue_depth,
             forward_router_info,
             fan_in_peer_distinguisher,
             acl,
@@ -640,8 +673,12 @@ impl BmpTcpOutRunner {
     ) {
         self.status_reporter.client_connected(client_addr);
 
-        // Create channel for sending messages to this client
-        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
+        // Create channel for sending messages to this client. Depth is the
+        // configured `live_queue_depth` (clamped to ≥1, since tokio's mpsc
+        // panics on a zero capacity) — see that field's docs for the
+        // slow-consumer-shedding trade-off it controls.
+        let (tx, mut rx) =
+            mpsc::channel::<Vec<u8>>(self.live_queue_depth.max(1));
 
         let client = Arc::new(ClientState::new(
             client_addr,
