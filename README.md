@@ -4,7 +4,7 @@
 
 The composable, programmable BGP Engine
 
-This repository is a FastNetMon Ltd maintained fork of NLnet Labs Rotonda. It
+This repository is a FastNetMon Inc maintained fork of NLnet Labs Rotonda. It
 is not an official NLnet Labs release. The original upstream project is
 available at <https://github.com/NLnetLabs/rotonda/>. See [NOTICE.md](NOTICE.md)
 for fork attribution and licensing notes.
@@ -94,7 +94,7 @@ Upstream NLnet Labs community resources may not apply to this fork.
 #### Open Source License
 
 Rotonda is licensed under the [Mozilla Public License 2.0](LICENSE). This fork
-preserves upstream NLnet Labs attribution and adds FastNetMon Ltd attribution
+preserves upstream NLnet Labs attribution and adds FastNetMon Inc attribution
 for fork-specific modifications.
 
 ## Memory allocator (jemalloc) tuning
