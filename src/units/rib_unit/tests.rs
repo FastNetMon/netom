@@ -1055,3 +1055,111 @@ async fn test_check_filter_and_store_and_ingress_id_filtering() {
     let ids_v6 = jsonl_ingress_ids(&output_v6);
     assert!(ids_v6.contains(&10));
 }
+
+/// `gc_disconnected_bmp_peers` must reclaim idle BMP router (parent) entries,
+/// not just BgpViaBmp peers — otherwise every torn-down router (incl. every
+/// port scan / half-open connection that mints a childless provisional entry)
+/// leaks a permanent Disconnected entry. Covers the safety invariants too:
+/// a Connected router is never touched, and a router that still has a child is
+/// kept until the child is gone so a reconnecting peer can still rebind.
+#[tokio::test]
+async fn gc_reclaims_idle_bmp_routers() {
+    use crate::ingress::register::IngressState;
+    use crate::ingress::{IngressInfo, IngressType};
+    use std::collections::HashSet;
+
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+
+    let disconnected_bmp = || {
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bmp)
+            .with_state(IngressState::Disconnected)
+    };
+
+    // id 10: childless Disconnected router (the port-scan / half-open shape).
+    reg.update_info(10, disconnected_bmp());
+    // id 20: Disconnected router that still owns a Disconnected child (21).
+    reg.update_info(20, disconnected_bmp());
+    reg.update_info(
+        21,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpViaBmp)
+            .with_parent_ingress(20u32)
+            .with_state(IngressState::Disconnected),
+    );
+    // id 30: a live (Connected) router — must never be reclaimed.
+    reg.update_info(
+        30,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bmp)
+            .with_state(IngressState::Connected),
+    );
+
+    // First sweep: `prev` is empty, so the idle-interval guard reclaims
+    // nothing yet — every entry must survive.
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    for id in [10, 20, 21, 30] {
+        assert!(reg.get(id).is_some(), "id {id} reclaimed too early");
+    }
+
+    // Second sweep: 10 (childless router) and 21 (peer) were Disconnected last
+    // sweep and are reclaimed. 20 still has child 21 at snapshot time, so it is
+    // held. 30 is Connected and untouched.
+    let prev = rib.gc_disconnected_bmp_peers(prev);
+    assert!(reg.get(10).is_none(), "childless router not reclaimed");
+    assert!(reg.get(21).is_none(), "BgpViaBmp peer not reclaimed");
+    assert!(
+        reg.get(20).is_some(),
+        "router reclaimed while it still had a child"
+    );
+    assert!(reg.get(30).is_some(), "Connected router reclaimed");
+
+    // Third sweep: child 21 is gone, so 20 is now childless and (having been
+    // Disconnected since before the second sweep) is reclaimed. 30 stays.
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(
+        reg.get(20).is_none(),
+        "router not reclaimed after its last child was gone"
+    );
+    assert!(reg.get(30).is_some(), "Connected router reclaimed");
+}
+
+/// A router that reconnects (flips back to Connected) between sweeps must be
+/// protected by the `remove_if_disconnected` guard even though it was a
+/// reclaim candidate from the previous sweep.
+#[tokio::test]
+async fn gc_spares_router_that_reconnected_since_snapshot() {
+    use crate::ingress::register::IngressState;
+    use crate::ingress::{IngressInfo, IngressType};
+    use std::collections::HashSet;
+
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+
+    reg.update_info(
+        10,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bmp)
+            .with_state(IngressState::Disconnected),
+    );
+
+    // Mark it a candidate (Disconnected in the previous sweep).
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    assert!(prev.contains(&10));
+
+    // Router reconnects before the next sweep: its entry is now Connected.
+    reg.update_info(
+        10,
+        IngressInfo::new().with_state(IngressState::Connected),
+    );
+
+    // The sweep must not reclaim it.
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(
+        reg.get(10).is_some(),
+        "reconnected (Connected) router was reclaimed"
+    );
+}

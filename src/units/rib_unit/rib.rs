@@ -872,12 +872,27 @@ impl Rib {
         }
     }
 
-    /// Layer C garbage-collection sweep. Reclaims the records of BMP-monitored
-    /// peers (`IngressType::BgpViaBmp`) that have stayed `Disconnected` across
-    /// at least one full sweep interval — i.e. peers torn down that did not
-    /// reconnect. Without this, the peers that Layer D keeps as Disconnected
-    /// (for mui reuse) would hold their mark-withdrawn records forever if they
-    /// never came back.
+    /// Layer C garbage-collection sweep. Reclaims two kinds of idle BMP
+    /// register entries that have stayed `Disconnected` across at least one
+    /// full sweep interval — i.e. were torn down and did not reconnect:
+    ///
+    /// * BMP-monitored peers (`IngressType::BgpViaBmp`): their mark-withdrawn
+    ///   RIB records are physically reclaimed (`remove_for_ingresses`).
+    ///   Without this, the peers that Layer D keeps as Disconnected (for mui
+    ///   reuse) would hold their records forever if they never came back.
+    ///
+    /// * BMP routers (`IngressType::Bmp`, the parent entries) that have **no
+    ///   children left in the register**. These hold no RIB records of their
+    ///   own (routes live under their `BgpViaBmp` children), so only the
+    ///   register entry is removed. A router parent is kept while any child
+    ///   (`parent_ingress == this id`) still exists so a reconnecting peer can
+    ///   rebind to it; once the last child is gone the parent has no reuse
+    ///   value left. Without this path, every torn-down router leaks a
+    ///   permanent `Disconnected` entry — including every TCP connection that
+    ///   drops before sending Initiation (port scan, TLS probe, half-open RST,
+    ///   each minting a childless provisional entry) and every
+    ///   NAT/IP-renumber/sysName change — because the sweep otherwise only
+    ///   reaped `BgpViaBmp`.
     ///
     /// Uses a two-sweep set rather than per-entry timestamps: `prev` is the
     /// set seen Disconnected on the previous sweep; any still Disconnected now
@@ -887,23 +902,48 @@ impl Rib {
         &self,
         prev: HashSet<IngressId>,
     ) -> HashSet<IngressId> {
-        let disconnected: HashSet<IngressId> = self
-            .ingress_register
-            .cloned_info()
-            .into_iter()
-            .filter(|(_, i)| {
-                i.state
-                    == Some(ingress::register::IngressState::Disconnected)
-                    && i.ingress_type
-                        == Some(ingress::IngressType::BgpViaBmp)
-            })
-            .map(|(id, _)| id)
-            .collect();
+        let info = self.ingress_register.cloned_info();
 
-        let to_reclaim: Vec<IngressId> =
-            disconnected.intersection(&prev).copied().collect();
+        // Every parent_ingress referenced by some entry. A router (parent)
+        // entry is only reclaimable once nothing still references it as a
+        // parent — otherwise a leftover child could still rebind to it.
+        let parents_in_use: HashSet<IngressId> =
+            info.values().filter_map(|i| i.parent_ingress).collect();
 
-        if !to_reclaim.is_empty() {
+        // All Disconnected ids we track across sweeps for idle-interval
+        // detection (this set becomes the next `prev`). Split into the two
+        // reclaim paths: `peers` (BgpViaBmp, carry RIB records) and
+        // `childless_routers` (Bmp parents with no remaining children). A Bmp
+        // parent that still has children is added to `disconnected` only — it
+        // stays a candidate next sweep but is not yet eligible to reclaim.
+        let mut disconnected: HashSet<IngressId> = HashSet::new();
+        let mut peers: HashSet<IngressId> = HashSet::new();
+        let mut childless_routers: HashSet<IngressId> = HashSet::new();
+        for (id, i) in &info {
+            if i.state
+                != Some(ingress::register::IngressState::Disconnected)
+            {
+                continue;
+            }
+            match i.ingress_type {
+                Some(ingress::IngressType::BgpViaBmp) => {
+                    disconnected.insert(*id);
+                    peers.insert(*id);
+                }
+                Some(ingress::IngressType::Bmp) => {
+                    disconnected.insert(*id);
+                    if !parents_in_use.contains(id) {
+                        childless_routers.insert(*id);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Reclaim BgpViaBmp peers that were already Disconnected last sweep.
+        let peers_to_reclaim: Vec<IngressId> =
+            peers.intersection(&prev).copied().collect();
+        if !peers_to_reclaim.is_empty() {
             // Atomically remove each still-Disconnected id from the register
             // FIRST, and only physically reclaim the store records
             // (remove_mui) for ids that were actually removed. A peer that
@@ -914,7 +954,7 @@ impl Rib {
             // before remove_mui also means any concurrent reuse can no longer
             // match this id (it mints a fresh one instead), so remove_mui only
             // ever clears the old, genuinely-departed session's records.
-            let reclaimed: Vec<IngressId> = to_reclaim
+            let reclaimed: Vec<IngressId> = peers_to_reclaim
                 .iter()
                 .copied()
                 .filter(|id| {
@@ -929,6 +969,31 @@ impl Rib {
                     "rib GC: reclaimed {} BMP peer(s) idle (Disconnected) \
                      for >= one GC interval",
                     reclaimed.len()
+                );
+            }
+        }
+
+        // Reclaim childless BMP router (parent) entries that were already
+        // Disconnected last sweep. Same atomic guard as the peer path: a
+        // router that reconnected since the snapshot is now Connected, so
+        // remove_if_disconnected skips it (the reconnect rebinds via
+        // find_existing_bmp_router_and_claim, which flips it to Connected).
+        // No remove_for_ingresses — parents own no RIB records.
+        let routers_to_reclaim: Vec<IngressId> =
+            childless_routers.intersection(&prev).copied().collect();
+        if !routers_to_reclaim.is_empty() {
+            let reclaimed = routers_to_reclaim
+                .iter()
+                .filter(|id| {
+                    self.ingress_register
+                        .remove_if_disconnected(**id)
+                        .is_some()
+                })
+                .count();
+            if reclaimed > 0 {
+                info!(
+                    "rib GC: reclaimed {reclaimed} idle BMP router(s) \
+                     (Disconnected, no children) for >= one GC interval"
                 );
             }
         }
