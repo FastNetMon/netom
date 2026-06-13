@@ -28,7 +28,9 @@ use crate::{
 use super::initiating::Initiating;
 
 use super::super::{
-    machine::{BmpState, BmpStateDetails, Initiable, PeerAware},
+    machine::{
+        BmpState, BmpStateDetails, Initiable, PeerAware, UnknownPeerLog,
+    },
     processing::ProcessingResult,
 };
 
@@ -476,5 +478,15 @@ impl PeerAware for Dumping {
 
     fn num_pending_eors(&self) -> usize {
         self.peer_states.num_pending_eors()
+    }
+
+    fn note_unknown_peer(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        now: std::time::Instant,
+        summary_interval: std::time::Duration,
+    ) -> UnknownPeerLog {
+        self.peer_states
+            .note_unknown_peer(pph, now, summary_interval)
     }
 }

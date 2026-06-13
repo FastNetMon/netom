@@ -22,7 +22,7 @@ use crate::{
     ingress::{self, IngressId},
     payload::{Payload, Update},
     units::bmp_tcp_in::state_machine::machine::{
-        BmpStateIdx, PeerState, PeerStates,
+        BmpStateIdx, PeerState, PeerStates, UnknownPeerLog,
     },
 };
 
@@ -316,5 +316,15 @@ impl PeerAware for Updating {
 
     fn num_pending_eors(&self) -> usize {
         self.peer_states.num_pending_eors()
+    }
+
+    fn note_unknown_peer(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        now: std::time::Instant,
+        summary_interval: std::time::Duration,
+    ) -> UnknownPeerLog {
+        self.peer_states
+            .note_unknown_peer(pph, now, summary_interval)
     }
 }

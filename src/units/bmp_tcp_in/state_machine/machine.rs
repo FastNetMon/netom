@@ -57,6 +57,7 @@ use std::{
     io::Read,
     ops::ControlFlow,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use crate::ingress::IngressId;
@@ -526,6 +527,15 @@ pub trait PeerAware {
     ) -> bool;
 
     fn num_pending_eors(&self) -> usize;
+
+    /// Throttle bookkeeping for RouteMonitoring messages whose peer has no
+    /// observed PeerUp. See [`PeerStates::note_unknown_peer`].
+    fn note_unknown_peer(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        now: Instant,
+        summary_interval: Duration,
+    ) -> UnknownPeerLog;
 }
 
 impl<T> BmpStateDetails<T>
@@ -964,7 +974,45 @@ where
                     }
                     self.details.get_peer_config(&pph).unwrap()
                 } else {
-                    warn!("RouteMonitoring message received for which no PeerUp has been observed (any policy variant).");
+                    // No PeerUp for any policy variant of this peer. Each such
+                    // RouteMonitoring is dropped; an unknown peer replaying its
+                    // RIB would otherwise emit one warning per prefix, so warn
+                    // once per distinct peer and fold the rest into a periodic
+                    // summary (see PeerStates::note_unknown_peer).
+                    match self.details.note_unknown_peer(
+                        &pph,
+                        received,
+                        UNKNOWN_PEER_SUMMARY_INTERVAL,
+                    ) {
+                        UnknownPeerLog::First => {
+                            warn!(
+                                "RouteMonitoring for unknown peer: no PeerUp \
+                                 observed (any policy variant). router={} \
+                                 peer={} asn={} rib_type={:?}. Further messages \
+                                 for this peer are summarized, not logged \
+                                 per-message.",
+                                self.router_id,
+                                pph.address(),
+                                pph.asn(),
+                                pph.rib_type(),
+                            );
+                        }
+                        UnknownPeerLog::Summary {
+                            suppressed,
+                            distinct,
+                        } => {
+                            warn!(
+                                "Suppressed {} further RouteMonitoring \
+                                 message(s) for {} unknown peer(s) on router={} \
+                                 (no PeerUp observed) in the last {}s.",
+                                suppressed,
+                                distinct,
+                                self.router_id,
+                                UNKNOWN_PEER_SUMMARY_INTERVAL.as_secs(),
+                            );
+                        }
+                        UnknownPeerLog::Suppressed => {}
+                    }
                     self.status_reporter.peer_unknown(self.router_id.clone());
 
                     return self.mk_invalid_message_result(
@@ -1417,8 +1465,45 @@ impl From<BmpStateDetails<Terminated>> for BmpState {
     }
 }
 
+/// How often to emit a rolled-up summary line for suppressed unknown-peer
+/// RouteMonitoring messages, instead of logging one warning per dropped route.
+const UNKNOWN_PEER_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// What the caller should log for a RouteMonitoring message whose peer has no
+/// observed PeerUp. See [`PeerStates::note_unknown_peer`].
+#[derive(Debug)]
+pub enum UnknownPeerLog {
+    /// First time this peer identity has been seen without a PeerUp; emit the
+    /// detailed, per-peer warning.
+    First,
+    /// A previously-warned peer; nothing to log right now (counted toward the
+    /// next summary).
+    Suppressed,
+    /// The summary interval elapsed; emit one rolled-up line covering
+    /// `suppressed` dropped messages across `distinct` unknown peers.
+    Summary { suppressed: u64, distinct: usize },
+}
+
+/// Throttle state for the "RouteMonitoring for unknown peer" warning. A single
+/// unknown peer replaying its RIB would otherwise log one `warn!` per prefix
+/// (hundreds of thousands of identical lines). We warn once per distinct peer
+/// identity, then fold the rest into a periodic summary.
 #[derive(Debug, Default)]
-pub struct PeerStates(HashMap<PerPeerHeader<Bytes>, PeerState>);
+struct UnknownPeerThrottle {
+    /// Peer identities (full PPH) already warned about individually.
+    warned: HashSet<PerPeerHeader<Bytes>>,
+    /// Unknown-peer messages suppressed since the last summary was emitted.
+    suppressed_since_summary: u64,
+    /// Receipt time of the last summary (or of the first unknown peer, to
+    /// anchor the first interval).
+    last_summary: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+pub struct PeerStates(
+    HashMap<PerPeerHeader<Bytes>, PeerState>,
+    UnknownPeerThrottle,
+);
 
 impl PeerStates {
     #[allow(dead_code)]
@@ -1455,6 +1540,39 @@ impl PeerStates {
                 (peer.ingress_id, None)
             })
             .collect()
+    }
+
+    /// Record a RouteMonitoring message received for a peer with no observed
+    /// PeerUp and decide how it should be logged. Returns [`UnknownPeerLog`]:
+    /// the first sighting of a given peer identity is logged in full, every
+    /// later one is suppressed and folded into a periodic rolled-up summary.
+    fn note_unknown_peer(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        now: Instant,
+        summary_interval: Duration,
+    ) -> UnknownPeerLog {
+        let throttle = &mut self.1;
+        if throttle.warned.insert(pph.clone()) {
+            // First time we see this peer identity without a PeerUp.
+            throttle.last_summary.get_or_insert(now);
+            return UnknownPeerLog::First;
+        }
+
+        // Already warned about this peer; count it and maybe summarize.
+        throttle.suppressed_since_summary += 1;
+        let anchor = *throttle.last_summary.get_or_insert(now);
+        if now.saturating_duration_since(anchor) >= summary_interval {
+            let suppressed =
+                std::mem::take(&mut throttle.suppressed_since_summary);
+            throttle.last_summary = Some(now);
+            UnknownPeerLog::Summary {
+                suppressed,
+                distinct: throttle.warned.len(),
+            }
+        } else {
+            UnknownPeerLog::Suppressed
+        }
     }
 }
 
@@ -1693,5 +1811,14 @@ impl PeerAware for PeerStates {
         self.0
             .values()
             .fold(0, |acc, peer_state| acc + peer_state.pending_eors.len())
+    }
+
+    fn note_unknown_peer(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        now: Instant,
+        summary_interval: Duration,
+    ) -> UnknownPeerLog {
+        PeerStates::note_unknown_peer(self, pph, now, summary_interval)
     }
 }

@@ -1283,6 +1283,58 @@ fn route_monitoring_from_unknown_peer() {
 }
 
 #[test]
+fn unknown_peer_route_monitoring_warning_is_throttled() {
+    use super::machine::UnknownPeerLog;
+    use std::time::Duration;
+
+    let mut peer_states = PeerStates::default();
+    // A BMP Per-Peer Header is a fixed 42-byte structure; the exact contents
+    // don't matter here, only that it is a valid HashSet key.
+    let pph = PerPeerHeader::for_slice(Bytes::from(vec![0u8; 42]));
+    let interval = Duration::from_secs(60);
+    let t0 = Instant::now();
+
+    // The first sighting of an unknown peer is logged in full.
+    assert!(matches!(
+        peer_states.note_unknown_peer(&pph, t0, interval),
+        UnknownPeerLog::First
+    ));
+
+    // Further messages within the interval are suppressed, not logged: this
+    // is what prevents an unknown peer replaying its RIB from flooding the
+    // log with one warning per prefix.
+    assert!(matches!(
+        peer_states.note_unknown_peer(&pph, t0, interval),
+        UnknownPeerLog::Suppressed
+    ));
+    assert!(matches!(
+        peer_states.note_unknown_peer(&pph, t0, interval),
+        UnknownPeerLog::Suppressed
+    ));
+
+    // Once the interval elapses, a single rolled-up summary covers every
+    // suppressed message and the counter resets.
+    let t1 = t0 + interval;
+    match peer_states.note_unknown_peer(&pph, t1, interval) {
+        UnknownPeerLog::Summary {
+            suppressed,
+            distinct,
+        } => {
+            assert_eq!(suppressed, 3);
+            assert_eq!(distinct, 1);
+        }
+        other => panic!("expected Summary, got {other:?}"),
+    }
+
+    // After the summary the counter is back to zero, so we suppress again
+    // until the next interval rather than re-emitting immediately.
+    assert!(matches!(
+        peer_states.note_unknown_peer(&pph, t1, interval),
+        UnknownPeerLog::Suppressed
+    ));
+}
+
+#[test]
 #[ignore = "to do"]
 fn end_of_rib_ipv6_for_a_single_peer() {}
 
