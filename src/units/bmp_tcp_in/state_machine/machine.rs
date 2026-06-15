@@ -1745,7 +1745,7 @@ impl PeerAware for PeerStates {
             }
             match self.2.note(code, now, UNDECODED_CAP_SUMMARY_INTERVAL) {
                 UndecodedCapLog::First => info!(
-                    "bmp-in: peer {} (AS{}) advertised BGP capability {} \
+                    "bmp-in: peer {} ({}) advertised BGP capability {} \
                      (code {}) that rotonda does not forward to bmp-out",
                     pph.address(),
                     pph.asn(),
