@@ -5,6 +5,7 @@ use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering};
 
 use inetnum::asn::Asn;
 use paste::paste;
+use routecore::bgp::message::open::Capabilities;
 use routecore::bmp::message::{PeerType, RibType};
 use std::fmt;
 use std::sync::RwLock;
@@ -709,11 +710,36 @@ info_for_field!(IngressInfo{
    peer_type: PeerType,
    distinguisher: [u8; 8],
    vrf_name: String,
-   #[serde(skip_serializing)]
+   #[serde(serialize_with = "serialize_capability_names")]
    local_capabilities: Vec<u8>,
-   #[serde(skip_serializing)]
+   #[serde(serialize_with = "serialize_capability_names")]
    remote_capabilities: Vec<u8>
 });
+
+/// Serialize a raw BGP capability blob (`capabilities_as_vec` wire format) as
+/// a human-readable list of capability names, e.g.
+/// `["MultiProtocol","FourOctetAsn","AddPath"]`, for the `/ingresses` dump.
+/// Storing the compact bytes keeps per-peer memory small; the names are
+/// derived only on serialization.
+fn serialize_capability_names<S>(
+    caps: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let blob = caps.as_deref().unwrap_or(&[]);
+    let names: Vec<String> = Capabilities(blob)
+        .iter()
+        .map(|c| c.typ().to_string())
+        .collect();
+    let mut seq = serializer.serialize_seq(Some(names.len()))?;
+    for name in &names {
+        seq.serialize_element(name)?;
+    }
+    seq.end()
+}
 
 #[cfg(test)]
 mod tests {

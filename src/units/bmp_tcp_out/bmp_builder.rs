@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use inetnum::addr::Prefix;
 use inetnum::asn::Asn;
+use routecore::bgp::message::open::Capabilities;
 use routecore::bgp::nlri::afisafi::IsPrefix;
 use routecore::bgp::types::AfiSafiType;
 use routecore::bmp::message::PeerType;
@@ -91,17 +92,36 @@ pub struct PeerInfo {
     /// `(seconds, microseconds)`. When set, used as the per-peer-header
     /// timestamp of the emitted Peer Up; otherwise `now()` is used.
     pub session_up_time: Option<(u32, u32)>,
+    /// Raw wire-format blob of all capabilities the peer advertised
+    /// (`capabilities_as_vec`). Capabilities not synthesized or excluded are
+    /// passed through verbatim into the received OPEN (see `OpenCapExtras`).
+    pub peer_capabilities: Vec<u8>,
     pub admin_label: Option<String>,
 }
 
+/// Capability codes NOT passed through verbatim into the received OPEN,
+/// because bmp-out either synthesizes them itself (so passing through would
+/// duplicate) or re-encodes routes incompatibly with them:
+///   1=MultiProtocol 65=FourOctetAsn 64=GracefulRestart  — synthesized to
+///       match our actual output encoding
+///   9=BgpRole 73=FQDN 75=SoftwareVersion                — synthesized from
+///       parsed `OpenCapExtras` fields
+///   5=ExtendedNextHop 69=AddPath                         — would change how
+///       downstream parses our re-encoded UPDATEs (next hops rebuilt, NLRI
+///       has no path-ids). Kept in sync with `machine::DROPPED_CAP_CODES`.
+const PASSTHROUGH_EXCLUDE: &[u8] = &[1, 5, 9, 64, 65, 69, 73, 75];
+
 /// Best-effort optional capabilities recovered from an upstream session and
 /// re-emitted in the (received) Peer Up OPEN so downstream consumers recover
-/// them the standard way. All absent for the synthetic *sent* OPEN.
+/// them the standard way. All absent/empty for the synthetic *sent* OPEN.
 #[derive(Default)]
 struct OpenCapExtras<'a> {
     hostname: Option<&'a str>,
     software_version: Option<&'a str>,
     role: Option<u8>,
+    /// Raw capability blob to pass through verbatim, minus
+    /// [`PASSTHROUGH_EXCLUDE`].
+    passthrough: &'a [u8],
 }
 
 impl PeerInfo {
@@ -154,6 +174,10 @@ impl PeerInfo {
             session_up_time: info.session_up_time.map(|dt| {
                 (dt.timestamp() as u32, dt.timestamp_subsec_micros())
             }),
+            peer_capabilities: info
+                .remote_capabilities
+                .clone()
+                .unwrap_or_default(),
             admin_label: None,
         }
     }
@@ -421,6 +445,25 @@ fn build_bgp_open(
         push_cap(9, &[role]);
     }
 
+    // Pass through every other capability the peer advertised, verbatim,
+    // except PASSTHROUGH_EXCLUDE (synthesized above, or incompatible with our
+    // re-encoding). Each blob entry is already a full code|len|value TLV;
+    // copy it whole if it still fits the single-octet param length.
+    let passthrough = Capabilities(extras.passthrough);
+    for cap in passthrough.iter() {
+        let bytes = cap.as_ref();
+        let code = match bytes.first() {
+            Some(c) => *c,
+            None => continue,
+        };
+        if PASSTHROUGH_EXCLUDE.contains(&code) {
+            continue;
+        }
+        if caps.len() + bytes.len() <= u8::MAX as usize {
+            caps.extend_from_slice(bytes);
+        }
+    }
+
     // Optional Parameters: wrap capabilities in Parameter Type 2
     let mut opt_params = Vec::with_capacity(2 + caps.len());
     opt_params.push(2); // Parameter Type = Capabilities
@@ -521,6 +564,7 @@ pub fn build_peer_up(
         hostname: peer.peer_hostname.as_deref(),
         software_version: peer.peer_software_version.as_deref(),
         role: peer.peer_role,
+        passthrough: &peer.peer_capabilities,
     };
     let sent_open = build_bgp_open(
         peer.peer_asn,
@@ -1499,6 +1543,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1525,6 +1570,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1566,6 +1612,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1707,6 +1754,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1746,6 +1794,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1831,6 +1880,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: Some(r#"{"sysName":"router1"}"#.to_string()),
         };
 
@@ -1876,6 +1926,7 @@ mod tests {
             peer_software_version: Some(version.to_string()),
             peer_role: Some(3), // Customer
             session_up_time: Some((0x1234_5678, 0x0009_0a0b)),
+            peer_capabilities: Vec::new(),
             admin_label: None,
         };
 
@@ -1926,6 +1977,46 @@ mod tests {
         assert!(contains(&[9u8, 1, 3]), "BGP Role capability not found");
     }
 
+    #[test]
+    fn peer_up_passes_through_advisory_caps_but_excludes_incompatible() {
+        // peer_capabilities blob: a vendor/advisory capability (code 200)
+        // that should pass through verbatim, plus AddPath (code 69) which
+        // must be excluded because we re-encode NLRI without path-ids.
+        let mut blob = vec![200u8, 3, 0xAA, 0xBB, 0xCC];
+        blob.extend_from_slice(&[69u8, 4, 0x00, 0x01, 0x01, 0x03]);
+
+        let peer = PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0x40,
+            peer_distinguisher: [0u8; 8],
+            peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: Asn::from_u32(65000),
+            peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
+            peer_capabilities: blob,
+            admin_label: None,
+        };
+
+        let msg = build_peer_up(&peer, true);
+        let contains =
+            |needle: &[u8]| msg.windows(needle.len()).any(|w| w == needle);
+
+        // Advisory/unknown capability passed through verbatim.
+        assert!(
+            contains(&[200u8, 3, 0xAA, 0xBB, 0xCC]),
+            "advisory capability was not passed through"
+        );
+        // AddPath (code 69) must not be re-emitted.
+        assert!(
+            !contains(&[69u8, 4, 0x00, 0x01, 0x01, 0x03]),
+            "AddPath capability must be excluded from the passthrough"
+        );
+    }
+
     /// Extract the 8-byte peer_distinguisher from a BMP message that
     /// carries a per-peer header (RouteMonitoring, PeerUp, PeerDown,
     /// StatsReport). Layout: common header (6 bytes) + peer_type (1) +
@@ -1950,6 +2041,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         }
     }
@@ -2083,6 +2175,7 @@ mod tests {
             peer_software_version: None,
             peer_role: None,
             session_up_time: None,
+            peer_capabilities: Vec::new(),
             admin_label: None,
         }
     }

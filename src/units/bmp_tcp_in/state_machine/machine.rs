@@ -1541,13 +1541,17 @@ struct UnknownPeerThrottle {
 /// capabilities rotonda received but does not forward to bmp-out.
 const UNDECODED_CAP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Capability codes rotonda re-emits in the synthesized bmp-out OPEN
-/// (see `bmp_tcp_out::bmp_builder::build_bgp_open`). Anything a peer
-/// advertises outside this set is not carried downstream; we log it once
-/// (rate-limited) so operators can discover what is being dropped.
-///   1=MultiProtocol 9=BgpRole 64=GracefulRestart 65=FourOctetAsn
-///   73=FQDN 75=SoftwareVersion
-const FORWARDED_CAP_CODES: &[u8] = &[1, 9, 64, 65, 73, 75];
+/// Capability codes that bmp-out can neither synthesize nor pass through,
+/// because rotonda re-encodes route-monitoring UPDATEs in a way that is
+/// incompatible with them (see `bmp_tcp_out::bmp_builder`):
+///   5  = ExtendedNextHop  — next hops are rebuilt, not replayed
+///   69 = AddPath          — NLRI is re-encoded without path-ids
+/// Everything else a peer advertises is either synthesized to match our
+/// output encoding or forwarded verbatim, so only these two are genuinely
+/// lost. We log them (rate-limited) since they can reduce route fidelity for
+/// the affected peer downstream. Keep in sync with
+/// `bmp_tcp_out::bmp_builder`'s passthrough exclude set.
+const DROPPED_CAP_CODES: &[u8] = &[5, 69];
 
 /// What to log for a received-but-not-forwarded BGP capability. Mirrors
 /// [`UnknownPeerLog`]: the first sighting of each distinct capability code is
@@ -1730,9 +1734,11 @@ impl PeerAware for PeerStates {
         let session_up_time =
             Some(pph.timestamp()).filter(|ts| ts.timestamp() > 0);
 
-        // Surface (rate-limited) any capability the peer advertised that
-        // rotonda does not forward to bmp-out, so silently-dropped optional
-        // data is discoverable without flooding the log.
+        // Surface (rate-limited) capabilities a peer advertised that bmp-out
+        // cannot carry because we re-encode routes incompatibly with them
+        // (AddPath / ExtendedNextHop). Other capabilities are synthesized or
+        // passed through, so this is a focused route-fidelity warning rather
+        // than a flood.
         let now = Instant::now();
         let caps = Capabilities(&remote_capabilities);
         for cap in caps.iter() {
@@ -1740,13 +1746,14 @@ impl PeerAware for PeerStates {
                 Some(c) => *c,
                 None => continue,
             };
-            if FORWARDED_CAP_CODES.contains(&code) {
+            if !DROPPED_CAP_CODES.contains(&code) {
                 continue;
             }
             match self.2.note(code, now, UNDECODED_CAP_SUMMARY_INTERVAL) {
                 UndecodedCapLog::First => info!(
                     "bmp-in: peer {} ({}) advertised BGP capability {} \
-                     (code {}) that rotonda does not forward to bmp-out",
+                     (code {}) that rotonda re-encodes away; not reflected \
+                     in the bmp-out feed (route fidelity may differ)",
                     pph.address(),
                     pph.asn(),
                     CapabilityType::from(code),
