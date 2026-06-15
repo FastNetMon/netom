@@ -5,12 +5,14 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     rc::Rc,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
 
 use chrono::serde::ts_microseconds;
 use chrono::Utc;
 use inetnum::{addr::Prefix, asn::Asn};
-use log::debug;
+use log::{debug, warn};
 use routecore::bgp::{
     message::UpdateMessage, nlri::afisafi::Nlri, types::AfiSafiType,
 };
@@ -480,6 +482,111 @@ impl OutputStreamMessage {
     }
 }
 
+//--- Unsupported AFI/SAFI drop accounting -----------------------------------
+
+/// How often to emit a rolled-up summary of NLRI dropped because their AFI/SAFI
+/// has no [`RotondaRoute`] representation.
+const UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Aggregated throttle state for NLRI dropped because their AFI/SAFI is not yet
+/// representable as a [`RotondaRoute`] (FlowSpec, MPLS-VPN, EVPN, RouteTarget,
+/// ...). Such NLRI are parsed fine by routecore but silently dropped before the
+/// RIB; without throttling a peer replaying a RIB full of them would emit one
+/// debug line per prefix and the loss would be invisible at default log levels.
+/// Instead we warn once per family on first sight, then fold the volume into a
+/// periodic `warn!` summary. See [`note_unsupported_afisafi`].
+///
+/// `Vec`s (not `HashMap`/`HashSet`) so the whole thing is const-constructible in
+/// a `static`; the set of distinct AFI/SAFI types is tiny, so linear scans are
+/// cheaper than hashing and this only runs on the (rare) drop path.
+struct UnsupportedAfiSafiThrottle {
+    /// AFI/SAFI types already called out individually; persists for the life of
+    /// the process so each family warns exactly once on first sight.
+    seen: Vec<AfiSafiType>,
+    /// Per-type drop tally accumulated toward the next periodic summary.
+    counts: Vec<(AfiSafiType, u64)>,
+    /// Start of the current summary window (anchored on the first drop after a
+    /// summary); `None` until the next drop re-anchors it.
+    window_start: Option<Instant>,
+}
+
+impl UnsupportedAfiSafiThrottle {
+    const fn new() -> Self {
+        Self {
+            seen: Vec::new(),
+            counts: Vec::new(),
+            window_start: None,
+        }
+    }
+}
+
+static UNSUPPORTED_AFISAFI_THROTTLE: Mutex<UnsupportedAfiSafiThrottle> =
+    Mutex::new(UnsupportedAfiSafiThrottle::new());
+
+/// Record one NLRI dropped because its AFI/SAFI has no [`RotondaRoute`]
+/// representation, and emit a throttled `warn!` so unexpected families
+/// (FlowSpec, MPLS-VPN, EVPN, ...) surface at default log levels without one
+/// line per prefix. Each distinct family is warned once on first sight; the
+/// drop volume is then rolled up into a summary at most once per
+/// [`UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL`].
+fn note_unsupported_afisafi(afi_safi: AfiSafiType) {
+    let now = Instant::now();
+    let mut throttle = UNSUPPORTED_AFISAFI_THROTTLE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // First time this exact AFI/SAFI is ever dropped: call it out immediately
+    // so a newly-appearing family is obvious rather than waiting for a summary.
+    let first_sight = !throttle.seen.contains(&afi_safi);
+    if first_sight {
+        throttle.seen.push(afi_safi);
+    }
+
+    // Tally toward the periodic volume summary.
+    match throttle.counts.iter_mut().find(|(t, _)| *t == afi_safi) {
+        Some((_, n)) => *n += 1,
+        None => throttle.counts.push((afi_safi, 1)),
+    }
+
+    let window_start = *throttle.window_start.get_or_insert(now);
+    let elapsed = now.saturating_duration_since(window_start);
+    let summary = if elapsed >= UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL {
+        let total: u64 = throttle.counts.iter().map(|(_, n)| n).sum();
+        let mut breakdown = std::mem::take(&mut throttle.counts);
+        throttle.window_start = None;
+        breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+        Some((total, elapsed, breakdown))
+    } else {
+        None
+    };
+
+    // Release the lock before formatting/logging.
+    drop(throttle);
+
+    if first_sight {
+        warn!(
+            "Dropping route(s) with unsupported AFI/SAFI {afi_safi}: no \
+             RotondaRoute representation, not stored in any RIB. Further drops \
+             are summarized at most once per {}s.",
+            UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL.as_secs(),
+        );
+    }
+
+    if let Some((total, elapsed, breakdown)) = summary {
+        let detail = breakdown
+            .iter()
+            .map(|(t, n)| format!("{t}={n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        warn!(
+            "Dropped {total} route(s) with unsupported AFI/SAFI over the last \
+             {}s (no RotondaRoute representation, not stored in any RIB): \
+             {detail}",
+            elapsed.as_secs(),
+        );
+    }
+}
+
 impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
     type Error = ();
     fn try_from(value: (Nlri<O>, RotondaPaMap)) -> Result<Self, Self::Error> {
@@ -511,6 +618,7 @@ impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
             | Nlri::L2VpnVplsAddpath(..)
             | Nlri::L2VpnEvpn(..)
             | Nlri::L2VpnEvpnAddpath(..) => {
+                note_unsupported_afisafi(value.0.afi_safi());
                 debug!(
                     "AFI/SAFI {} not yet supported in RotondaRoute",
                     value.0
