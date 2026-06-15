@@ -34,7 +34,10 @@ use routecore::{
     bgp::nlri::afisafi::IsPrefix,
     bgp::nlri::afisafi::Nlri,
     bgp::{
-        message::{open::CapabilityType, SessionConfig, UpdateMessage},
+        message::{
+            open::{Capabilities, CapabilityType},
+            SessionConfig, UpdateMessage,
+        },
         types::AfiSafiType,
         workshop::route::RouteWorkshop,
     },
@@ -55,6 +58,7 @@ use std::{
     },
     hash::{Hash, Hasher},
     io::Read,
+    net::IpAddr,
     ops::ControlFlow,
     sync::Arc,
     time::{Duration, Instant},
@@ -105,6 +109,34 @@ fn pph_distinguisher_bytes<T: AsRef<[u8]>>(
         );
         [0u8; 8]
     })
+}
+
+/// Apply `f` to the value bytes of the first capability of type `typ` found
+/// in a wire-format BGP capability blob (the concatenation produced by
+/// `BgpOpen::capabilities_as_vec`). Returns `None` if the capability is
+/// absent — every caller is best-effort.
+fn with_capability_value<R>(
+    caps: &[u8],
+    typ: CapabilityType,
+    f: impl FnOnce(&[u8]) -> Option<R>,
+) -> Option<R> {
+    let caps = Capabilities(caps);
+    let cap = caps.iter().find(|c| c.typ() == typ)?;
+    f(cap.value())
+}
+
+/// Read the leading 1-octet-length-prefixed UTF-8 string from a capability
+/// value. Shared by the FQDN capability (73,
+/// draft-walton-bgp-hostname-capability — `hostname_len | hostname |
+/// domain_len | domain`, we take just the hostname) and the Software
+/// Version capability (75, draft-abraitis — `version_len | version`).
+fn first_len_prefixed_string(value: &[u8]) -> Option<String> {
+    let len = *value.first()? as usize;
+    let s = value.get(1..1 + len)?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(s).into_owned())
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -450,6 +482,7 @@ pub trait PeerAware {
         eor_capable: bool,
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
+        local_addr: IpAddr,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         tlv_iter: InformationTlvIter,
@@ -564,6 +597,10 @@ where
             (sent.capabilities_as_vec(), rcvd.capabilities_as_vec())
         };
 
+        // Local end of the BGP session (the monitored router's own address
+        // for this peering). The peer/remote end lives in the PPH.
+        let local_addr = msg.local_address();
+
         let tlv_iter = msg.information_tlvs();
 
         let (peer_added, existing_peer_ingress_id) =
@@ -573,6 +610,7 @@ where
                 eor_capable,
                 local_capabilities,
                 remote_capabilities,
+                local_addr,
                 self.ingress_register.clone(),
                 self.ingress_id,
                 tlv_iter,
@@ -700,9 +738,9 @@ where
                 let entries = entries.into_iter().collect::<SmallVec<
                     [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
                 >>();
-                self.mk_routing_update_result(Update::WithdrawBulk(
-                    Box::new(entries),
-                ))
+                self.mk_routing_update_result(Update::WithdrawBulk(Box::new(
+                    entries,
+                )))
             }
 
             /*
@@ -1584,6 +1622,7 @@ impl PeerAware for PeerStates {
         eor_capable: bool,
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
+        local_addr: IpAddr,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         mut tlv_iter: InformationTlvIter,
@@ -1603,12 +1642,38 @@ impl PeerAware for PeerStates {
 
         let mut added = false;
 
+        // Best-effort optional metadata the peer may have advertised in its
+        // received OPEN (FQDN hostname, software version, BGP role) and the
+        // session-establishment time from the per-peer header. All are
+        // surfaced only when present.
+        let peer_hostname = with_capability_value(
+            &remote_capabilities,
+            CapabilityType::FQDN,
+            first_len_prefixed_string,
+        );
+        let peer_software_version = with_capability_value(
+            &remote_capabilities,
+            CapabilityType::SoftwareVersion,
+            first_len_prefixed_string,
+        );
+        let peer_role = with_capability_value(
+            &remote_capabilities,
+            CapabilityType::BgpRole,
+            |v| v.first().copied(),
+        );
+        // PeerUp per-peer-header timestamp = when the BGP session came up.
+        // Some exporters send 0; treat that as "unknown" rather than 1970.
+        let session_up_time =
+            Some(pph.timestamp()).filter(|ts| ts.timestamp() > 0);
+
         let mut query_ingress = ingress::IngressInfo::new()
             .with_ingress_type(ingress::IngressType::BgpViaBmp)
             .with_parent_ingress(bmp_ingress_id)
             .with_state(ingress::register::IngressState::Connected)
             .with_remote_addr(pph.address())
             .with_remote_asn(pph.asn())
+            .with_bgp_id(pph.bgp_id())
+            .with_local_addr(local_addr)
             .with_rib_type(pph.rib_type())
             .with_peer_rib_type((pph.is_post_policy(), pph.rib_type()))
             .with_peer_type(pph.peer_type())
@@ -1636,6 +1701,19 @@ impl PeerAware for PeerStates {
         {
             query_ingress = query_ingress
                 .with_vrf_name(String::from_utf8_lossy(vrf_name.value()));
+        }
+
+        if let Some(hostname) = peer_hostname {
+            query_ingress = query_ingress.with_peer_hostname(hostname);
+        }
+        if let Some(version) = peer_software_version {
+            query_ingress = query_ingress.with_peer_software_version(version);
+        }
+        if let Some(role) = peer_role {
+            query_ingress = query_ingress.with_peer_role(role);
+        }
+        if let Some(ts) = session_up_time {
+            query_ingress = query_ingress.with_session_up_time(ts);
         }
 
         let peer_ingress_id;
@@ -1820,5 +1898,83 @@ impl PeerAware for PeerStates {
         summary_interval: Duration,
     ) -> UnknownPeerLog {
         PeerStates::note_unknown_peer(self, pph, now, summary_interval)
+    }
+}
+
+#[cfg(test)]
+mod capability_extract_tests {
+    use super::{first_len_prefixed_string, with_capability_value};
+    use routecore::bgp::message::open::CapabilityType;
+
+    /// Build a wire-format FQDN capability (code 73): `hostname_len |
+    /// hostname | domain_len | domain`, prefixed with code and length.
+    fn fqdn_cap(hostname: &[u8], domain: &[u8]) -> Vec<u8> {
+        let value_len = 1 + hostname.len() + 1 + domain.len();
+        let mut v = vec![73u8, value_len as u8, hostname.len() as u8];
+        v.extend_from_slice(hostname);
+        v.push(domain.len() as u8);
+        v.extend_from_slice(domain);
+        v
+    }
+
+    /// Software Version capability (code 75): `version_len | version`.
+    fn software_version_cap(version: &[u8]) -> Vec<u8> {
+        let mut v =
+            vec![75u8, (1 + version.len()) as u8, version.len() as u8];
+        v.extend_from_slice(version);
+        v
+    }
+
+    /// BGP Role capability (code 9, RFC 9234): single role octet.
+    fn role_cap(role: u8) -> Vec<u8> {
+        vec![9u8, 1, role]
+    }
+
+    // A 4-octet-ASN capability (code 65), to verify we skip unrelated caps.
+    const ASN_CAP: &[u8] = &[65, 4, 0, 0, 0xfd, 0xe8];
+
+    fn hostname(caps: &[u8]) -> Option<String> {
+        with_capability_value(
+            caps,
+            CapabilityType::FQDN,
+            first_len_prefixed_string,
+        )
+    }
+    fn version(caps: &[u8]) -> Option<String> {
+        with_capability_value(
+            caps,
+            CapabilityType::SoftwareVersion,
+            first_len_prefixed_string,
+        )
+    }
+    fn role(caps: &[u8]) -> Option<u8> {
+        with_capability_value(caps, CapabilityType::BgpRole, |v| {
+            v.first().copied()
+        })
+    }
+
+    #[test]
+    fn extracts_each_capability_when_present() {
+        let mut caps = ASN_CAP.to_vec();
+        caps.extend_from_slice(&fqdn_cap(b"edge1", b"example.net"));
+        caps.extend_from_slice(&software_version_cap(b"FRRouting 9.1"));
+        caps.extend_from_slice(&role_cap(3)); // Customer
+
+        assert_eq!(hostname(&caps).as_deref(), Some("edge1"));
+        assert_eq!(version(&caps).as_deref(), Some("FRRouting 9.1"));
+        assert_eq!(role(&caps), Some(3));
+    }
+
+    #[test]
+    fn none_when_absent_or_empty() {
+        // Only an unrelated capability present.
+        assert_eq!(hostname(ASN_CAP), None);
+        assert_eq!(version(ASN_CAP), None);
+        assert_eq!(role(ASN_CAP), None);
+        // Empty capability blob.
+        assert_eq!(hostname(&[]), None);
+        // Zero-length string is treated as absent.
+        assert_eq!(hostname(&fqdn_cap(b"", b"")), None);
+        assert_eq!(version(&software_version_cap(b"")), None);
     }
 }

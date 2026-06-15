@@ -1,5 +1,6 @@
 use std::{
-    collections::hash_map::Keys, fmt::Debug, ops::ControlFlow, sync::Arc,
+    collections::hash_map::Keys, fmt::Debug, net::IpAddr, ops::ControlFlow,
+    sync::Arc,
 };
 
 use bytes::Bytes;
@@ -387,6 +388,7 @@ impl PeerAware for Dumping {
         eor_capable: bool,
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
+        local_addr: IpAddr,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         tlv_iter: InformationTlvIter,
@@ -397,6 +399,7 @@ impl PeerAware for Dumping {
             eor_capable,
             local_capabilities,
             remote_capabilities,
+            local_addr,
             ingress_register,
             bmp_ingress_id,
             tlv_iter,

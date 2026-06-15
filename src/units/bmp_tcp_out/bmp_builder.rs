@@ -73,7 +73,35 @@ pub struct PeerInfo {
     pub peer_address: IpAddr,
     pub peer_asn: Asn,
     pub peer_bgp_id: [u8; 4],
+    /// Local end of the BGP session (the monitored router's own address).
+    /// Emitted in the Peer Up "Local Address" field. Defaults to
+    /// unspecified when the origin (MRT, direct BGP) carries no local addr.
+    pub local_addr: IpAddr,
+    /// Peer's hostname, if it advertised the BGP FQDN capability (code 73)
+    /// upstream. Re-emitted as an FQDN capability in the Peer Up received
+    /// OPEN. `None` when the peer did not advertise it.
+    pub peer_hostname: Option<String>,
+    /// Peer's software version, if it advertised the Software Version
+    /// capability (code 75) upstream. Re-emitted in the received OPEN.
+    pub peer_software_version: Option<String>,
+    /// Peer's BGP Role (code 9, RFC 9234), if advertised. Re-emitted in the
+    /// received OPEN.
+    pub peer_role: Option<u8>,
+    /// BGP session establishment time (PeerUp per-peer-header timestamp) as
+    /// `(seconds, microseconds)`. When set, used as the per-peer-header
+    /// timestamp of the emitted Peer Up; otherwise `now()` is used.
+    pub session_up_time: Option<(u32, u32)>,
     pub admin_label: Option<String>,
+}
+
+/// Best-effort optional capabilities recovered from an upstream session and
+/// re-emitted in the (received) Peer Up OPEN so downstream consumers recover
+/// them the standard way. All absent for the synthetic *sent* OPEN.
+#[derive(Default)]
+struct OpenCapExtras<'a> {
+    hostname: Option<&'a str>,
+    software_version: Option<&'a str>,
+    role: Option<u8>,
 }
 
 impl PeerInfo {
@@ -116,7 +144,16 @@ impl PeerInfo {
             peer_distinguisher,
             peer_address,
             peer_asn,
-            peer_bgp_id: [0u8; 4],
+            peer_bgp_id: info.bgp_id.unwrap_or([0u8; 4]),
+            local_addr: info
+                .local_addr
+                .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)),
+            peer_hostname: info.peer_hostname.clone(),
+            peer_software_version: info.peer_software_version.clone(),
+            peer_role: info.peer_role,
+            session_up_time: info.session_up_time.map(|dt| {
+                (dt.timestamp() as u32, dt.timestamp_subsec_micros())
+            }),
             admin_label: None,
         }
     }
@@ -184,7 +221,11 @@ fn write_common_header(buf: &mut Vec<u8>, msg_type: u8, total_len: u32) {
 }
 
 /// Write BMP Per-Peer Header to buffer.
-fn write_per_peer_header(buf: &mut Vec<u8>, peer: &PeerInfo) {
+fn write_per_peer_header(
+    buf: &mut Vec<u8>,
+    peer: &PeerInfo,
+    timestamp: Option<(u32, u32)>,
+) {
     // Peer Type (1 byte)
     buf.push(peer.peer_type.into());
 
@@ -211,14 +252,17 @@ fn write_per_peer_header(buf: &mut Vec<u8>, peer: &PeerInfo) {
     // Peer BGP ID (4 bytes)
     buf.extend_from_slice(&peer.peer_bgp_id);
 
-    // Timestamp seconds (4 bytes)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    buf.extend_from_slice(&(now.as_secs() as u32).to_be_bytes());
-
-    // Timestamp microseconds (4 bytes)
-    buf.extend_from_slice(&(now.subsec_micros()).to_be_bytes());
+    // Timestamp (4 bytes seconds + 4 bytes microseconds). Use the supplied
+    // event time (e.g. the real session-up time for Peer Up) when available,
+    // otherwise stamp now().
+    let (secs, micros) = timestamp.unwrap_or_else(|| {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        (now.as_secs() as u32, now.subsec_micros())
+    });
+    buf.extend_from_slice(&secs.to_be_bytes());
+    buf.extend_from_slice(&micros.to_be_bytes());
 }
 
 /// Build a BMP Initiation Message.
@@ -260,8 +304,27 @@ pub fn build_termination_message() -> Vec<u8> {
 }
 
 /// Build a synthetic BGP OPEN message.
+/// Build a *synthetic* BGP OPEN for the Peer Up notification.
+///
+/// This is a normalized OPEN, not a copy of what the monitored router
+/// actually exchanged: we advertise a fixed capability set (4-octet ASN,
+/// MP-BGP for the AFI/SAFIs we re-emit, optional Graceful Restart) and cap
+/// downstream UPDATE size at the classic 4096 limit. `bgp_id` is the only
+/// field plumbed through from the real session — for the *received* OPEN we
+/// pass the peer's BGP Identifier (router-id) so it matches the per-peer
+/// header; the *sent* OPEN's identifier (the monitored router's own
+/// router-id) is not carried by BMP and stays zero.
+///
+/// FUTURE (under consideration): replay the received OPEN verbatim instead
+/// of synthesizing one. That would faithfully preserve the real BGP
+/// Identifier, the full negotiated capability set, and the BGP Hostname
+/// capability (code 73) — i.e. the upstream peer's hostname — at the cost of
+/// giving up the normalization/size-cap guarantees above. Not implemented
+/// yet; see also the capability-extraction work tracked separately.
 fn build_bgp_open(
     asn: Asn,
+    bgp_id: [u8; 4],
+    extras: &OpenCapExtras,
     include_ipv6: bool,
     advertise_graceful_restart: bool,
 ) -> Vec<u8> {
@@ -309,6 +372,55 @@ fn build_bgp_open(
         }
     }
 
+    // Best-effort descriptive capabilities recovered from the upstream
+    // session, re-emitted so downstream consumers recover them the standard
+    // way. Each is skipped if it would overflow the single-octet optional-
+    // parameter length (matching the inbound best-effort semantics).
+    //
+    // Closure appends one capability (code + length + value) if it fits.
+    let mut push_cap = |code: u8, value: &[u8]| {
+        if value.len() <= u8::MAX as usize
+            && caps.len() + 2 + value.len() <= u8::MAX as usize
+        {
+            caps.push(code);
+            caps.push(value.len() as u8);
+            caps.extend_from_slice(value);
+        }
+    };
+
+    // FQDN / Hostname (code 73, draft-walton): hostname_len + hostname +
+    // domain_len; we leave the domain empty.
+    if let Some(host) =
+        extras.hostname.map(str::as_bytes).filter(|h| !h.is_empty())
+    {
+        if host.len() <= u8::MAX as usize {
+            let mut value = Vec::with_capacity(host.len() + 2);
+            value.push(host.len() as u8);
+            value.extend_from_slice(host);
+            value.push(0); // domain name length = 0
+            push_cap(73, &value);
+        }
+    }
+
+    // Software Version (code 75, draft-abraitis): version_len + version.
+    if let Some(ver) = extras
+        .software_version
+        .map(str::as_bytes)
+        .filter(|v| !v.is_empty())
+    {
+        if ver.len() <= u8::MAX as usize {
+            let mut value = Vec::with_capacity(ver.len() + 1);
+            value.push(ver.len() as u8);
+            value.extend_from_slice(ver);
+            push_cap(75, &value);
+        }
+    }
+
+    // BGP Role (code 9, RFC 9234): single role octet.
+    if let Some(role) = extras.role {
+        push_cap(9, &[role]);
+    }
+
     // Optional Parameters: wrap capabilities in Parameter Type 2
     let mut opt_params = Vec::with_capacity(2 + caps.len());
     opt_params.push(2); // Parameter Type = Capabilities
@@ -332,7 +444,7 @@ fn build_bgp_open(
     };
     buf.extend_from_slice(&two_byte_asn.to_be_bytes());
     buf.extend_from_slice(&90u16.to_be_bytes()); // Hold Time
-    buf.extend_from_slice(&[0u8; 4]); // BGP Identifier
+    buf.extend_from_slice(&bgp_id); // BGP Identifier
     buf.push(opt_params.len() as u8);
     buf.extend_from_slice(&opt_params);
 
@@ -401,13 +513,26 @@ pub fn build_peer_up(
     // BMP-out can emit IPv4 and IPv6 unicast route-monitoring messages for a
     // peer regardless of whether the peer's transport address is IPv4 or IPv6.
     let include_ipv6 = true;
+    // Sent OPEN: the monitored router's own router-id is not carried by BMP,
+    // so leave it zero and advertise no peer-supplied extras. Received OPEN:
+    // stamp the peer's BGP Identifier so it agrees with the per-peer header's
+    // Peer BGP ID, and re-emit the peer's best-effort descriptive caps.
+    let received_extras = OpenCapExtras {
+        hostname: peer.peer_hostname.as_deref(),
+        software_version: peer.peer_software_version.as_deref(),
+        role: peer.peer_role,
+    };
     let sent_open = build_bgp_open(
         peer.peer_asn,
+        [0u8; 4],
+        &OpenCapExtras::default(),
         include_ipv6,
         advertise_graceful_restart,
     );
     let received_open = build_bgp_open(
         peer.peer_asn,
+        peer.peer_bgp_id,
+        &received_extras,
         include_ipv6,
         advertise_graceful_restart,
     );
@@ -435,10 +560,18 @@ pub fn build_peer_up(
 
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_PEER_UP, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, peer.session_up_time);
 
-    // Local Address (16 bytes) - zeros
-    buf.extend_from_slice(&[0u8; 16]);
+    // Local Address (16 bytes) - RFC 7854: 12 zero bytes + IPv4, or full IPv6
+    match peer.local_addr {
+        IpAddr::V4(v4) => {
+            buf.extend_from_slice(&[0u8; 12]);
+            buf.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            buf.extend_from_slice(&v6.octets());
+        }
+    }
     // Local Port (2 bytes)
     buf.extend_from_slice(&0u16.to_be_bytes());
     // Remote Port (2 bytes)
@@ -464,7 +597,7 @@ pub fn build_peer_down(peer: &PeerInfo) -> Vec<u8> {
 
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_PEER_DOWN, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     buf.push(BMP_PEER_DOWN_REASON_REMOTE_NO_NOTIFICATION);
 
     buf
@@ -483,7 +616,7 @@ pub fn build_route_monitoring(
 
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     buf.extend_from_slice(&bgp_update);
 
     Some(buf)
@@ -606,7 +739,7 @@ fn build_aggregated_route_monitoring(
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     buf.extend_from_slice(&bgp_update);
     buf
 }
@@ -846,8 +979,7 @@ impl RouteAggregator {
         // A single prefix whose attribute set alone overflows the limit can
         // never be aggregated; emit it via the single-route builder (which
         // also handles the truly-oversized drop case) and drop the group.
-        if group.is_empty()
-            && group.base_len + nlri_len > MAX_BGP_UPDATE_LEN
+        if group.is_empty() && group.base_len + nlri_len > MAX_BGP_UPDATE_LEN
         {
             if let Some(msg) =
                 build_route_monitoring(peer, prefix, pamap, false)
@@ -953,7 +1085,7 @@ pub fn build_statistics_report(peer: &PeerInfo, body: &[u8]) -> Vec<u8> {
         BMP_MSG_STATISTICS_REPORT,
         total_len as u32,
     );
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     buf.extend_from_slice(body);
 
     buf
@@ -1215,7 +1347,7 @@ fn build_eor_ipv4(peer: &PeerInfo) -> Vec<u8> {
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     // BGP UPDATE header
     buf.extend_from_slice(&BGP_MARKER);
     buf.extend_from_slice(&(bgp_update_len as u16).to_be_bytes());
@@ -1243,7 +1375,7 @@ fn build_eor_mp_unreach(peer: &PeerInfo, afisafi: AfiSafiType) -> Vec<u8> {
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update_len;
     let mut buf = Vec::with_capacity(total_len);
     write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
-    write_per_peer_header(&mut buf, peer);
+    write_per_peer_header(&mut buf, peer, None);
     // BGP UPDATE header
     buf.extend_from_slice(&BGP_MARKER);
     buf.extend_from_slice(&(bgp_update_len as u16).to_be_bytes());
@@ -1362,6 +1494,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         };
 
@@ -1383,6 +1520,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         };
 
@@ -1419,6 +1561,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         };
 
@@ -1468,7 +1615,13 @@ mod tests {
     #[test]
     fn test_bgp_open_contains_graceful_restart() {
         // IPv4-only peer
-        let open = build_bgp_open(Asn::from_u32(65000), false, true);
+        let open = build_bgp_open(
+            Asn::from_u32(65000),
+            [0u8; 4],
+            &OpenCapExtras::default(),
+            false,
+            true,
+        );
         // Find GR capability (code 64) in the capabilities
         let bgp_body = &open[19..]; // skip marker(16) + length(2) + type(1)
         let opt_params_len = bgp_body[9] as usize;
@@ -1494,7 +1647,13 @@ mod tests {
         );
 
         // IPv6 peer
-        let open_v6 = build_bgp_open(Asn::from_u32(65000), true, true);
+        let open_v6 = build_bgp_open(
+            Asn::from_u32(65000),
+            [0u8; 4],
+            &OpenCapExtras::default(),
+            true,
+            true,
+        );
         let bgp_body = &open_v6[19..];
         let opt_params_len = bgp_body[9] as usize;
         let opt_params = &bgp_body[10..10 + opt_params_len];
@@ -1513,7 +1672,13 @@ mod tests {
 
     #[test]
     fn test_bgp_open_can_omit_graceful_restart() {
-        let open = build_bgp_open(Asn::from_u32(65000), true, false);
+        let open = build_bgp_open(
+            Asn::from_u32(65000),
+            [0u8; 4],
+            &OpenCapExtras::default(),
+            true,
+            false,
+        );
         let bgp_body = &open[19..];
         let opt_params_len = bgp_body[9] as usize;
         let opt_params = &bgp_body[10..10 + opt_params_len];
@@ -1537,6 +1702,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         };
 
@@ -1571,6 +1741,11 @@ mod tests {
             )),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         };
 
@@ -1651,6 +1826,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: Some(r#"{"sysName":"router1"}"#.to_string()),
         };
 
@@ -1680,6 +1860,72 @@ mod tests {
         assert_eq!(&msg[tlv_offset + 4..], label.as_bytes());
     }
 
+    #[test]
+    fn peer_up_carries_bgp_id_local_addr_and_optional_caps() {
+        let hostname = "rtr-edge-01";
+        let version = "FRRouting 9.1";
+        let peer = PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0x40,
+            peer_distinguisher: [0u8; 8],
+            peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: Asn::from_u32(65000),
+            peer_bgp_id: [192, 0, 2, 7],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2)),
+            peer_hostname: Some(hostname.to_string()),
+            peer_software_version: Some(version.to_string()),
+            peer_role: Some(3), // Customer
+            session_up_time: Some((0x1234_5678, 0x0009_0a0b)),
+            admin_label: None,
+        };
+
+        let msg = build_peer_up(&peer, true);
+
+        // Per-peer header carries the peer's BGP Identifier (router-id).
+        // Layout after common(6): type(1) flags(1) pd(8) addr(16) asn(4).
+        let bgp_id_off = BMP_COMMON_HEADER_LEN + 1 + 1 + 8 + 16 + 4;
+        assert_eq!(&msg[bgp_id_off..bgp_id_off + 4], &[192, 0, 2, 7]);
+
+        // The per-peer-header timestamp is the supplied session-up time, not
+        // now(). Timestamp follows the 4-byte Peer BGP ID.
+        let ts_off = bgp_id_off + 4;
+        assert_eq!(
+            u32::from_be_bytes(msg[ts_off..ts_off + 4].try_into().unwrap()),
+            0x1234_5678
+        );
+        assert_eq!(
+            u32::from_be_bytes(
+                msg[ts_off + 4..ts_off + 8].try_into().unwrap()
+            ),
+            0x0009_0a0b
+        );
+
+        // Peer Up body begins after the per-peer header with the 16-byte
+        // Local Address (IPv4 => 12 zero bytes + octets).
+        let local_off = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN;
+        assert_eq!(&msg[local_off..local_off + 12], &[0u8; 12]);
+        assert_eq!(&msg[local_off + 12..local_off + 16], &[10, 0, 0, 2]);
+
+        let contains =
+            |needle: &[u8]| msg.windows(needle.len()).any(|w| w == needle);
+
+        // FQDN (73): code | value_len | host_len | host | domain_len(0).
+        let mut fqdn =
+            vec![73u8, (hostname.len() + 2) as u8, hostname.len() as u8];
+        fqdn.extend_from_slice(hostname.as_bytes());
+        fqdn.push(0);
+        assert!(contains(&fqdn), "FQDN capability not found");
+
+        // Software Version (75): code | value_len | ver_len | version.
+        let mut sw =
+            vec![75u8, (version.len() + 1) as u8, version.len() as u8];
+        sw.extend_from_slice(version.as_bytes());
+        assert!(contains(&sw), "Software Version capability not found");
+
+        // BGP Role (9): code | len(1) | role.
+        assert!(contains(&[9u8, 1, 3]), "BGP Role capability not found");
+    }
+
     /// Extract the 8-byte peer_distinguisher from a BMP message that
     /// carries a per-peer header (RouteMonitoring, PeerUp, PeerDown,
     /// StatsReport). Layout: common header (6 bytes) + peer_type (1) +
@@ -1699,6 +1945,11 @@ mod tests {
             )),
             peer_asn: Asn::from_u32(6939),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         }
     }
@@ -1789,16 +2040,13 @@ mod tests {
 
         let pd_peer_up = pd_from_msg(&build_peer_up(&peer, false));
         let pd_peer_down = pd_from_msg(&build_peer_down(&peer));
-        let pd_eor =
-            pd_from_msg(&build_eor_ipv4(&peer));
+        let pd_eor = pd_from_msg(&build_eor_ipv4(&peer));
         let pd_eor6 = pd_from_msg(&build_eor_mp_unreach(
             &peer,
             AfiSafiType::Ipv6Unicast,
         ));
-        let pd_stats = pd_from_msg(&build_statistics_report(
-            &peer,
-            &[0u8, 0, 0, 0],
-        ));
+        let pd_stats =
+            pd_from_msg(&build_statistics_report(&peer, &[0u8, 0, 0, 0]));
 
         assert_eq!(pd_peer_up, tag);
         assert_eq!(pd_peer_down, tag);
@@ -1830,6 +2078,11 @@ mod tests {
             peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
             peer_asn: Asn::from_u32(65000),
             peer_bgp_id: [0u8; 4],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
             admin_label: None,
         }
     }
@@ -1851,7 +2104,11 @@ mod tests {
                 .unwrap(),
         ];
         let msg = build_aggregated_route_monitoring(
-            &peer, &prefixes, &pa_bytes, nh.as_deref(), true,
+            &peer,
+            &prefixes,
+            &pa_bytes,
+            nh.as_deref(),
+            true,
         );
 
         assert_eq!(msg[0], BMP_VERSION);
@@ -1882,8 +2139,7 @@ mod tests {
         let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
         let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
         peer_map.insert(7, peer.clone());
-        let mut agg =
-            RouteAggregator::new(64 * 1024 * 1024, peer_map);
+        let mut agg = RouteAggregator::new(64 * 1024 * 1024, peer_map);
         {
             let mut sink = |m: Vec<u8>, n: usize| {
                 messages.push((m, n));
@@ -1938,8 +2194,7 @@ mod tests {
                 total += n;
                 let bgp =
                     &m[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
-                let bgp_len =
-                    u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+                let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
                 if bgp_len != bgp.len() || bgp_len > MAX_BGP_UPDATE_LEN {
                     evicted_within_limit = false;
                 }

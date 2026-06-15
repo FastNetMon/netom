@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use core::sync::atomic::AtomicU32;
 use std::net::IpAddr;
 use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering};
@@ -465,9 +466,7 @@ impl Register {
     ) -> Option<IngressInfo> {
         let mut lock = self.info.write().unwrap();
         match lock.get(&id) {
-            Some(info)
-                if info.state == Some(IngressState::Disconnected) =>
-            {
+            Some(info) if info.state == Some(IngressState::Disconnected) => {
                 lock.remove(&id)
             }
             _ => None,
@@ -695,6 +694,12 @@ info_for_field!(IngressInfo{
    state: IngressState,
    remote_addr: IpAddr,
    remote_asn: Asn,
+   bgp_id: [u8; 4],    // peer's BGP Identifier / router-id (often a loopback)
+   local_addr: IpAddr, // local end of the BGP session (monitored router side)
+   peer_hostname: String, // peer's hostname from BGP FQDN capability (73), if advertised
+   peer_software_version: String, // peer's BGP Software Version capability (75), if advertised
+   peer_role: u8,         // peer's BGP Role capability (9, RFC 9234): 0=Provider 1=RS 2=RS-Client 3=Customer 4=Peer
+   session_up_time: DateTime<Utc>, // PeerUp per-peer-header timestamp (BGP session establishment time)
    rib_type: RibType,
    peer_rib_type: PeerRibType, // RibType + pre/post policy
    filename: PathBuf,
