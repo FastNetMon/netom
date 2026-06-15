@@ -5,7 +5,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     rc::Rc,
-    sync::Mutex,
+    sync::{Arc, LazyLock, Mutex},
     time::{Duration, Instant},
 };
 
@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ingress::IngressId,
     manager,
+    metrics,
     payload::{RotondaPaMap, RotondaRoute},
 };
 
@@ -488,103 +489,167 @@ impl OutputStreamMessage {
 /// has no [`RotondaRoute`] representation.
 const UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Aggregated throttle state for NLRI dropped because their AFI/SAFI is not yet
-/// representable as a [`RotondaRoute`] (FlowSpec, MPLS-VPN, EVPN, RouteTarget,
-/// ...). Such NLRI are parsed fine by routecore but silently dropped before the
-/// RIB; without throttling a peer replaying a RIB full of them would emit one
-/// debug line per prefix and the loss would be invisible at default log levels.
-/// Instead we warn once per family on first sight, then fold the volume into a
-/// periodic `warn!` summary. See [`note_unsupported_afisafi`].
+/// Process-global accounting for NLRI dropped because their AFI/SAFI has no
+/// [`RotondaRoute`] representation (FlowSpec, MPLS-VPN, EVPN, RouteTarget, ...).
+/// Such NLRI are parsed fine by routecore but dropped before any RIB in the
+/// [`RotondaRoute`] `TryFrom` chokepoint. This serves two purposes:
 ///
-/// `Vec`s (not `HashMap`/`HashSet`) so the whole thing is const-constructible in
-/// a `static`; the set of distinct AFI/SAFI types is tiny, so linear scans are
-/// cheaper than hashing and this only runs on the (rare) drop path.
-struct UnsupportedAfiSafiThrottle {
-    /// AFI/SAFI types already called out individually; persists for the life of
-    /// the process so each family warns exactly once on first sight.
+///  * **logging** — warn once per family on first sight, then fold the volume
+///    into a periodic `warn!` summary, so the drops are visible at default log
+///    levels without one line per prefix;
+///  * **metrics** — a monotonic per-AFI/SAFI Prometheus counter, exposed by the
+///    [`metrics::Source`] impl and registered globally in `Manager::new`.
+///
+/// Reachable from the shared explode path (bmp-in, bgp-in, mrt-in) via
+/// [`note_unsupported_afisafi`]; the live handle is obtained with
+/// [`unsupported_afisafi_metrics`].
+#[derive(Debug, Default)]
+pub struct UnsupportedAfiSafiMetrics {
+    inner: Mutex<UnsupportedAfiSafiInner>,
+}
+
+/// Tallies are kept in `Vec`s rather than `HashMap`s: the set of distinct
+/// AFI/SAFI types is tiny, so linear scans beat hashing, and this only runs on
+/// the (rare) drop path and on metrics scrapes.
+#[derive(Debug, Default)]
+struct UnsupportedAfiSafiInner {
+    /// AFI/SAFI types already called out individually; persists for process
+    /// life so each family warns exactly once on first sight.
     seen: Vec<AfiSafiType>,
-    /// Per-type drop tally accumulated toward the next periodic summary.
-    counts: Vec<(AfiSafiType, u64)>,
-    /// Start of the current summary window (anchored on the first drop after a
-    /// summary); `None` until the next drop re-anchors it.
+    /// Per-type drop tally for the next periodic log summary (drained on emit).
+    window_counts: Vec<(AfiSafiType, u64)>,
+    /// Monotonic per-type drop totals exposed via Prometheus (never drained).
+    totals: Vec<(AfiSafiType, u64)>,
+    /// Start of the current log-summary window (anchored on the first drop
+    /// after a summary); `None` until the next drop re-anchors it.
     window_start: Option<Instant>,
 }
 
-impl UnsupportedAfiSafiThrottle {
-    const fn new() -> Self {
-        Self {
-            seen: Vec::new(),
-            counts: Vec::new(),
-            window_start: None,
+/// Increment the per-AFI/SAFI counter in a small assoc-`Vec`, inserting on
+/// first sight.
+fn bump(counts: &mut Vec<(AfiSafiType, u64)>, afi_safi: AfiSafiType) {
+    match counts.iter_mut().find(|(t, _)| *t == afi_safi) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((afi_safi, 1)),
+    }
+}
+
+impl UnsupportedAfiSafiMetrics {
+    /// Record one dropped NLRI: bump the monotonic Prometheus total and drive
+    /// the throttled `warn!` logging (see the type docs for the scheme). `now`
+    /// is taken by the caller so this stays deterministic in tests.
+    fn note(&self, afi_safi: AfiSafiType, now: Instant) {
+        let (first_sight, summary) = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // Monotonic Prometheus total (never drained).
+            bump(&mut inner.totals, afi_safi);
+
+            // First time this exact AFI/SAFI is ever dropped: call it out
+            // immediately rather than waiting for the next summary.
+            let first_sight = !inner.seen.contains(&afi_safi);
+            if first_sight {
+                inner.seen.push(afi_safi);
+            }
+
+            // Windowed tally driving the periodic log summary.
+            bump(&mut inner.window_counts, afi_safi);
+            let window_start = *inner.window_start.get_or_insert(now);
+            let elapsed = now.saturating_duration_since(window_start);
+            let summary = if elapsed >= UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL {
+                let total: u64 =
+                    inner.window_counts.iter().map(|(_, n)| n).sum();
+                let mut breakdown = std::mem::take(&mut inner.window_counts);
+                inner.window_start = None;
+                breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+                Some((total, elapsed, breakdown))
+            } else {
+                None
+            };
+            (first_sight, summary)
+        };
+        // Lock released; format and log outside the critical section.
+
+        if first_sight {
+            warn!(
+                "Dropping route(s) with unsupported AFI/SAFI {afi_safi}: no \
+                 RotondaRoute representation, not stored in any RIB. Further \
+                 drops are summarized at most once per {}s and counted in \
+                 rotonda_unsupported_afisafi_dropped_total.",
+                UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL.as_secs(),
+            );
+        }
+
+        if let Some((total, elapsed, breakdown)) = summary {
+            let detail = breakdown
+                .iter()
+                .map(|(t, n)| format!("{t}={n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            warn!(
+                "Dropped {total} route(s) with unsupported AFI/SAFI over the \
+                 last {}s (no RotondaRoute representation, not stored in any \
+                 RIB): {detail}",
+                elapsed.as_secs(),
+            );
         }
     }
 }
 
-static UNSUPPORTED_AFISAFI_THROTTLE: Mutex<UnsupportedAfiSafiThrottle> =
-    Mutex::new(UnsupportedAfiSafiThrottle::new());
+impl metrics::Source for UnsupportedAfiSafiMetrics {
+    fn append(&self, _unit_name: &str, target: &mut metrics::Target) {
+        const DROPPED_METRIC: metrics::Metric = metrics::Metric::new(
+            "unsupported_afisafi_dropped",
+            "routes dropped because their AFI/SAFI has no internal \
+             representation and cannot be stored in any RIB",
+            metrics::MetricType::Counter,
+            metrics::MetricUnit::Total,
+        );
+
+        // Snapshot under the lock, render outside it.
+        let totals: Vec<(AfiSafiType, u64)> = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.totals.clone()
+        };
+
+        if totals.is_empty() {
+            return;
+        }
+
+        // One HELP/TYPE block, one labelled row per AFI/SAFI family, e.g.
+        // rotonda_unsupported_afisafi_dropped_total{afi_safi="Ipv4FlowSpec"}.
+        target.append(&DROPPED_METRIC, None, |records| {
+            for (afi_safi, count) in &totals {
+                let afi_safi = afi_safi.to_string();
+                records
+                    .label_value(&[("afi_safi", afi_safi.as_str())], *count);
+            }
+        });
+    }
+}
+
+static UNSUPPORTED_AFISAFI: LazyLock<Arc<UnsupportedAfiSafiMetrics>> =
+    LazyLock::new(|| Arc::new(UnsupportedAfiSafiMetrics::default()));
+
+/// Returns the process-global unsupported-AFI/SAFI accounting handle so the
+/// manager can register it as a [`metrics::Source`]. The `LazyLock` keeps a
+/// strong reference for the life of the process, so the `Weak` held by the
+/// metrics collection never dangles.
+pub fn unsupported_afisafi_metrics() -> Arc<UnsupportedAfiSafiMetrics> {
+    UNSUPPORTED_AFISAFI.clone()
+}
 
 /// Record one NLRI dropped because its AFI/SAFI has no [`RotondaRoute`]
-/// representation, and emit a throttled `warn!` so unexpected families
-/// (FlowSpec, MPLS-VPN, EVPN, ...) surface at default log levels without one
-/// line per prefix. Each distinct family is warned once on first sight; the
-/// drop volume is then rolled up into a summary at most once per
-/// [`UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL`].
+/// representation. Called from the shared `TryFrom` drop path; bumps the
+/// Prometheus counter and drives the throttled `warn!` logging.
 fn note_unsupported_afisafi(afi_safi: AfiSafiType) {
-    let now = Instant::now();
-    let mut throttle = UNSUPPORTED_AFISAFI_THROTTLE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-
-    // First time this exact AFI/SAFI is ever dropped: call it out immediately
-    // so a newly-appearing family is obvious rather than waiting for a summary.
-    let first_sight = !throttle.seen.contains(&afi_safi);
-    if first_sight {
-        throttle.seen.push(afi_safi);
-    }
-
-    // Tally toward the periodic volume summary.
-    match throttle.counts.iter_mut().find(|(t, _)| *t == afi_safi) {
-        Some((_, n)) => *n += 1,
-        None => throttle.counts.push((afi_safi, 1)),
-    }
-
-    let window_start = *throttle.window_start.get_or_insert(now);
-    let elapsed = now.saturating_duration_since(window_start);
-    let summary = if elapsed >= UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL {
-        let total: u64 = throttle.counts.iter().map(|(_, n)| n).sum();
-        let mut breakdown = std::mem::take(&mut throttle.counts);
-        throttle.window_start = None;
-        breakdown.sort_by(|a, b| b.1.cmp(&a.1));
-        Some((total, elapsed, breakdown))
-    } else {
-        None
-    };
-
-    // Release the lock before formatting/logging.
-    drop(throttle);
-
-    if first_sight {
-        warn!(
-            "Dropping route(s) with unsupported AFI/SAFI {afi_safi}: no \
-             RotondaRoute representation, not stored in any RIB. Further drops \
-             are summarized at most once per {}s.",
-            UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL.as_secs(),
-        );
-    }
-
-    if let Some((total, elapsed, breakdown)) = summary {
-        let detail = breakdown
-            .iter()
-            .map(|(t, n)| format!("{t}={n}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        warn!(
-            "Dropped {total} route(s) with unsupported AFI/SAFI over the last \
-             {}s (no RotondaRoute representation, not stored in any RIB): \
-             {detail}",
-            elapsed.as_secs(),
-        );
-    }
+    UNSUPPORTED_AFISAFI.note(afi_safi, Instant::now());
 }
 
 impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
@@ -687,5 +752,49 @@ pub struct PeerId {
 impl PeerId {
     pub fn new(addr: IpAddr, asn: Asn) -> Self {
         Self { addr, asn }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_afisafi_counter_increments_and_renders() {
+        let m = UnsupportedAfiSafiMetrics::default();
+        let now = Instant::now();
+        // Two FlowSpec drops and one MPLS-VPN drop.
+        m.note(AfiSafiType::Ipv4FlowSpec, now);
+        m.note(AfiSafiType::Ipv4FlowSpec, now);
+        m.note(AfiSafiType::Ipv6MplsVpnUnicast, now);
+
+        let mut target =
+            metrics::Target::new(metrics::OutputFormat::Prometheus);
+        metrics::Source::append(&m, "unsupported_afisafi", &mut target);
+        let out = target.into_string();
+
+        assert!(
+            out.contains(
+                "rotonda_unsupported_afisafi_dropped_total\
+                 {afi_safi=\"Ipv4FlowSpec\"} 2"
+            ),
+            "missing FlowSpec total in:\n{out}"
+        );
+        assert!(
+            out.contains(
+                "rotonda_unsupported_afisafi_dropped_total\
+                 {afi_safi=\"Ipv6MplsVpnUnicast\"} 1"
+            ),
+            "missing MPLS-VPN total in:\n{out}"
+        );
+    }
+
+    #[test]
+    fn unsupported_afisafi_metric_absent_until_first_drop() {
+        let m = UnsupportedAfiSafiMetrics::default();
+        let mut target =
+            metrics::Target::new(metrics::OutputFormat::Prometheus);
+        metrics::Source::append(&m, "unsupported_afisafi", &mut target);
+        assert!(!target.into_string().contains("unsupported_afisafi"));
     }
 }
