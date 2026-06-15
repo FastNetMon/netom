@@ -1,7 +1,7 @@
 use atomic_enum::atomic_enum;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 //use roto::types::{builtin::{explode_announcements, explode_withdrawals, BytesRecord, FreshRouteContext, NlriStatus, PeerId, PeerRibType, Provenance, RouteContext}, lazyrecord_types::BgpUpdateMessage};
 
 /// RFC 7854 BMP processing.
@@ -1537,10 +1537,74 @@ struct UnknownPeerThrottle {
     last_summary: Option<Instant>,
 }
 
+/// How often to emit a rolled-up summary for repeat sightings of BGP
+/// capabilities rotonda received but does not forward to bmp-out.
+const UNDECODED_CAP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Capability codes rotonda re-emits in the synthesized bmp-out OPEN
+/// (see `bmp_tcp_out::bmp_builder::build_bgp_open`). Anything a peer
+/// advertises outside this set is not carried downstream; we log it once
+/// (rate-limited) so operators can discover what is being dropped.
+///   1=MultiProtocol 9=BgpRole 64=GracefulRestart 65=FourOctetAsn
+///   73=FQDN 75=SoftwareVersion
+const FORWARDED_CAP_CODES: &[u8] = &[1, 9, 64, 65, 73, 75];
+
+/// What to log for a received-but-not-forwarded BGP capability. Mirrors
+/// [`UnknownPeerLog`]: the first sighting of each distinct capability code is
+/// logged in full, later ones are folded into a periodic summary.
+#[derive(Debug)]
+enum UndecodedCapLog {
+    First,
+    Suppressed,
+    Summary { suppressed: u64, distinct: usize },
+}
+
+/// Throttle for the "received a capability we don't forward" log. The same
+/// capability code appears on every peer's OPEN, so a fan-in of thousands of
+/// peers would otherwise log identical lines en masse. We log once per
+/// distinct code, then roll the rest into a periodic summary.
+#[derive(Debug, Default)]
+struct UndecodedCapThrottle {
+    /// Capability codes already logged individually.
+    seen: HashSet<u8>,
+    /// Repeat sightings suppressed since the last summary.
+    suppressed_since_summary: u64,
+    /// Anchor for the current summary interval.
+    last_summary: Option<Instant>,
+}
+
+impl UndecodedCapThrottle {
+    fn note(
+        &mut self,
+        code: u8,
+        now: Instant,
+        summary_interval: Duration,
+    ) -> UndecodedCapLog {
+        if self.seen.insert(code) {
+            self.last_summary.get_or_insert(now);
+            return UndecodedCapLog::First;
+        }
+        self.suppressed_since_summary += 1;
+        let anchor = *self.last_summary.get_or_insert(now);
+        if now.saturating_duration_since(anchor) >= summary_interval {
+            let suppressed =
+                std::mem::take(&mut self.suppressed_since_summary);
+            self.last_summary = Some(now);
+            UndecodedCapLog::Summary {
+                suppressed,
+                distinct: self.seen.len(),
+            }
+        } else {
+            UndecodedCapLog::Suppressed
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct PeerStates(
     HashMap<PerPeerHeader<Bytes>, PeerState>,
     UnknownPeerThrottle,
+    UndecodedCapThrottle,
 );
 
 impl PeerStates {
@@ -1665,6 +1729,43 @@ impl PeerAware for PeerStates {
         // Some exporters send 0; treat that as "unknown" rather than 1970.
         let session_up_time =
             Some(pph.timestamp()).filter(|ts| ts.timestamp() > 0);
+
+        // Surface (rate-limited) any capability the peer advertised that
+        // rotonda does not forward to bmp-out, so silently-dropped optional
+        // data is discoverable without flooding the log.
+        let now = Instant::now();
+        let caps = Capabilities(&remote_capabilities);
+        for cap in caps.iter() {
+            let code = match cap.as_ref().first() {
+                Some(c) => *c,
+                None => continue,
+            };
+            if FORWARDED_CAP_CODES.contains(&code) {
+                continue;
+            }
+            match self.2.note(code, now, UNDECODED_CAP_SUMMARY_INTERVAL) {
+                UndecodedCapLog::First => info!(
+                    "bmp-in: peer {} (AS{}) advertised BGP capability {} \
+                     (code {}) that rotonda does not forward to bmp-out",
+                    pph.address(),
+                    pph.asn(),
+                    CapabilityType::from(code),
+                    code,
+                ),
+                UndecodedCapLog::Summary {
+                    suppressed,
+                    distinct,
+                } => info!(
+                    "bmp-in: suppressed {} further sighting(s) of \
+                     non-forwarded BGP capabilities across {} distinct \
+                     code(s) in the last {}s",
+                    suppressed,
+                    distinct,
+                    UNDECODED_CAP_SUMMARY_INTERVAL.as_secs(),
+                ),
+                UndecodedCapLog::Suppressed => {}
+            }
+        }
 
         let mut query_ingress = ingress::IngressInfo::new()
             .with_ingress_type(ingress::IngressType::BgpViaBmp)
@@ -1903,8 +2004,12 @@ impl PeerAware for PeerStates {
 
 #[cfg(test)]
 mod capability_extract_tests {
-    use super::{first_len_prefixed_string, with_capability_value};
+    use super::{
+        first_len_prefixed_string, with_capability_value, UndecodedCapLog,
+        UndecodedCapThrottle,
+    };
     use routecore::bgp::message::open::CapabilityType;
+    use std::time::{Duration, Instant};
 
     /// Build a wire-format FQDN capability (code 73): `hostname_len |
     /// hostname | domain_len | domain`, prefixed with code and length.
@@ -1976,5 +2081,41 @@ mod capability_extract_tests {
         // Zero-length string is treated as absent.
         assert_eq!(hostname(&fqdn_cap(b"", b"")), None);
         assert_eq!(version(&software_version_cap(b"")), None);
+    }
+
+    #[test]
+    fn undecoded_cap_throttle_logs_first_then_summarizes() {
+        let mut t = UndecodedCapThrottle::default();
+        let t0 = Instant::now();
+        let interval = Duration::from_secs(300);
+
+        // First sighting of each distinct code is logged in full.
+        assert!(matches!(t.note(69, t0, interval), UndecodedCapLog::First));
+        assert!(matches!(t.note(2, t0, interval), UndecodedCapLog::First));
+
+        // Repeats within the interval are suppressed.
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(matches!(
+            t.note(69, t1, interval),
+            UndecodedCapLog::Suppressed
+        ));
+        assert!(matches!(
+            t.note(2, t1, interval),
+            UndecodedCapLog::Suppressed
+        ));
+
+        // Once the interval elapses, a repeat yields a rolled-up summary
+        // covering all suppressed sightings and the distinct code count.
+        let t2 = t0 + interval + Duration::from_secs(1);
+        match t.note(69, t2, interval) {
+            UndecodedCapLog::Summary {
+                suppressed,
+                distinct,
+            } => {
+                assert_eq!(suppressed, 3);
+                assert_eq!(distinct, 2);
+            }
+            other => panic!("expected Summary, got {other:?}"),
+        }
     }
 }
