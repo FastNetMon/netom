@@ -481,7 +481,7 @@ pub async fn perform_initial_dump(
     for (id, pi, count) in &peer_rows {
         if *count == 0 {
             info!(
-                "bmp-out dump for {}: ZERO-ROUTE peer ingress_id={} AS{} {}",
+                "bmp-out dump for {}: ZERO-ROUTE peer ingress_id={} {} {}",
                 client.remote_addr, id, pi.peer_asn, pi.peer_address,
             );
         }
