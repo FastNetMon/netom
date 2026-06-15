@@ -14,7 +14,9 @@ use chrono::Utc;
 use inetnum::{addr::Prefix, asn::Asn};
 use log::{debug, warn};
 use routecore::bgp::{
-    message::UpdateMessage, nlri::afisafi::Nlri, types::AfiSafiType,
+    message::UpdateMessage,
+    nlri::afisafi::{Nlri, NlriType},
+    types::AfiSafiType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -483,62 +485,71 @@ impl OutputStreamMessage {
     }
 }
 
-//--- Unsupported AFI/SAFI drop accounting -----------------------------------
+//--- Unsupported NLRI drop accounting ---------------------------------------
 
-/// How often to emit a rolled-up summary of NLRI dropped because their AFI/SAFI
-/// has no [`RotondaRoute`] representation.
-const UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to emit a rolled-up summary of NLRI dropped because their type has
+/// no [`RotondaRoute`] representation.
+const UNSUPPORTED_NLRI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Process-global accounting for NLRI dropped because their AFI/SAFI has no
-/// [`RotondaRoute`] representation (FlowSpec, MPLS-VPN, EVPN, RouteTarget, ...).
-/// Such NLRI are parsed fine by routecore but dropped before any RIB in the
-/// [`RotondaRoute`] `TryFrom` chokepoint. This serves two purposes:
+/// Process-global accounting for NLRI dropped because their [`NlriType`] has no
+/// [`RotondaRoute`] representation. This covers genuinely unsupported families
+/// (FlowSpec, MPLS-VPN, EVPN, RouteTarget, ...) *and* the ADD-PATH encodings of
+/// otherwise-supported families (`Ipv4UnicastAddpath`, `Ipv6UnicastAddpath`,
+/// ...), which `RotondaRoute` cannot yet hold. Such NLRI parse fine in routecore
+/// but are dropped before any RIB in the [`RotondaRoute`] `TryFrom` chokepoint.
 ///
-///  * **logging** — warn once per family on first sight, then fold the volume
+/// Keyed on [`NlriType`] rather than `AfiSafiType` precisely so the ADD-PATH
+/// variants stay distinct: `AfiSafiType` collapses e.g. `Ipv4UnicastAddpath`
+/// down to `Ipv4Unicast`, which would mislabel dropped ADD-PATH routes as the
+/// plain unicast family that *is* stored.
+///
+/// This serves two purposes:
+///
+///  * **logging** — warn once per NLRI type on first sight, then fold the volume
 ///    into a periodic `warn!` summary, so the drops are visible at default log
 ///    levels without one line per prefix;
-///  * **metrics** — a monotonic per-AFI/SAFI Prometheus counter, exposed by the
+///  * **metrics** — a monotonic per-NLRI-type Prometheus counter, exposed by the
 ///    [`metrics::Source`] impl and registered globally in `Manager::new`.
 ///
 /// Reachable from the shared explode path (bmp-in, bgp-in, mrt-in) via
-/// [`note_unsupported_afisafi`]; the live handle is obtained with
-/// [`unsupported_afisafi_metrics`].
+/// [`note_unsupported_nlri`]; the live handle is obtained with
+/// [`unsupported_nlri_metrics`].
 #[derive(Debug, Default)]
-pub struct UnsupportedAfiSafiMetrics {
-    inner: Mutex<UnsupportedAfiSafiInner>,
+pub struct UnsupportedNlriMetrics {
+    inner: Mutex<UnsupportedNlriInner>,
 }
 
-/// Tallies are kept in `Vec`s rather than `HashMap`s: the set of distinct
-/// AFI/SAFI types is tiny, so linear scans beat hashing, and this only runs on
-/// the (rare) drop path and on metrics scrapes.
+/// Tallies are kept in `Vec`s rather than `HashMap`s: the set of distinct NLRI
+/// types is tiny, so linear scans beat hashing, and this only runs on the
+/// (rare) drop path and on metrics scrapes.
 #[derive(Debug, Default)]
-struct UnsupportedAfiSafiInner {
-    /// AFI/SAFI types already called out individually; persists for process
-    /// life so each family warns exactly once on first sight.
-    seen: Vec<AfiSafiType>,
+struct UnsupportedNlriInner {
+    /// NLRI types already called out individually; persists for process life so
+    /// each type warns exactly once on first sight.
+    seen: Vec<NlriType>,
     /// Per-type drop tally for the next periodic log summary (drained on emit).
-    window_counts: Vec<(AfiSafiType, u64)>,
+    window_counts: Vec<(NlriType, u64)>,
     /// Monotonic per-type drop totals exposed via Prometheus (never drained).
-    totals: Vec<(AfiSafiType, u64)>,
+    totals: Vec<(NlriType, u64)>,
     /// Start of the current log-summary window (anchored on the first drop
     /// after a summary); `None` until the next drop re-anchors it.
     window_start: Option<Instant>,
 }
 
-/// Increment the per-AFI/SAFI counter in a small assoc-`Vec`, inserting on
+/// Increment the per-NLRI-type counter in a small assoc-`Vec`, inserting on
 /// first sight.
-fn bump(counts: &mut Vec<(AfiSafiType, u64)>, afi_safi: AfiSafiType) {
-    match counts.iter_mut().find(|(t, _)| *t == afi_safi) {
+fn bump(counts: &mut Vec<(NlriType, u64)>, nlri_type: NlriType) {
+    match counts.iter_mut().find(|(t, _)| *t == nlri_type) {
         Some((_, n)) => *n += 1,
-        None => counts.push((afi_safi, 1)),
+        None => counts.push((nlri_type, 1)),
     }
 }
 
-impl UnsupportedAfiSafiMetrics {
+impl UnsupportedNlriMetrics {
     /// Record one dropped NLRI: bump the monotonic Prometheus total and drive
     /// the throttled `warn!` logging (see the type docs for the scheme). `now`
     /// is taken by the caller so this stays deterministic in tests.
-    fn note(&self, afi_safi: AfiSafiType, now: Instant) {
+    fn note(&self, nlri_type: NlriType, now: Instant) {
         let (first_sight, summary) = {
             let mut inner = self
                 .inner
@@ -546,25 +557,26 @@ impl UnsupportedAfiSafiMetrics {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
 
             // Monotonic Prometheus total (never drained).
-            bump(&mut inner.totals, afi_safi);
+            bump(&mut inner.totals, nlri_type);
 
-            // First time this exact AFI/SAFI is ever dropped: call it out
+            // First time this exact NLRI type is ever dropped: call it out
             // immediately rather than waiting for the next summary.
-            let first_sight = !inner.seen.contains(&afi_safi);
+            let first_sight = !inner.seen.contains(&nlri_type);
             if first_sight {
-                inner.seen.push(afi_safi);
+                inner.seen.push(nlri_type);
             }
 
             // Windowed tally driving the periodic log summary.
-            bump(&mut inner.window_counts, afi_safi);
+            bump(&mut inner.window_counts, nlri_type);
             let window_start = *inner.window_start.get_or_insert(now);
             let elapsed = now.saturating_duration_since(window_start);
-            let summary = if elapsed >= UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL {
+            let summary = if elapsed >= UNSUPPORTED_NLRI_SUMMARY_INTERVAL {
                 let total: u64 =
                     inner.window_counts.iter().map(|(_, n)| n).sum();
                 let mut breakdown = std::mem::take(&mut inner.window_counts);
                 inner.window_start = None;
-                breakdown.sort_by(|a, b| b.1.cmp(&a.1));
+                // Highest-volume NLRI type first.
+                breakdown.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
                 Some((total, elapsed, breakdown))
             } else {
                 None
@@ -575,22 +587,23 @@ impl UnsupportedAfiSafiMetrics {
 
         if first_sight {
             warn!(
-                "Dropping route(s) with unsupported AFI/SAFI {afi_safi}: no \
-                 RotondaRoute representation, not stored in any RIB. Further \
-                 drops are summarized at most once per {}s and counted in \
-                 rotonda_unsupported_afisafi_dropped_total.",
-                UNSUPPORTED_AFISAFI_SUMMARY_INTERVAL.as_secs(),
+                "Dropping route(s) with unsupported NLRI type {nlri_type:?}: \
+                 no RotondaRoute representation, not stored in any RIB (note: \
+                 ADD-PATH encodings such as Ipv4UnicastAddpath land here too). \
+                 Further drops are summarized at most once per {}s and counted \
+                 in rotonda_unsupported_nlri_dropped_total.",
+                UNSUPPORTED_NLRI_SUMMARY_INTERVAL.as_secs(),
             );
         }
 
         if let Some((total, elapsed, breakdown)) = summary {
             let detail = breakdown
                 .iter()
-                .map(|(t, n)| format!("{t}={n}"))
+                .map(|(t, n)| format!("{t:?}={n}"))
                 .collect::<Vec<_>>()
                 .join(", ");
             warn!(
-                "Dropped {total} route(s) with unsupported AFI/SAFI over the \
+                "Dropped {total} route(s) with unsupported NLRI type over the \
                  last {}s (no RotondaRoute representation, not stored in any \
                  RIB): {detail}",
                 elapsed.as_secs(),
@@ -599,18 +612,19 @@ impl UnsupportedAfiSafiMetrics {
     }
 }
 
-impl metrics::Source for UnsupportedAfiSafiMetrics {
+impl metrics::Source for UnsupportedNlriMetrics {
     fn append(&self, _unit_name: &str, target: &mut metrics::Target) {
         const DROPPED_METRIC: metrics::Metric = metrics::Metric::new(
-            "unsupported_afisafi_dropped",
-            "routes dropped because their AFI/SAFI has no internal \
-             representation and cannot be stored in any RIB",
+            "unsupported_nlri_dropped",
+            "routes dropped because their NLRI type (AFI/SAFI, or its ADD-PATH \
+             encoding) has no internal representation and cannot be stored in \
+             any RIB",
             metrics::MetricType::Counter,
             metrics::MetricUnit::Total,
         );
 
         // Snapshot under the lock, render outside it.
-        let totals: Vec<(AfiSafiType, u64)> = {
+        let totals: Vec<(NlriType, u64)> = {
             let inner = self
                 .inner
                 .lock()
@@ -622,34 +636,36 @@ impl metrics::Source for UnsupportedAfiSafiMetrics {
             return;
         }
 
-        // One HELP/TYPE block, one labelled row per AFI/SAFI family, e.g.
-        // rotonda_unsupported_afisafi_dropped_total{afi_safi="Ipv4FlowSpec"}.
+        // One HELP/TYPE block, one labelled row per NLRI type, e.g.
+        // rotonda_unsupported_nlri_dropped_total{nlri_type="Ipv4UnicastAddpath"}.
         target.append(&DROPPED_METRIC, None, |records| {
-            for (afi_safi, count) in &totals {
-                let afi_safi = afi_safi.to_string();
-                records
-                    .label_value(&[("afi_safi", afi_safi.as_str())], *count);
+            for (nlri_type, count) in &totals {
+                let nlri_type = format!("{nlri_type:?}");
+                records.label_value(
+                    &[("nlri_type", nlri_type.as_str())],
+                    *count,
+                );
             }
         });
     }
 }
 
-static UNSUPPORTED_AFISAFI: LazyLock<Arc<UnsupportedAfiSafiMetrics>> =
-    LazyLock::new(|| Arc::new(UnsupportedAfiSafiMetrics::default()));
+static UNSUPPORTED_NLRI: LazyLock<Arc<UnsupportedNlriMetrics>> =
+    LazyLock::new(|| Arc::new(UnsupportedNlriMetrics::default()));
 
-/// Returns the process-global unsupported-AFI/SAFI accounting handle so the
-/// manager can register it as a [`metrics::Source`]. The `LazyLock` keeps a
-/// strong reference for the life of the process, so the `Weak` held by the
-/// metrics collection never dangles.
-pub fn unsupported_afisafi_metrics() -> Arc<UnsupportedAfiSafiMetrics> {
-    UNSUPPORTED_AFISAFI.clone()
+/// Returns the process-global unsupported-NLRI accounting handle so the manager
+/// can register it as a [`metrics::Source`]. The `LazyLock` keeps a strong
+/// reference for the life of the process, so the `Weak` held by the metrics
+/// collection never dangles.
+pub fn unsupported_nlri_metrics() -> Arc<UnsupportedNlriMetrics> {
+    UNSUPPORTED_NLRI.clone()
 }
 
-/// Record one NLRI dropped because its AFI/SAFI has no [`RotondaRoute`]
+/// Record one NLRI dropped because its [`NlriType`] has no [`RotondaRoute`]
 /// representation. Called from the shared `TryFrom` drop path; bumps the
 /// Prometheus counter and drives the throttled `warn!` logging.
-fn note_unsupported_afisafi(afi_safi: AfiSafiType) {
-    UNSUPPORTED_AFISAFI.note(afi_safi, Instant::now());
+fn note_unsupported_nlri(nlri_type: NlriType) {
+    UNSUPPORTED_NLRI.note(nlri_type, Instant::now());
 }
 
 impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
@@ -683,9 +699,10 @@ impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
             | Nlri::L2VpnVplsAddpath(..)
             | Nlri::L2VpnEvpn(..)
             | Nlri::L2VpnEvpnAddpath(..) => {
-                note_unsupported_afisafi(value.0.afi_safi());
+                note_unsupported_nlri(value.0.nlri_type());
                 debug!(
-                    "AFI/SAFI {} not yet supported in RotondaRoute",
+                    "NLRI type {:?} not yet supported in RotondaRoute: {}",
+                    value.0.nlri_type(),
                     value.0
                 );
                 return Err(());
@@ -760,41 +777,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unsupported_afisafi_counter_increments_and_renders() {
-        let m = UnsupportedAfiSafiMetrics::default();
+    fn unsupported_nlri_counter_increments_and_renders() {
+        let m = UnsupportedNlriMetrics::default();
         let now = Instant::now();
-        // Two FlowSpec drops and one MPLS-VPN drop.
-        m.note(AfiSafiType::Ipv4FlowSpec, now);
-        m.note(AfiSafiType::Ipv4FlowSpec, now);
-        m.note(AfiSafiType::Ipv6MplsVpnUnicast, now);
+        // Two ADD-PATH unicast drops (the real-world case: AfiSafiType would
+        // collapse these to plain Ipv4Unicast) and one FlowSpec drop.
+        m.note(NlriType::Ipv4UnicastAddpath, now);
+        m.note(NlriType::Ipv4UnicastAddpath, now);
+        m.note(NlriType::Ipv6FlowSpec, now);
 
         let mut target =
             metrics::Target::new(metrics::OutputFormat::Prometheus);
-        metrics::Source::append(&m, "unsupported_afisafi", &mut target);
+        metrics::Source::append(&m, "unsupported_nlri", &mut target);
         let out = target.into_string();
 
         assert!(
             out.contains(
-                "rotonda_unsupported_afisafi_dropped_total\
-                 {afi_safi=\"Ipv4FlowSpec\"} 2"
+                "rotonda_unsupported_nlri_dropped_total\
+                 {nlri_type=\"Ipv4UnicastAddpath\"} 2"
             ),
-            "missing FlowSpec total in:\n{out}"
+            "missing ADD-PATH unicast total in:\n{out}"
         );
         assert!(
             out.contains(
-                "rotonda_unsupported_afisafi_dropped_total\
-                 {afi_safi=\"Ipv6MplsVpnUnicast\"} 1"
+                "rotonda_unsupported_nlri_dropped_total\
+                 {nlri_type=\"Ipv6FlowSpec\"} 1"
             ),
-            "missing MPLS-VPN total in:\n{out}"
+            "missing FlowSpec total in:\n{out}"
         );
     }
 
     #[test]
-    fn unsupported_afisafi_metric_absent_until_first_drop() {
-        let m = UnsupportedAfiSafiMetrics::default();
+    fn unsupported_nlri_metric_absent_until_first_drop() {
+        let m = UnsupportedNlriMetrics::default();
         let mut target =
             metrics::Target::new(metrics::OutputFormat::Prometheus);
-        metrics::Source::append(&m, "unsupported_afisafi", &mut target);
-        assert!(!target.into_string().contains("unsupported_afisafi"));
+        metrics::Source::append(&m, "unsupported_nlri", &mut target);
+        assert!(!target.into_string().contains("unsupported_nlri"));
     }
 }

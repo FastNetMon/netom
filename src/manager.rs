@@ -379,14 +379,15 @@ impl Manager {
             Arc::downgrade(roto_metrics.as_ref().unwrap())
                 as Weak<dyn metrics::Source>,
         );
-        // Global counter for routes dropped because their AFI/SAFI has no
-        // RotondaRoute representation. The source's strong reference is held
+        // Global counter for routes dropped because their NLRI type has no
+        // RotondaRoute representation (unsupported AFI/SAFI, or ADD-PATH
+        // encodings of supported ones). The source's strong reference is held
         // for the process lifetime by a LazyLock inside roto_runtime::types,
         // so this Weak never dangles.
         metrics.register(
-            "unsupported_afisafi".into(),
+            "unsupported_nlri".into(),
             Arc::downgrade(
-                &crate::roto_runtime::types::unsupported_afisafi_metrics(),
+                &crate::roto_runtime::types::unsupported_nlri_metrics(),
             ) as Weak<dyn metrics::Source>,
         );
         let http_ng_api = Arc::new(Mutex::new(http_ng::Api::new(
