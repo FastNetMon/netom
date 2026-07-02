@@ -47,7 +47,7 @@ jobs:
         run: |
           mkdir -p target/debian
           cat > target/debian/changelog << EOF
-          rotonda (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
+          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
 
             * Release ${{ needs.prepare.outputs.version }}
 
@@ -93,7 +93,7 @@ jobs:
         run: |
           mkdir -p target/debian
           cat > target/debian/changelog << EOF
-          rotonda (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
+          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
 
             * Release ${{ needs.prepare.outputs.version }}
 
@@ -139,7 +139,7 @@ jobs:
         run: |
           mkdir -p target/debian
           cat > target/debian/changelog << EOF
-          rotonda (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
+          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
 
             * Release ${{ needs.prepare.outputs.version }}
 

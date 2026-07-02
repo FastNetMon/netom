@@ -397,7 +397,7 @@ where
         // couple of seconds to retrieve RPKI data from the connected RP
         // software. Ideally we signal the other components immediatly
         // after a RTR Reset (i.e., the initial sync), but that requires
-        // some refactoring to not stall Rotonda entirely when the
+        // some refactoring to not stall Netom entirely when the
         // connection to the RP software is never successful. For now,
         // simply wait 5 seconds.
 

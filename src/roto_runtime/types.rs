@@ -165,7 +165,7 @@ pub enum Output {
     Origin(Asn),
 
     // TODO stick the PeerIp in here from roto, if we can, otherwise get it
-    // from elsewhere in Rotonda
+    // from elsewhere in Netom
     /// A BMP PeerDownNotification was observed.
     PeerDown,
     /// Prefix observed in the BGP or BMP message.
@@ -591,7 +591,7 @@ impl UnsupportedNlriMetrics {
                  no RotondaRoute representation, not stored in any RIB (note: \
                  ADD-PATH encodings such as Ipv4UnicastAddpath land here too). \
                  Further drops are summarized at most once per {}s and counted \
-                 in rotonda_unsupported_nlri_dropped_total.",
+                 in netom_unsupported_nlri_dropped_total.",
                 UNSUPPORTED_NLRI_SUMMARY_INTERVAL.as_secs(),
             );
         }
@@ -637,7 +637,7 @@ impl metrics::Source for UnsupportedNlriMetrics {
         }
 
         // One HELP/TYPE block, one labelled row per NLRI type, e.g.
-        // rotonda_unsupported_nlri_dropped_total{nlri_type="Ipv4UnicastAddpath"}.
+        // netom_unsupported_nlri_dropped_total{nlri_type="Ipv4UnicastAddpath"}.
         target.append(&DROPPED_METRIC, None, |records| {
             for (nlri_type, count) in &totals {
                 let nlri_type = format!("{nlri_type:?}");
@@ -793,14 +793,14 @@ mod tests {
 
         assert!(
             out.contains(
-                "rotonda_unsupported_nlri_dropped_total\
+                "netom_unsupported_nlri_dropped_total\
                  {nlri_type=\"Ipv4UnicastAddpath\"} 2"
             ),
             "missing ADD-PATH unicast total in:\n{out}"
         );
         assert!(
             out.contains(
-                "rotonda_unsupported_nlri_dropped_total\
+                "netom_unsupported_nlri_dropped_total\
                  {nlri_type=\"Ipv6FlowSpec\"} 1"
             ),
             "missing FlowSpec total in:\n{out}"

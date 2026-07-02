@@ -1,0 +1,11 @@
+[Unit]
+Description=Netom
+Documentation=man:netom(1)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/netom --config=/etc/netom/netom.conf
+User=netom
+
+[Install]
+WantedBy=multi-user.target

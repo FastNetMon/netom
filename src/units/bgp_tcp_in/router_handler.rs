@@ -699,8 +699,8 @@ impl Processor {
         // [2023-08-02 21:13:18] WARN  routecore::bgp::message::nlri: Unimplemented NextHop AFI/SAFI Ipv6/Unicast len 4
         // [2023-08-02 21:13:18] ERROR rotonda_fsm::bgp::session: error: parse error
         // [2023-08-02 21:13:18] DEBUG rotonda_fsm::bgp::fsm: FSM Established -> Connect
-        // [2023-08-02 21:13:18] ERROR rotonda::units::bgp_tcp_in::router_handler: error from fsm: error: error from read_frame
-        // [2023-08-02 21:13:18] DEBUG rotonda::units::bgp_tcp_in::router_handler: removed AS200@10.1.0.2 from live_sessions (current count: 0)
+        // [2023-08-02 21:13:18] ERROR netom::units::bgp_tcp_in::router_handler: error from fsm: error: error from read_frame
+        // [2023-08-02 21:13:18] DEBUG netom::units::bgp_tcp_in::router_handler: removed AS200@10.1.0.2 from live_sessions (current count: 0)
         //
         // And all previously announced correct prefixes are withdrawn from
         // rib. Perhaps this can serve when further developing the part
@@ -799,7 +799,7 @@ pub async fn handle_connection(
     //  - depending on candidate_config, with or without DelayOpen
     //  Ugly use of temp bool here, because candidate_config is moved.
     //  We do not want to put this logic in BgpSession itself, because this
-    //  all looks a bit to rotonda-unit specific.
+    //  all looks a bit to netom-unit specific.
 
     let delay_open = !candidate_config.is_exact();
     debug!(

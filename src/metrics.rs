@@ -1,7 +1,7 @@
 //! Maintaining and outputting metrics.
 //!
 //! Metrics are operational data maintained by components that allow users to
-//! understand what their instance of Rotonda is doing. Because they are
+//! understand what their instance of Netom is doing. Because they are
 //! updated by components and printed by other components in different
 //! threads, management is a bit tricky.
 //!
@@ -33,7 +33,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 //------------ Module Configuration ------------------------------------------
 
 /// The application prefix to use in the names of Prometheus metrics.
-const PROMETHEUS_PREFIX: &str = "rotonda";
+const PROMETHEUS_PREFIX: &str = "netom";
 
 //------------ Collection ----------------------------------------------------
 

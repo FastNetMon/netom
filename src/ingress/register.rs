@@ -163,7 +163,7 @@ macro_rules! info_for_field{
         /// The `IngressInfo` struct is quite broad and generic in nature, featuring
         /// fields that might not make sense in all use cases. Therefore, everything
         /// is wrapped as an `Option`, giving the user (mostly connector/ingress
-        /// components within Rotonda) the flexibilty to fill in what makes sense in
+        /// components within Netom) the flexibilty to fill in what makes sense in
         /// their specific case.
         #[derive(Clone, Debug, Default, Eq, PartialEq, Ord, PartialOrd)]
         #[serde_with::skip_serializing_none]

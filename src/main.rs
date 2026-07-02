@@ -4,9 +4,9 @@ use futures::{
     pin_mut,
 };
 use log::{debug, error, info, warn};
-use rotonda::log::ExitError;
-use rotonda::manager::Manager;
-use rotonda::{
+use netom::log::ExitError;
+use netom::manager::Manager;
+use netom::{
     config::{Config, ConfigFile, Source},
     log::Terminate,
 };
@@ -30,7 +30,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 fn run_with_cmdline_args() -> Result<(), Terminate> {
     Config::init()?;
 
-    let app = Command::new("rotonda")
+    let app = Command::new("netom")
         .version(crate_version!())
         .author(crate_authors!())
         .next_line_help(true);
@@ -231,7 +231,7 @@ mod tests {
     use atomic_enum::atomic_enum;
     use inetnum::{addr::Prefix, asn::Asn};
     use prometheus_parse::Value;
-    use rotonda::{
+    use netom::{
         bgp::encode::{
             mk_initiation_msg, mk_peer_down_notification_msg,
             mk_peer_up_notification_msg, mk_route_monitoring_msg,
@@ -249,17 +249,17 @@ mod tests {
     use super::*;
 
     const MAX_TIME_TO_WAIT_SECS: u64 = 3;
-    const METRIC_PREFIX: &str = "rotonda_";
+    const METRIC_PREFIX: &str = "netom_";
 
-    // This test runs Rotonda as if it were run from the command line using a
+    // This test runs Netom as if it were run from the command line using a
     // config file. It:
-    //   - Configures Rotonda to expect BMP input and to produce MQTT output.
+    //   - Configures Netom to expect BMP input and to produce MQTT output.
     //   - Simulates a monitored router by sending BMP messages over a TCP
-    //     connection to Rotonda.
+    //     connection to Netom.
     //   - Runs a real MQTT broker (using the rumqttd Rust library) to which
-    //     Rotonda will publish messages, and from which the test can retrieve
+    //     Netom will publish messages, and from which the test can retrieve
     //     published messages.
-    //   - Inspects the state of Rotonda using its Prometheus metrics
+    //   - Inspects the state of Netom using its Prometheus metrics
     //     endpoint, its RIB HTTP API and by looking at the MQTT messages
     //     received at the MQTT broker.
     #[test]
@@ -273,7 +273,7 @@ mod tests {
 
         // Uncomment this to investigate roto script parsing and execution
         // issues.
-        // std::env::set_var("ROTONDA_ROTO_LOG", "1");
+        // std::env::set_var("NETOM_ROTO_LOG", "1");
 
         let test_prefix = Prefix::from_str("127.0.0.1/32").unwrap();
         let test_prefix2 = Prefix::from_str("127.0.0.2/32").unwrap();
@@ -284,7 +284,7 @@ mod tests {
         Config::init().unwrap();
 
         // ===================================================================
-        // Define a base Rotonda config. It defines a BMP input and a RIB with
+        // Define a base Netom config. It defines a BMP input and a RIB with
         // two vRIBs.
         // ===================================================================
         let base_config_toml = r#"
@@ -321,14 +321,14 @@ mod tests {
 
         // ===================================================================
         // Define a config fragment for an MQTT target.
-        // We'll reconfigure Rotonda to use this instead of the null target.
+        // We'll reconfigure Netom to use this instead of the null target.
         // ===================================================================
         let mqtt_target_toml = r#"
         [targets.local-broker]
         type = "mqtt-out"
         qos = 2
         destination = "127.0.0.1"
-        client_id = "rotonda"
+        client_id = "netom"
         communities = ["BLACKHOLE"]
         sources = ["global-rib"]
         connect_retry_secs = 1
@@ -341,14 +341,14 @@ mod tests {
         //
 
         // ===================================================================
-        // Run Rotonda using the base + null target config. This will also
+        // Run Netom using the base + null target config. This will also
         // start a Tokio runtime which we then also use below to run the
         // actual integration test steps.
         // ===================================================================
         let mut config_bytes = base_config_toml.as_bytes().to_vec();
         config_bytes.extend_from_slice(null_target_toml.as_bytes());
         eprintln!(
-            "The following Rotonda config file will be used:\n{}",
+            "The following Netom config file will be used:\n{}",
             String::from_utf8_lossy(&config_bytes)
         );
         let config_file = ConfigFile::new(
@@ -438,9 +438,9 @@ mod tests {
             // that we can easily tell if it has changed.
             let link_report_update_time = manager.link_report_updated_at();
 
-            // Subscribe our test program to the MQTT broker _before_ Rotonda
+            // Subscribe our test program to the MQTT broker _before_ Netom
             // publishes any messages to it.
-            link_tx.subscribe("rotonda/#").unwrap();
+            link_tx.subscribe("netom/#").unwrap();
             assert!(matches!(
                 link_rx.recv(),
                 Ok(Some(Notification::DeviceAck(_)))
@@ -452,7 +452,7 @@ mod tests {
             //   /_/ \_\_|\_|_|\_|\___/ \___/|_|\_|\___|___| |_|_\\___/ \___/  |_| |___| |_|
             //                                                                              
 
-            // Emulate a BMP capable router connected to Rotonda
+            // Emulate a BMP capable router connected to Netom
             eprintln!("Subscribed to MQTT broker, sending BMP messages...");
             let mut bmp_conn = wait_for_bmp_connect().await;
             let sys_name = bmp_initiate(&mut bmp_conn).await;
@@ -576,7 +576,7 @@ mod tests {
             let mut config_bytes = base_config_toml.as_bytes().to_vec();
             config_bytes.extend_from_slice(mqtt_target_toml.as_bytes());
             eprintln!(
-                "Sending Rotonda a SIGHUP signal to reconfigure itself using the following config:\n{}",
+                "Sending Netom a SIGHUP signal to reconfigure itself using the following config:\n{}",
                 String::from_utf8_lossy(&config_bytes)
             );
             let config_file = ConfigFile::new(
@@ -678,7 +678,7 @@ mod tests {
             //                                                           
 
             // Three MQTT messages are published, one for every time the
-            // "my-module" filter was executed due to this line in the Rotonda
+            // "my-module" filter was executed due to this line in the Netom
             // config file defined above:
             //
             //     filter_names = ["my-module", "my-module", "my-module"]
@@ -1386,7 +1386,7 @@ mod tests {
 
             eprintln!("Checking MQTT message...");
             if let Some(Notification::Forward(forward)) = msg {
-                assert_eq!(forward.publish.topic, "rotonda/testing");
+                assert_eq!(forward.publish.topic, "netom/testing");
                 let expected_json = serde_json::json!({
                     "message": "🤭 I encountered 1818"
                 });

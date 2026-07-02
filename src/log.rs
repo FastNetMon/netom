@@ -180,7 +180,7 @@ impl LogConfig {
 
     /// Initialize logging.
     ///
-    /// All diagnostic output of Rotonda is done via logging, never to stderr
+    /// All diagnostic output of Netom is done via logging, never to stderr
     /// directly. Thus, it is important to initalize logging before doing
     /// anything else that may result in such output. This function does
     /// exactly that. It sets a maximum log level of `warn`, leading only
@@ -235,7 +235,7 @@ impl LogConfig {
             ..Default::default()
         };
         if formatter.hostname.is_none() {
-            formatter.hostname = Some("rotonda".into());
+            formatter.hostname = Some("netom".into());
         }
         let formatter = formatter;
         let logger = syslog::unix(formatter.clone())
@@ -289,16 +289,16 @@ impl LogConfig {
         // you clearly actually want to see the logging that you are enabling,
         // not a bunch of other logging as well. So I think this needs some
         // more thought.
-        let mqtt_log_level = match std::env::var("ROTONDA_MQTT_LOG") {
+        let mqtt_log_level = match std::env::var("NETOM_MQTT_LOG") {
             Ok(_) => self.log_level.0.min(LevelFilter::Trace),
             Err(_) => self.log_level.0.min(LevelFilter::Warn),
         };
-        let rotonda_store_log_level = match std::env::var("ROTONDA_STORE_LOG")
+        let rotonda_store_log_level = match std::env::var("NETOM_STORE_LOG")
         {
             Ok(_) => self.log_level.0.min(LevelFilter::Trace),
             Err(_) => self.log_level.0.min(LevelFilter::Warn),
         };
-        let roto_log_level = match std::env::var("ROTONDA_ROTO_LOG") {
+        let roto_log_level = match std::env::var("NETOM_ROTO_LOG") {
             Ok(_) => self.log_level.0.min(LevelFilter::Trace),
             Err(_) => self.log_level.0.min(LevelFilter::Warn),
         };
@@ -307,7 +307,7 @@ impl LogConfig {
 
         let mut res = fern::Dispatch::new();
 
-        // Don't log module paths (e.g. rotonda::xxx::yyy) for our own code
+        // Don't log module paths (e.g. netom::xxx::yyy) for our own code
         // modules as we the StatusLoggers take care of making it clear which
         // unit or target instance is logging which is more useful for readers
         // of the logs. Do log module paths for messages logged (unexpectedly
@@ -322,7 +322,7 @@ impl LogConfig {
             res = res.format(move |out, message, record| {
                 let module_path = record.module_path().unwrap_or("");
                 let show_module =
-                    debug_enabled || !module_path.starts_with("rotonda");
+                    debug_enabled || !module_path.starts_with("netom");
                 out.finish(format_args!(
                     "[{}] {:5} {}{}{}",
                     chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
@@ -336,7 +336,7 @@ impl LogConfig {
             res = res.format(move |out, message, record| {
                 let module_path = record.module_path().unwrap_or("");
                 let show_module =
-                    debug_enabled || !module_path.starts_with("rotonda");
+                    debug_enabled || !module_path.starts_with("netom");
                 out.finish(format_args!(
                     "{}{}{}",
                     if show_module { module_path } else { "" },

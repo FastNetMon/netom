@@ -1260,7 +1260,7 @@ where
 
         Ok((payloads, update_report_msg))
 
-        // we need to turn the encapsulated BGP UPDATE into rotonda Payloads
+        // we need to turn the encapsulated BGP UPDATE into netom Payloads
         //
         // - similar to bgp explode_announcements/withdrawals
         // - find and attach correct ingress_id
@@ -1538,11 +1538,11 @@ struct UnknownPeerThrottle {
 }
 
 /// How often to emit a rolled-up summary for repeat sightings of BGP
-/// capabilities rotonda received but does not forward to bmp-out.
+/// capabilities netom received but does not forward to bmp-out.
 const UNDECODED_CAP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
 /// Capability codes that bmp-out can neither synthesize nor pass through,
-/// because rotonda re-encodes route-monitoring UPDATEs in a way that is
+/// because netom re-encodes route-monitoring UPDATEs in a way that is
 /// incompatible with them (see `bmp_tcp_out::bmp_builder`):
 ///   5  = ExtendedNextHop  — next hops are rebuilt, not replayed
 ///   69 = AddPath          — NLRI is re-encoded without path-ids
@@ -1752,7 +1752,7 @@ impl PeerAware for PeerStates {
             match self.2.note(code, now, UNDECODED_CAP_SUMMARY_INTERVAL) {
                 UndecodedCapLog::First => info!(
                     "bmp-in: peer {} ({}) advertised BGP capability {} \
-                     (code {}) that rotonda re-encodes away; not reflected \
+                     (code {}) that netom re-encodes away; not reflected \
                      in the bmp-out feed (route fidelity may differ)",
                     pph.address(),
                     pph.asn(),

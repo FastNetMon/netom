@@ -142,7 +142,7 @@ impl Config {
 
     /// The default MQTT topic prefix.
     pub fn default_topic_template() -> String {
-        "rotonda/{id}".to_string()
+        "netom/{id}".to_string()
     }
 
     /// The default re-connect timeout in seconds.

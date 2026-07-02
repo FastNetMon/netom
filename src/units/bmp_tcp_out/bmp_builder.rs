@@ -185,7 +185,7 @@ impl PeerInfo {
     /// Stamp the fan-in `peer_distinguisher` tag (RFC 7854 §4.2 opaque
     /// 8-byte field) when the inbound peer has no real RD/VRF context.
     ///
-    /// When rotonda multiplexes multiple upstream BMP sessions into one
+    /// When netom multiplexes multiple upstream BMP sessions into one
     /// downstream session, two upstream routers can each have a session
     /// with the same neighbor (same peer_ip + peer_asn). On the wire that
     /// produces identical per-peer-header tuples and most BMP receivers
@@ -210,7 +210,7 @@ impl PeerInfo {
 /// router (parent) IngressId.
 ///
 /// Requirements:
-///   * Stable for the rotonda process lifetime (`IngressId` is allocated
+///   * Stable for the netom process lifetime (`IngressId` is allocated
 ///     once per upstream session and reused on reconnect via the
 ///     register's find_existing_bmp_router path).
 ///   * Unique across concurrent upstream routers within one process
@@ -227,6 +227,9 @@ pub fn fan_in_distinguisher_tag(parent_ingress_id: IngressId) -> [u8; 8] {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     // Domain-separation prefix: keep this fan-in hash output distinct
     // from any other use of DefaultHasher on the same numeric input.
+    // Kept as the historical "rotonda" string after the project rename:
+    // changing it would re-tag every synthesized fan-in peer across an
+    // upgrade, making downstream consumers see all peers flap.
     hasher.write(b"rotonda:bmp-out:fan-in:v1");
     hasher.write_u32(parent_ingress_id);
     let v = hasher.finish();

@@ -209,7 +209,7 @@ where
                     self.client.store(client.map(Arc::new));
                 }
 
-                // If nothing happened above, check for new internal Rotonda
+                // If nothing happened above, check for new internal Netom
                 // target commands to handle.
                 cmd = cmd_rx.recv() => {
                     if let Some(cmd) = &cmd {

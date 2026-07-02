@@ -1,6 +1,6 @@
 //! Configuration.
 //!
-//! Rotonda is configured through a single TOML configuration file. We use
+//! Netom is configured through a single TOML configuration file. We use
 //! [serde] to deserialize this file into the [`Config`] struct provided by
 //! this module. This struct also provides the facilities to load the config
 //! file referred to in command line options.
@@ -24,7 +24,7 @@ const ARG_CONFIG: &str = "config";
 
 //------------ Config --------------------------------------------------------
 
-/// The complete Rotonda configuration.
+/// The complete Netom configuration.
 ///
 /// All configuration is available via public fields.
 ///

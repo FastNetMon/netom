@@ -12,8 +12,8 @@ type = "bmp-tcp-out"
 listen = "0.0.0.0:11020"
 sources = ["rib"]
 rib_unit = "rib"
-sys_name = "rotonda-bmp-out"
-sys_descr = "Rotonda BMP restreamer"
+sys_name = "netom-bmp-out"
+sys_descr = "Netom BMP restreamer"
 max_client_buffer = 100000
 forward_router_info = true
 acl = ["0.0.0.0/0", "::/0"]
@@ -31,8 +31,8 @@ tls_key = "/path/to/key.pem"
 | `listen` | yes | — | Address and port to listen on for BMP client connections. |
 | `sources` | yes | — | Upstream gate(s) to receive live updates from (typically a RIB unit). |
 | `rib_unit` | no | `"rib"` | Name of the RIB unit used for the initial table dump. |
-| `sys_name` | no | `"rotonda-bmp-out"` | Value sent in the BMP Initiation Message sysName TLV. |
-| `sys_descr` | no | `"Rotonda BMP restreamer"` | Value sent in the BMP Initiation Message sysDescr TLV. |
+| `sys_name` | no | `"netom-bmp-out"` | Value sent in the BMP Initiation Message sysName TLV. |
+| `sys_descr` | no | `"Netom BMP restreamer"` | Value sent in the BMP Initiation Message sysDescr TLV. |
 | `max_client_buffer` | no | `100000` | Maximum number of updates buffered per client during the initial dump phase. If exceeded, the client is disconnected. See [Buffer Overflow](#buffer-overflow) below. |
 | `acl` | yes | — | List of allowed client IP addresses or CIDR prefixes. Use `["0.0.0.0/0", "::/0"]` to allow all. |
 | `forward_router_info` | no | `true` | Include upstream router identity (sysName/sysDescr) as a JSON Admin Label TLV (type 4, RFC 9736) in Peer Up messages. |
@@ -48,7 +48,7 @@ When a BMP consumer connects:
 
 1. **ACL check** — the client IP is checked against the `acl` list. Rejected connections are closed immediately.
 2. **Initiation Message** — a BMP Initiation Message (type 4) is sent with `sys_name` and `sys_descr`.
-3. **Initial table dump** — for each active BGP peer known to Rotonda:
+3. **Initial table dump** — for each active BGP peer known to Netom:
    - A BMP Peer Up Notification is sent (with synthetic BGP OPEN messages).
    - All routes for that peer are read from the RIB and sent as BMP Route Monitoring messages.
    - End-of-RIB markers are sent per address family (IPv4 Unicast, IPv6 Unicast).
@@ -70,11 +70,11 @@ be replayed after the dump completes. If the RIB is large and the update rate is
 high, the buffer can fill up before the dump finishes.
 
 When the buffer exceeds `max_client_buffer`, the client is **disconnected**. The
-`rotonda_bmp_tcp_out_buffer_overflows_total` metric tracks how often this happens.
+`netom_bmp_tcp_out_buffer_overflows_total` metric tracks how often this happens.
 
 **Tuning considerations:**
 
-- If `rotonda_bmp_tcp_out_buffer_overflows_total` is increasing and the system
+- If `netom_bmp_tcp_out_buffer_overflows_total` is increasing and the system
   has sufficient RAM available, increasing `max_client_buffer` (e.g., to 200000
   or 500000) can resolve the issue by giving the initial dump more time to
   complete before the buffer fills up.
@@ -99,7 +99,7 @@ a JSON object carrying the upstream BMP router's `sysName` and `sysDescr` that
 were received via the BMP Initiation Message on the `bmp-tcp-in` side.
 
 This allows downstream BMP consumers to identify which upstream router each
-peer belongs to, even when rotonda multiplexes multiple routers into a single
+peer belongs to, even when netom multiplexes multiple routers into a single
 BMP session.
 
 Fields whose value is a placeholder (`"no-sysname"` / `"no-sysdesc"`) or empty
@@ -179,15 +179,15 @@ All metrics are exported under the configured unit name (e.g., `component="bmp-o
 
 | Metric | Type | Description |
 |--------|------|-------------|
-| `rotonda_bmp_tcp_out_listener_bound_count_total` | counter | Number of times the TCP listen port was bound. |
-| `rotonda_bmp_tcp_out_clients_connected_total` | counter | Total BMP client connections accepted. |
-| `rotonda_bmp_tcp_out_clients_disconnected_total` | counter | Total BMP client connections lost. |
-| `rotonda_bmp_tcp_out_messages_sent_total` | counter | Total BMP messages sent to all clients. |
-| `rotonda_bmp_tcp_out_bytes_sent_total` | counter | Total bytes sent to all clients. |
-| `rotonda_bmp_tcp_out_active_dumps_total` | gauge | Number of clients currently receiving an initial table dump. |
-| `rotonda_bmp_tcp_out_buffer_overflows_total` | counter | Number of clients disconnected due to buffer overflow during dump. |
-| `rotonda_bmp_tcp_out_acl_rejected_total` | counter | Number of connections rejected by ACL. |
-| `rotonda_bmp_tcp_out_tls_handshake_failures_total` | counter | Number of TLS handshake failures. |
+| `netom_bmp_tcp_out_listener_bound_count_total` | counter | Number of times the TCP listen port was bound. |
+| `netom_bmp_tcp_out_clients_connected_total` | counter | Total BMP client connections accepted. |
+| `netom_bmp_tcp_out_clients_disconnected_total` | counter | Total BMP client connections lost. |
+| `netom_bmp_tcp_out_messages_sent_total` | counter | Total BMP messages sent to all clients. |
+| `netom_bmp_tcp_out_bytes_sent_total` | counter | Total bytes sent to all clients. |
+| `netom_bmp_tcp_out_active_dumps_total` | gauge | Number of clients currently receiving an initial table dump. |
+| `netom_bmp_tcp_out_buffer_overflows_total` | counter | Number of clients disconnected due to buffer overflow during dump. |
+| `netom_bmp_tcp_out_acl_rejected_total` | counter | Number of connections rejected by ACL. |
+| `netom_bmp_tcp_out_tls_handshake_failures_total` | counter | Number of TLS handshake failures. |
 
 ## Example Configuration
 
@@ -227,6 +227,6 @@ sys_descr = "Production BMP restreamer"
 max_client_buffer = 200000
 acl = ["10.0.0.0/8", "2001:db8::/32"]
 tls = true
-tls_cert = "/etc/rotonda/cert.pem"
-tls_key = "/etc/rotonda/key.pem"
+tls_cert = "/etc/netom/cert.pem"
+tls_key = "/etc/netom/key.pem"
 ```

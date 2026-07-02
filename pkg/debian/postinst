@@ -1,11 +1,11 @@
 #!/bin/sh -e
 
-ROTONDA_HOME="/var/lib/rotonda/"
-ROTONDA_USER="rotonda"
+NETOM_HOME="/var/lib/netom/"
+NETOM_USER="netom"
 
 create_user() {
-    if id ${ROTONDA_USER} > /dev/null 2>&1; then return; fi
-    adduser --system --home "${ROTONDA_HOME}" --group ${ROTONDA_USER}
+    if id ${NETOM_USER} > /dev/null 2>&1; then return; fi
+    adduser --system --home "${NETOM_HOME}" --group ${NETOM_USER}
 }
 
 case "$1" in

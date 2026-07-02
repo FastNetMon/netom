@@ -118,8 +118,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--config",
-        default="rotonda-mrt.conf",
-        help="Path to Rotonda config with http_listen enabled.",
+        default="netom-mrt.conf",
+        help="Path to Netom config with http_listen enabled.",
     )
     parser.add_argument(
         "--cargo-cmd",

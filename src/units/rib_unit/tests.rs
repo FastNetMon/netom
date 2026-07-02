@@ -671,7 +671,7 @@ async fn count_insert_retries_during_forced_contention() {
     // individual thread shouldn't block Tokio entirely, especially given
     // its work-stealing ability. Typically with Tokio one is supposed to
     // run blocking activities on a dedicated blocking Tokio thread pool.
-    // This isn't done currentlty in Rotonda because store inserts are
+    // This isn't done currentlty in Netom because store inserts are
     // intended and expected to be extremely fast, even with contention.
     // The point noted about thread sleep is only relevant to test builds
     // as release builds don't have the thread sleep code in the MergeUpdate

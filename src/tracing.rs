@@ -1,8 +1,8 @@
-/// Support for tracing messages through the Rotonda pipeline.
+/// Support for tracing messages through the Netom pipeline.
 ///
 /// Tracing is implemented as a limited pool of trace ID numbers for each of
 /// which a collection of arbitrary strings may be stored, each timestamped
-/// and associated with a component in the Rotonda pipeline. Collectively
+/// and associated with a component in the Netom pipeline. Collectively
 /// these attributes define a [`TraceMsg`] and a collection of them is called
 /// a [`Trace`] which traces the progress of pipeline messages relating to a
 /// particular trace ID through the pipeline. The complete set of traces is

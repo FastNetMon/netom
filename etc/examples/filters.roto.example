@@ -121,7 +121,7 @@ filter rib_in_pre(
         output.log_prefix(route.prefix());
     }
 
-    # Only has effect when an RTR unit is configured in rotonda.conf
+    # Only has effect when an RTR unit is configured in netom.conf
     rpki.check_rov(route);
 
     accept
@@ -130,9 +130,9 @@ filter rib_in_pre(
 # The vrp_update filter processes updates pertaining to VRPs coming in via RTR.
 #
 # This is mainly useful for monitoring and generally, one would like to always
-# return 'accept' from this filter: Returning 'reject' will cause Rotonda to not
+# return 'accept' from this filter: Returning 'reject' will cause Netom to not
 # apply the update which is probably not what you want. As such, if this filter
-# definition is omitted, Rotonda defaults to 'accept'.
+# definition is omitted, Netom defaults to 'accept'.
 #
 # Note that this filter is triggered for any incoming VRP update, regardless of
 # whether the prefixes in the VRPs are stored in the RIB. To act on actual

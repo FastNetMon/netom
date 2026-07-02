@@ -1,6 +1,6 @@
 # Testing
 
-The tests of Rotonda live in a few places:
+The tests of Netom live in a few places:
 
  - unit tests in the source code
  - doctests in the source code
@@ -15,7 +15,7 @@ cargo test --all-features --release
 
 ## End-to-end testing (REEDS)
 
-The end-to-end tests for Rotonda are maintained in a separate repository that
+The end-to-end tests for Netom are maintained in a separate repository that
 is private. Keeping it private enables us to store real-world network data,
 which is used as input in the test suites.
 

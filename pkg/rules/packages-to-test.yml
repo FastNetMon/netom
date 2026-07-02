@@ -1,6 +1,6 @@
 ---
 pkg:
-  - 'rotonda'
+  - 'netom'
 image:
   - "ubuntu:bionic"   # ubuntu/18.04
   - "ubuntu:focal"    # ubuntu/20.04
@@ -18,20 +18,20 @@ test-image:
   - ""
 include:
   - image: 'almalinux:8'
-    systemd_service_unit_file: pkg/common/rotonda.rotonda.service
+    systemd_service_unit_file: pkg/common/netom.netom.service
 
   - image: 'almalinux:9'
-    systemd_service_unit_file: pkg/common/rotonda.rotonda.service
+    systemd_service_unit_file: pkg/common/netom.netom.service
 
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'debian:buster'
     target: 'aarch64-unknown-linux-musl'
 
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'debian:bookworm'
     target: 'aarch64-unknown-linux-musl'
 
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'almalinux:9'
     target: 'x86_64'
     test-image: 'centos:9-Stream'

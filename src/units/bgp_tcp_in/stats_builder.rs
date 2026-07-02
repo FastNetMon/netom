@@ -19,7 +19,7 @@
 //! 0–6 and 11–13, 8 bytes (gauge) for 7 and 8, and 11 bytes
 //! (AFI:2 + SAFI:1 + gauge:8) for 9 and 10.
 //!
-//! Rotonda does not compute most counters (loop checks, RFC 7606
+//! Netom does not compute most counters (loop checks, RFC 7606
 //! treat-as-withdraw, Loc-RIB totals); per the RFC the Stat Data
 //! field is just a value, so reporting zero is well-formed and lets
 //! receivers consume a stable TLV set across vendors.
@@ -72,7 +72,7 @@ fn put_per_afi_safi_tlv(
 
 /// Serialize a [`BgpPeerStatsSnapshot`] into a BMP Statistics Report
 /// body — the bytes that go after the per-peer header. The full TLV
-/// set from RFC 7854 §4.8 is always emitted; counters Rotonda does
+/// set from RFC 7854 §4.8 is always emitted; counters Netom does
 /// not track are reported as zero.
 pub fn build_stats_body(snap: &BgpPeerStatsSnapshot) -> Bytes {
     // Per-AFI/SAFI TLVs are variable in count; everything else is a

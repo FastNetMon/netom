@@ -245,11 +245,11 @@ impl BmpTcpOut {
     }
 
     fn default_sys_name() -> String {
-        "rotonda-bmp-out".to_string()
+        "netom-bmp-out".to_string()
     }
 
     fn default_sys_descr() -> String {
-        "Rotonda BMP restreamer".to_string()
+        "Netom BMP restreamer".to_string()
     }
 
     /// 5 million Updates. Multi-minute dumps on busy systems (thousands

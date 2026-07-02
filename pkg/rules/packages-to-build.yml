@@ -2,7 +2,7 @@
 # workflow inputs.
 ---
 pkg:
-  - 'rotonda'
+  - 'netom'
 image:
   - "ubuntu:bionic"   # ubuntu/18.04
   - "ubuntu:focal"    # ubuntu/20.04
@@ -36,33 +36,33 @@ include:
   # therefore in this case need to specify that the O/S we are building for has a different name than the Docker
   # image we are building it in.
   - image: 'almalinux:8'
-    systemd_service_unit_file: pkg/common/rotonda.rotonda.service
+    systemd_service_unit_file: pkg/common/netom.netom.service
 
   - image: 'almalinux:9'
-    systemd_service_unit_file: pkg/common/rotonda.rotonda.service
+    systemd_service_unit_file: pkg/common/netom.netom.service
 
   - image: 'almalinux:10'
-    systemd_service_unit_file: pkg/common/rotonda.rotonda.service
+    systemd_service_unit_file: pkg/common/netom.netom.service
 
  ## package for the Raspberry Pi 4b as an ARMv7 cross compiled variant of the Debian Bullseye upon which
  ## Raspbian 11 is based.
- #- pkg: 'rotonda'
+ #- pkg: 'netom'
  #  image: 'debian:bullseye'
  #  target: 'armv7-unknown-linux-musleabihf'
 
  ## package for the Raspberry Pi 1b as an ARMv6 cross compiled variant of the Debian Buster upon which
  ## Raspbian 10 is based.
- #- pkg: 'rotonda'
+ #- pkg: 'netom'
  #  image: 'debian:buster'
  #  target: 'arm-unknown-linux-musleabihf'
 
   # package for the ROCK64 as an AARCH64 cross compiled variant of Debian Buster upon which Armbian 21 is based.
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'debian:buster'
     target: 'aarch64-unknown-linux-musl'
 
   # package for virtual machines on Apple Silicon
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'debian:bookworm'
     target: 'aarch64-unknown-linux-musl'
 
@@ -70,12 +70,12 @@ include:
   # of matrix keys and values as already exist elsewhere in the matrix, but they will cause an additional tests
   # to be run in the package testing phase, which will install the package in an LXC container running the 
   # specified 'test-image' instead of the 'image' it was built in.
-#  - pkg: 'rotonda'
+#  - pkg: 'netom'
 #    image: 'rockylinux:9'
 #    target: 'x86_64'
 #    test-image: 'almalinux:9'
 
-  - pkg: 'rotonda'
+  - pkg: 'netom'
     image: 'almalinux:9'
     target: 'x86_64'
     test-image: 'centos:9-Stream'
@@ -90,9 +90,9 @@ test-mode:
 # Disable upgrade testing on Alma Linux 10 and Debian Bookworm as we haven't published any packages for
 # those O/S versions yet.
 #test-exclude:
-#  - pkg: 'rotonda'
+#  - pkg: 'netom'
 #    image: 'almalinux:10'
 #    mode: 'upgrade-from-published'
-#  - pkg: 'rotonda'
+#  - pkg: 'netom'
 #    image: 'debian:trixie'
 #    mode: 'upgrade-from-published'

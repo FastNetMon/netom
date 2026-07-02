@@ -3,15 +3,15 @@ post_install_script = '''
 #RPM_SYSTEMD_MACROS#
 
 if [ $EUID -ne 0 ]; then
-    echo >&2 "ERROR: Rotonda postinst script must be run as root"
+    echo >&2 "ERROR: Netom postinst script must be run as root"
     exit 1
 fi
 
 if [ $1 -eq 1 ] ; then
     # Initial installation
-    R_USER=rotonda
+    R_USER=netom
     R_GROUP=${R_USER}
-    R_HOME_DIR=/var/lib/rotonda
+    R_HOME_DIR=/var/lib/netom
     R_HOME_DIR_PERMS=700
 
     if ! id ${R_USER} > /dev/null 2>&1; then
@@ -28,7 +28,7 @@ if [ $1 -eq 1 ] ; then
     chmod ${R_HOME_DIR_PERMS} ${R_HOME_DIR}
 
     # Run commands equivalent to what the RPM systemd macros would do
-    systemd_post rotonda.service
+    systemd_post netom.service
     systemd_triggers
 fi
 '''
@@ -40,7 +40,7 @@ pre_uninstall_script = '''
 if [ $1 -eq 0 ] ; then
     # Package removal, not upgrade
     # Run commands equivalent to what the RPM systemd macros would do
-    systemd_preun rotonda.service
+    systemd_preun netom.service
     systemd_triggers
 fi
 '''
@@ -51,7 +51,7 @@ post_uninstall_script = '''
 
 if [ $1 -ge 1 ] ; then
     # Run commands equivalent to what the RPM systemd macros would do
-    systemd_postun_with_restart rotonda.service
+    systemd_postun_with_restart netom.service
     systemd_triggers
 fi
 '''

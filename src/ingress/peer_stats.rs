@@ -6,7 +6,7 @@
 //! per-connection task that updates counters and the periodic emitter
 //! that snapshots them and publishes `Update::PeerStats`.
 //!
-//! Counters Rotonda doesn't compute (loop checks, RFC 7606
+//! Counters Netom doesn't compute (loop checks, RFC 7606
 //! treat-as-withdraw, Loc-RIB totals) are kept as fields so the
 //! emitted Stats Report has a stable RFC 7854 §4.8 TLV set; their
 //! values are simply zero. See `stats_builder` for serialization.

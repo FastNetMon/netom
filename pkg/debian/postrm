@@ -1,14 +1,14 @@
 #!/bin/sh -e
 
-ROTONDA_ETC="/etc/rotonda"
+NETOM_ETC="/etc/netom"
 
 case "$1" in
 purge)
     # Per https://www.debian.org/doc/debian-policy/ch-files.html#behavior
     # "configuration files must be preserved when the package is removed, and
     #  only deleted when the package is purged."
-    if [ -d ${ROTONDA_ETC} ]; then
-        rm -R ${ROTONDA_ETC}
+    if [ -d ${NETOM_ETC} ]; then
+        rm -R ${NETOM_ETC}
     fi
     ;;
 esac

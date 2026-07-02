@@ -2,7 +2,7 @@
 
 //! Data processing units.
 //!
-//! Rotonda provides the means for flexible data processing through
+//! Netom provides the means for flexible data processing through
 //! interconnected entities called _units._ Each unit produces a constantly
 //! updated data set. Other units can subscribe to updates from these sets.
 //! Alternatively, they can produce their own data set from external input.

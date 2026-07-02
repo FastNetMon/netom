@@ -142,7 +142,7 @@ FROM ${BASE_IMG} AS final
 COPY --from=source /tmp/out/bin/* /usr/local/bin/
 
 # Build variables for uid and guid of user to run container
-ARG RUN_USER=rotonda
+ARG RUN_USER=netom
 ARG RUN_USER_UID=1012
 ARG RUN_USER_GID=1012
 
@@ -153,16 +153,16 @@ RUN addgroup -g ${RUN_USER_GID} ${RUN_USER} && \
     adduser -D -u ${RUN_USER_UID} -G ${RUN_USER} ${RUN_USER}
 
 
-# Create the config directory with a default rotonda.conf
-WORKDIR /etc/rotonda
-COPY etc/rotonda.conf .
+# Create the config directory with a default netom.conf
+WORKDIR /etc/netom
+COPY etc/netom.conf .
 RUN chown -R ${RUN_USER}: .
 
 # Switch to our applications user
 USER $RUN_USER_UID
 
 # Hint to operators the TCP port that the application in this image listens on
-# (by default). The default Rotonda configuration configures Rotonda to listen
+# (by default). The default Netom configuration configures Netom to listen
 # for HTTP requests on port 8080, incoming BGP connections on port 11179 and
 # incoming BMP connections on port 11019. For consistency we do the same.
 EXPOSE 8080/tcp
@@ -172,4 +172,4 @@ EXPOSE 11179/tcp
 # Use Tini to ensure that our application responds to CTRL-C when run in the
 # foreground without the Docker argument "--init" (which is actually another
 # way of activating Tini, but cannot be enabled from inside the Docker image).
-ENTRYPOINT ["/sbin/tini", "--", "rotonda", "--config", "/etc/rotonda/rotonda.conf"]
+ENTRYPOINT ["/sbin/tini", "--", "netom", "--config", "/etc/netom/netom.conf"]

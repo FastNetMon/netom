@@ -74,7 +74,7 @@ fn generate_self_signed(
 
     params
         .distinguished_name
-        .push(rcgen::DnType::CommonName, "rotonda-bmp-out");
+        .push(rcgen::DnType::CommonName, "netom-bmp-out");
 
     let ip = listen_addr.ip();
     if ip.is_unspecified() {

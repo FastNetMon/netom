@@ -1095,7 +1095,7 @@ impl Manager {
             graph_svg_data.swap(Arc::new((Instant::now(), reports)));
             // XXX
             // so we need to call (re)start here, because at this point we know for sure all other
-            // Rotonda components had a chance to add their paths to the axum router
+            // Netom components had a chance to add their paths to the axum router
             // BUT
             // on SIGHUP, we also need to apply (changes to) the main config file, e.g. interfaces
             // to listen on, which does not happen here currently.
@@ -1224,7 +1224,7 @@ impl Manager {
         }
     }
 
-    /// Restart the HTTP API based on the passed Rotonda `Config`
+    /// Restart the HTTP API based on the passed Netom `Config`
     pub fn restart_http_ng_with_config(&mut self, config: &Config) {
         if let Ok(mut lock) = self.http_ng_api.lock() {
             lock.set_interfaces(

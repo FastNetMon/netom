@@ -98,7 +98,7 @@ fn generate_correct_json_for_publishing_from_output_stream_roto_type_value() {
         runner.output_stream_message_to_msg(output_stream).unwrap();
 
     // And the topic should be based on the rouuter id recorded with the route, if any
-    assert_eq!(topic, "rotonda/my-topic");
+    assert_eq!(topic, "netom/my-topic");
 
     // And the produced message to be published should match the expected JSON format
     let expected_json = json!({
@@ -206,7 +206,7 @@ async fn publish_msg() {
         |m| {
             m.with_labels::<usize>(
                 "mqtt_target_publish_count",
-                &[("topic", "rotonda/my-topic")],
+                &[("topic", "netom/my-topic")],
             ) == 1
         },
         "mqtt_target_publish_count != 1",
