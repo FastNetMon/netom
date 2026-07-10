@@ -1104,6 +1104,259 @@ mod tests {
     use inetnum::asn::Asn;
     use std::net::{IpAddr, Ipv6Addr};
 
+    /// What one emitted BMP message is, for sequence assertions.
+    #[derive(Debug, PartialEq)]
+    enum MsgKind {
+        Initiation,
+        PeerUp,
+        /// Route Monitoring carrying routes: (afi, safi) of its MP_REACH,
+        /// or (1, 1) for a plain IPv4 NLRI-field UPDATE.
+        Route(u16, u8),
+        /// End-of-RIB for (afi, safi).
+        Eor(u16, u8),
+    }
+
+    fn classify(msg: &[u8]) -> MsgKind {
+        match msg[5] {
+            4 => MsgKind::Initiation,
+            3 => MsgKind::PeerUp,
+            0 => {
+                // Route Monitoring: BGP UPDATE after common(6) + pph(42).
+                let bgp = &msg[48..];
+                let withdrawn_len =
+                    u16::from_be_bytes([bgp[19], bgp[20]]) as usize;
+                let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+                let has_nlri =
+                    bgp.len() > 23 + withdrawn_len + pa_len;
+                if withdrawn_len == 0 && pa_len == 0 {
+                    return if has_nlri {
+                        MsgKind::Route(1, 1)
+                    } else {
+                        MsgKind::Eor(1, 1)
+                    };
+                }
+                // Walk attributes for MP_REACH (14) / MP_UNREACH (15).
+                let pas = &bgp[23 + withdrawn_len..23 + withdrawn_len + pa_len];
+                let mut pos = 0;
+                while pos + 2 < pas.len() {
+                    let flags = pas[pos];
+                    let type_code = pas[pos + 1];
+                    let (attr_len, header_len) = if flags & 0x10 != 0 {
+                        (
+                            u16::from_be_bytes([pas[pos + 2], pas[pos + 3]])
+                                as usize,
+                            4,
+                        )
+                    } else {
+                        (pas[pos + 2] as usize, 3)
+                    };
+                    let value = &pas[pos + header_len
+                        ..(pos + header_len + attr_len).min(pas.len())];
+                    if type_code == 14 {
+                        return MsgKind::Route(
+                            u16::from_be_bytes([value[0], value[1]]),
+                            value[2],
+                        );
+                    }
+                    if type_code == 15 {
+                        let afi = u16::from_be_bytes([value[0], value[1]]);
+                        let safi = value[2];
+                        return if attr_len == 3 {
+                            MsgKind::Eor(afi, safi)
+                        } else {
+                            MsgKind::Route(afi, safi)
+                        };
+                    }
+                    pos += header_len + attr_len;
+                }
+                // No MP attribute: plain IPv4 unicast NLRI-field UPDATE.
+                MsgKind::Route(1, 1)
+            }
+            other => panic!("unexpected BMP message type {other}"),
+        }
+    }
+
+    /// Full dump sequence with a unicast+flowspec peer and a flowspec-only
+    /// peer: Initiation -> one Peer Up per peer -> unicast routes ->
+    /// flowspec routes (never mixed per UPDATE) -> 4 EoRs per peer, and
+    /// the flowspec NLRI bytes round-trip verbatim.
+    #[tokio::test]
+    async fn dump_sequence_covers_flowspec() {
+        use crate::payload::{RotondaPaMap, RotondaRoute};
+        use crate::roto_runtime::Ctx;
+        use rotonda_store::prefix_record::RouteStatus;
+        use std::str::FromStr;
+        use std::sync::Mutex;
+
+        // {dst 10.0.1.0/24, proto =17} raw components (no length header)
+        const FS_NLRI: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+
+        fn mk_flowspec_route(raw_components: &[u8]) -> RotondaRoute {
+            let mut wire = Vec::with_capacity(raw_components.len() + 1);
+            wire.push(u8::try_from(raw_components.len()).unwrap());
+            wire.extend_from_slice(raw_components);
+            let bytes = bytes::Bytes::from(wire);
+            let mut parser = octseq::Parser::from_ref(&bytes);
+            let nlri = routecore::bgp::nlri::flowspec::FlowSpecNlri::parse(
+                &mut parser,
+                routecore::bgp::types::Afi::Ipv4,
+            )
+            .unwrap();
+            RotondaRoute::Ipv4FlowSpec(
+                nlri.into(),
+                RotondaPaMap::empty_path_attributes(),
+            )
+        }
+
+        let register: Arc<register::Register> = Default::default();
+        let ctx = Arc::new(Mutex::new(Ctx::empty()));
+        let rib =
+            Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
+
+        // Peer 1: unicast + flowspec. Peer 2: flowspec-only.
+        let peer1 = register.register();
+        let peer2 = register.register();
+        for (peer, addr) in [(peer1, "10.9.9.1"), (peer2, "10.9.9.2")] {
+            register.update_info(
+                peer,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpViaBmp)
+                    .with_state(IngressState::Connected)
+                    .with_remote_addr(addr.parse::<IpAddr>().unwrap())
+                    .with_remote_asn(Asn::from_u32(65000)),
+            );
+        }
+
+        let unicast = RotondaRoute::Ipv4Unicast(
+            inetnum::addr::Prefix::from_str("192.0.2.0/24")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(&unicast, RouteStatus::Active, 1, peer1, false, false)
+            .unwrap();
+        let fs_route = mk_flowspec_route(FS_NLRI);
+        rib.insert(&fs_route, RouteStatus::Active, 2, peer1, false, false)
+            .unwrap();
+        rib.insert(&fs_route, RouteStatus::Active, 3, peer2, false, false)
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let client = Arc::new(ClientState::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+            10_000,
+            10 * 1024 * 1024,
+        ));
+        let gate = crate::comms::Gate::default();
+        let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
+        let status_reporter = Arc::new(BmpTcpOutStatusReporter::new(
+            "test",
+            metrics.clone(),
+        ));
+
+        let ok = perform_initial_dump(
+            &client,
+            &rib,
+            &register,
+            "test-sys",
+            "test-descr",
+            false,
+            FanInPeerDistinguisher::Off,
+            &metrics,
+            &status_reporter,
+        )
+        .await;
+        assert!(ok, "dump must complete");
+        drop(client);
+
+        let mut kinds = Vec::new();
+        let mut flowspec_nlri_seen: Vec<Vec<u8>> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            let kind = classify(&msg);
+            if kind == MsgKind::Route(1, 133) {
+                // Extract the MP_REACH NLRI: value[5..] after afi(2),
+                // safi(1), nh_len(1)=0, reserved(1).
+                let bgp = &msg[48..];
+                let pa_len =
+                    u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+                let pas = &bgp[23..23 + pa_len];
+                let mut pos = 0;
+                while pos + 2 < pas.len() {
+                    let flags = pas[pos];
+                    let type_code = pas[pos + 1];
+                    let (attr_len, header_len) = if flags & 0x10 != 0 {
+                        (
+                            u16::from_be_bytes([
+                                pas[pos + 2],
+                                pas[pos + 3],
+                            ]) as usize,
+                            4,
+                        )
+                    } else {
+                        (pas[pos + 2] as usize, 3)
+                    };
+                    if type_code == 14 {
+                        let value = &pas
+                            [pos + header_len..pos + header_len + attr_len];
+                        let mut nlri = &value[5..];
+                        while !nlri.is_empty() {
+                            let len = nlri[0] as usize;
+                            flowspec_nlri_seen
+                                .push(nlri[1..1 + len].to_vec());
+                            nlri = &nlri[1 + len..];
+                        }
+                    }
+                    pos += header_len + attr_len;
+                }
+            }
+            kinds.push(kind);
+        }
+
+        // Initiation first.
+        assert_eq!(kinds[0], MsgKind::Initiation);
+        // Exactly one Peer Up per peer — the flowspec-only peer included.
+        let peer_ups =
+            kinds.iter().filter(|k| **k == MsgKind::PeerUp).count();
+        assert_eq!(peer_ups, 2);
+        // Both flowspec rules re-emitted, NLRI bytes verbatim.
+        assert_eq!(flowspec_nlri_seen.len(), 2);
+        assert!(flowspec_nlri_seen.iter().all(|n| n == FS_NLRI));
+        // The unicast route went out, and never in a SAFI-133 UPDATE.
+        assert!(kinds.contains(&MsgKind::Route(1, 1)));
+        // All routes precede all EoRs; unicast routes precede flowspec.
+        let last_route = kinds
+            .iter()
+            .rposition(|k| matches!(k, MsgKind::Route(..)))
+            .unwrap();
+        let first_eor = kinds
+            .iter()
+            .position(|k| matches!(k, MsgKind::Eor(..)))
+            .unwrap();
+        assert!(last_route < first_eor);
+        let last_unicast_route =
+            kinds.iter().rposition(|k| *k == MsgKind::Route(1, 1)).unwrap();
+        let first_fs_route = kinds
+            .iter()
+            .position(|k| *k == MsgKind::Route(1, 133))
+            .unwrap();
+        assert!(last_unicast_route < first_fs_route);
+        // 4 EoRs per peer: v4/v6 unicast + v4/v6 flowspec.
+        let eors: Vec<(u16, u8)> = kinds
+            .iter()
+            .filter_map(|k| match k {
+                MsgKind::Eor(afi, safi) => Some((*afi, *safi)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(eors.len(), 8);
+        assert_eq!(
+            eors.iter().filter(|(_, safi)| *safi == 133).count(),
+            4
+        );
+    }
+
     /// Build the same peer (same peer_ip, peer_asn) attributed to two
     /// different upstream BMP routers, and assert the fan-in distinguisher
     /// stamping yields two distinct non-zero pd values when enabled, but

@@ -29,7 +29,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 #members = []
 
 [workspace.dependencies]
-routecore          = { git = "https://github.com/nuclearcat/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
+routecore          = { git = "https://github.com/nuclearcat/routecore.git", branch = "flowspec-full", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { version = "0.1.1", features = ["arbitrary", "serde"] }
 rotonda-store      = { git = "https://github.com/nuclearcat/rotonda-store", branch = "fnm-gc" }   # fork: Layer A remove_mui
 log                = "0.4"
@@ -201,10 +201,3 @@ assets = [
 # ensure that the useradd tools are present by installing their respective packages
 [package.metadata.generate-rpm.requires]
 shadow-utils = "*"
-
-# Local development override for the FlowSpec work; removed when the
-# flowspec-full branch is pushed and the git dependency repinned.
-[patch."https://github.com/nuclearcat/routecore.git"]
-routecore = { path = "../routecore" }
-[patch."https://github.com/nuclearcat/rotonda-store"]
-rotonda-store = { path = "../rotonda-store" }

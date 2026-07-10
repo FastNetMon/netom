@@ -1062,7 +1062,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2138,7 +2138,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2737,6 +2737,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
+source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#b89ba17792cf6194e995a12bf9757dbbb510375f"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2776,6 +2777,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
+source = "git+https://github.com/nuclearcat/routecore.git?branch=flowspec-full#ed9ae2a349afbc70fff266f602bce54151b2aae8"
 dependencies = [
  "bytes",
  "chrono",
@@ -2919,7 +2921,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3321,10 +3323,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
