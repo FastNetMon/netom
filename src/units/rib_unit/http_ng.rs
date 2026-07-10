@@ -49,6 +49,17 @@ pub fn register_routes(router: &mut Api) {
     );
     router.add_get("/ribs/ipv6unicast/routes", search_ipv6unicast_all);
 
+    router.add_get(
+        "/ribs/ipv4flowspec/routes/{prefix}/{prefix_len}",
+        search_ipv4flowspec,
+    );
+    router.add_get("/ribs/ipv4flowspec/routes", search_ipv4flowspec_all);
+    router.add_get(
+        "/ribs/ipv6flowspec/routes/{prefix}/{prefix_len}",
+        search_ipv6flowspec,
+    );
+    router.add_get("/ribs/ipv6flowspec/routes", search_ipv6flowspec_all);
+
     // The 'hardcoded' afisafis above take precedence over this 'catch-all' one.
     router.add_get("/ribs/{afisafi}/routes", generic_afisafi_all);
 
@@ -318,6 +329,135 @@ impl std::str::FromStr for Include {
             _ => Err(UnknownInclude),
         }
     }
+}
+
+/// One decoded flowspec rule in the API response.
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FlowSpecRow {
+    /// The prefix the rule is keyed on: its destination-prefix component,
+    /// or the family default route for rules without a usable one.
+    key_prefix: String,
+    ingress_id: IngressId,
+    validity: &'static str,
+    /// Human-readable rule (RFC 8955/8956 components).
+    nlri: String,
+    /// The raw NLRI bytes (the rule identity), hex-encoded.
+    nlri_hex: String,
+    /// Human-readable traffic actions from the extended communities.
+    actions: Vec<String>,
+    attributes: crate::payload::RotondaPaMap,
+}
+
+fn flowspec_response(
+    rib: std::sync::Arc<super::rib::Rib>,
+    family_v4: bool,
+    prefix: Option<Prefix>,
+    filter: &QueryFilter,
+) -> Result<axum::response::Response, ApiError> {
+    use super::flowspec::{decode_actions, parse_raw_nlri};
+
+    let rows = rib
+        .query_flowspec(
+            family_v4,
+            prefix,
+            filter.include.contains(&Include::LessSpecifics),
+            filter.include.contains(&Include::MoreSpecifics),
+            filter.ingress_id,
+        )
+        .map_err(ApiError::InternalServerError)?;
+
+    // Parse once per row for Display + RFC 8955 §5.1 ordering.
+    let mut parsed: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            let nlri = parse_raw_nlri(&row.rule.nlri, family_v4);
+            (row, nlri)
+        })
+        .collect();
+    parsed.sort_by(|(_, a), (_, b)| match (a, b) {
+        (Some(a), Some(b)) => routecore::flowspec::rfc8955_cmp(a, b),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
+
+    let out: Vec<FlowSpecRow> = parsed
+        .into_iter()
+        .map(|(row, nlri)| FlowSpecRow {
+            key_prefix: row.key_prefix.to_string(),
+            ingress_id: row.ingress_id,
+            validity: row.rule.validity.as_str(),
+            nlri: nlri
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "<malformed>".to_string()),
+            nlri_hex: row
+                .rule
+                .nlri
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+            actions: decode_actions(&row.rule.pamap),
+            attributes: row.rule.pamap,
+        })
+        .collect();
+
+    let body = serde_json::to_vec(&serde_json::json!({ "data": out }))
+        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    Ok((
+        [("content-type", OutputFormat::Json.content_type())],
+        body,
+    )
+        .into_response())
+}
+
+fn load_rib(
+    state: &ApiState,
+) -> Result<std::sync::Arc<super::rib::Rib>, ApiError> {
+    match *state.store.load() {
+        Some(ref store) => Ok(store.clone()),
+        None => {
+            Err(ApiError::InternalServerError("store unavailable".into()))
+        }
+    }
+}
+
+async fn search_ipv4flowspec(
+    Path((prefix, prefix_len)): Path<(Ipv4Addr, u8)>,
+    Query(filter): Query<QueryFilter>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v4(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let rib = load_rib(&state)?;
+    flowspec_response(rib, true, Some(prefix), &filter)
+}
+
+async fn search_ipv4flowspec_all(
+    Query(filter): Query<QueryFilter>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rib = load_rib(&state)?;
+    flowspec_response(rib, true, None, &filter)
+}
+
+async fn search_ipv6flowspec(
+    Path((prefix, prefix_len)): Path<(Ipv6Addr, u8)>,
+    Query(filter): Query<QueryFilter>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v6(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let rib = load_rib(&state)?;
+    flowspec_response(rib, false, Some(prefix), &filter)
+}
+
+async fn search_ipv6flowspec_all(
+    Query(filter): Query<QueryFilter>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let rib = load_rib(&state)?;
+    flowspec_response(rib, false, None, &filter)
 }
 
 async fn generic_afisafi_all(

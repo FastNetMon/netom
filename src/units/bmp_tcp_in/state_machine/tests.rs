@@ -1729,7 +1729,7 @@ fn flowspec_end_of_rib_clears_pending_eor() {
     let initiation_msg_buf =
         mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
     // EoR-capable peer: flowspec announcements register a pending EoR.
-    let (peer_up_msg_buf, pph) = mk_peer_up_notification_msg(
+    let (peer_up_msg_buf, _pph) = mk_peer_up_notification_msg(
         &mk_per_peer_header("127.0.0.1", 12345),
         true,
     );

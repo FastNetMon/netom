@@ -523,11 +523,16 @@ impl Rib {
             })
             .unwrap_or_default();
 
+        let metrics = super::flowspec::flowspec_metrics();
+        let is_v4 = key.is_v4();
+
         if route_status == RouteStatus::Withdrawn {
+            metrics.note_update(is_v4, true);
             if !ruleset.remove(nlri_raw) {
                 // Unknown rule (or peer) — nothing to withdraw.
                 return Ok(no_op);
             }
+            metrics.add_rules(is_v4, -1);
             let (status, ltime) = if ruleset.is_empty() {
                 (RouteStatus::Withdrawn, ltime)
             } else {
@@ -536,6 +541,7 @@ impl Rib {
             let pubrec = Record::new(mui, ltime, status, ruleset);
             return store.insert(&key, pubrec, None);
         }
+        metrics.note_update(is_v4, false);
 
         // Mirror insert_prefix's reactivation of a mui flagged withdrawn in
         // the store-global bitmap (e.g. a peer that reconnected): without
@@ -554,9 +560,42 @@ impl Rib {
             );
         }
 
-        ruleset.upsert(nlri_raw, pamap, FlowSpecValidity::NotValidated);
+        let replaced =
+            ruleset.upsert(nlri_raw, pamap, FlowSpecValidity::NotValidated);
+        if !replaced {
+            metrics.add_rules(is_v4, 1);
+        }
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         store.insert(&key, pubrec, None)
+    }
+
+    /// Recount the stored-rule gauges by walking the (small) flowspec
+    /// store. Called after operations that drop rules without going through
+    /// `insert_flowspec` (whole-mui removal, compaction) so the gauges
+    /// cannot drift.
+    fn recount_flowspec_rules(&self) {
+        let Some(store) = (*self.flowspec).as_ref() else {
+            return;
+        };
+        let mut v4 = 0u64;
+        let mut v6 = 0u64;
+        for key in store.prefixes_keys_iter() {
+            if let Ok(Some(records)) =
+                store.get_records_for_prefix(&key, None, false)
+            {
+                let rules: u64 = records
+                    .iter()
+                    .filter(|r| r.status != RouteStatus::Withdrawn)
+                    .map(|r| r.meta.rule_count() as u64)
+                    .sum();
+                if key.is_v4() {
+                    v4 += rules;
+                } else {
+                    v6 += rules;
+                }
+            }
+        }
+        super::flowspec::flowspec_metrics().set_rules(v4, v6);
     }
 
     fn insert_prefix(
@@ -826,6 +865,10 @@ impl Rib {
                 }
             }
         }
+
+        // Whole-mui status flips change which flowspec rules are visible
+        // without going through insert_flowspec.
+        self.recount_flowspec_rules();
     }
 
     /// Physically remove every record for these ingress ids from the RIB,
@@ -886,6 +929,7 @@ impl Rib {
                 }
             }
         }
+        self.recount_flowspec_rules();
     }
 
     pub fn compact_withdrawn_attributes_for_ingress(
@@ -1236,6 +1280,7 @@ impl Rib {
         {
             error!("failed to mark MUI as active in flowspec v6 rib: {e}")
         }
+        self.recount_flowspec_rules();
     }
 
     /// Layer C garbage-collection sweep. Reclaims two kinds of idle BMP

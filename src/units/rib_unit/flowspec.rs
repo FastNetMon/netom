@@ -26,7 +26,10 @@ use rotonda_store::prefix_record::Meta;
 use rotonda_store::rib::config::MemoryOnlyConfig;
 use rotonda_store::rib::StarCastRib;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 
+use crate::metrics;
 use crate::payload::RotondaPaMap;
 
 pub type FlowSpecStore = StarCastRib<FlowSpecRuleSet, MemoryOnlyConfig>;
@@ -247,6 +250,166 @@ impl Meta for FlowSpecRuleSet {
     type TBI = ();
 
     fn as_orderable(&self, _tbi: Self::TBI) -> Self::Orderable<'_> {}
+}
+
+/// Re-frame raw flowspec NLRI bytes (the stored identity, without the
+/// length header) with their RFC 8955 §4.1 length header and parse them —
+/// for Display, ordering and validation purposes. `None` on malformed or
+/// oversized bytes.
+pub fn parse_raw_nlri(
+    raw: &[u8],
+    v4: bool,
+) -> Option<routecore::bgp::nlri::flowspec::FlowSpecNlri<bytes::Bytes>> {
+    use routecore::bgp::types::Afi;
+
+    let len = raw.len();
+    let mut wire = Vec::with_capacity(len + 2);
+    if len >= 240 {
+        wire.extend_from_slice(
+            &(0xf000u16 | u16::try_from(len).ok().filter(|l| *l <= 4095)?)
+                .to_be_bytes(),
+        );
+    } else {
+        wire.push(len as u8);
+    }
+    wire.extend_from_slice(raw);
+    let bytes = bytes::Bytes::from(wire);
+    let mut parser = octseq::Parser::from_ref(&bytes);
+    routecore::bgp::nlri::flowspec::FlowSpecNlri::parse(
+        &mut parser,
+        if v4 { Afi::Ipv4 } else { Afi::Ipv6 },
+    )
+    .ok()
+}
+
+/// Human-readable FlowSpec traffic actions (RFC 8955 §7 / RFC 8956 §5)
+/// found in a rule's extended communities.
+pub fn decode_actions(pamap: &RotondaPaMap) -> Vec<String> {
+    use routecore::bgp::path_attributes::{
+        ExtendedCommunitiesList, Ipv6ExtendedCommunitiesList,
+    };
+
+    let mut actions = Vec::new();
+    let attrs = pamap.path_attributes();
+    if let Some(list) = attrs.get::<ExtendedCommunitiesList>() {
+        for ec in list.communities() {
+            if let Some(action) = ec.flowspec() {
+                actions.push(action.to_string());
+            }
+        }
+    }
+    if let Some(list) = attrs.get::<Ipv6ExtendedCommunitiesList>() {
+        for ec in list.communities() {
+            if let Some(action) = ec.flowspec() {
+                actions.push(action.to_string());
+            }
+        }
+    }
+    actions
+}
+
+//------------ Metrics -------------------------------------------------------
+
+/// Process-global FlowSpec accounting, modeled on `UnsupportedNlriMetrics`:
+/// held alive by a `LazyLock`, registered once in the manager.
+#[derive(Debug, Default)]
+pub struct FlowSpecMetrics {
+    pub v4_announced: AtomicU64,
+    pub v4_withdrawn: AtomicU64,
+    pub v6_announced: AtomicU64,
+    pub v6_withdrawn: AtomicU64,
+    /// Stored-rule gauges. Delta-maintained by `insert_flowspec` and
+    /// recounted (cheap at flowspec scale) after whole-mui removal and
+    /// compaction, so GC cannot make them drift.
+    pub v4_rules: AtomicU64,
+    pub v6_rules: AtomicU64,
+}
+
+impl FlowSpecMetrics {
+    pub fn note_update(&self, is_v4: bool, withdrawn: bool) {
+        let counter = match (is_v4, withdrawn) {
+            (true, false) => &self.v4_announced,
+            (true, true) => &self.v4_withdrawn,
+            (false, false) => &self.v6_announced,
+            (false, true) => &self.v6_withdrawn,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn add_rules(&self, is_v4: bool, delta: i64) {
+        let gauge = if is_v4 { &self.v4_rules } else { &self.v6_rules };
+        if delta >= 0 {
+            gauge.fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            gauge.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn set_rules(&self, v4: u64, v6: u64) {
+        self.v4_rules.store(v4, Ordering::Relaxed);
+        self.v6_rules.store(v6, Ordering::Relaxed);
+    }
+}
+
+impl metrics::Source for FlowSpecMetrics {
+    fn append(&self, _unit_name: &str, target: &mut metrics::Target) {
+        const UPDATES_METRIC: metrics::Metric = metrics::Metric::new(
+            "flowspec_updates",
+            "FlowSpec rule announcements and withdrawals ingested into \
+             the flowspec store",
+            metrics::MetricType::Counter,
+            metrics::MetricUnit::Total,
+        );
+        const RULES_METRIC: metrics::Metric = metrics::Metric::new(
+            "flowspec_rules_stored",
+            "FlowSpec rules currently stored, per address family",
+            metrics::MetricType::Gauge,
+            metrics::MetricUnit::Total,
+        );
+
+        target.append(&UPDATES_METRIC, None, |records| {
+            for (labels, value) in [
+                (
+                    [("afi", "ipv4"), ("op", "announce")],
+                    self.v4_announced.load(Ordering::Relaxed),
+                ),
+                (
+                    [("afi", "ipv4"), ("op", "withdraw")],
+                    self.v4_withdrawn.load(Ordering::Relaxed),
+                ),
+                (
+                    [("afi", "ipv6"), ("op", "announce")],
+                    self.v6_announced.load(Ordering::Relaxed),
+                ),
+                (
+                    [("afi", "ipv6"), ("op", "withdraw")],
+                    self.v6_withdrawn.load(Ordering::Relaxed),
+                ),
+            ] {
+                records.label_value(&labels, value);
+            }
+        });
+
+        target.append(&RULES_METRIC, None, |records| {
+            records.label_value(
+                &[("afi", "ipv4")],
+                self.v4_rules.load(Ordering::Relaxed),
+            );
+            records.label_value(
+                &[("afi", "ipv6")],
+                self.v6_rules.load(Ordering::Relaxed),
+            );
+        });
+    }
+}
+
+static FLOWSPEC_METRICS: LazyLock<Arc<FlowSpecMetrics>> =
+    LazyLock::new(|| Arc::new(FlowSpecMetrics::default()));
+
+/// The process-global FlowSpec metrics handle; the `LazyLock` keeps the
+/// strong reference alive so the manager's `Weak` never dangles.
+pub fn flowspec_metrics() -> Arc<FlowSpecMetrics> {
+    FLOWSPEC_METRICS.clone()
 }
 
 #[cfg(test)]
