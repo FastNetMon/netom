@@ -15,8 +15,8 @@ use futures::{future::select, pin_mut, Future};
 use log::{debug, warn};
 use routecore::bmp::message::Message as BmpMessage;
 use serde::Deserialize;
-use socket2::{SockRef, TcpKeepalive};
 use serde_with::{serde_as, DisplayFromStr};
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     sync::{Mutex, RwLock},
     time::sleep,
@@ -157,6 +157,18 @@ pub struct BmpTcpIn {
     /// Off by default. Applies to connections accepted after a (re)configure.
     #[serde(default)]
     pub ignore_post_policy_routes: bool,
+
+    /// Forward each cleanly parsed Route Monitoring message verbatim as
+    /// `Update::RouteMonitoringRaw` alongside (and before) the parsed
+    /// payloads, for consumption by a fastpath-enabled `bmp-tcp-out`
+    /// downstream. On by default. Set to `false` in pipelines with no
+    /// bmp-tcp-out unit to save one gate update per Route Monitoring
+    /// message — the copies are pure overhead there. Turning it off is
+    /// always safe: fastpath coverage downstream is adaptive, peers
+    /// without raw copies simply stay on the rebuild path. Applies to
+    /// connections accepted after a (re)configure.
+    #[serde(default = "BmpTcpIn::default_forward_raw_updates")]
+    pub forward_raw_updates: bool,
 }
 
 impl BmpTcpIn {
@@ -235,6 +247,7 @@ impl BmpTcpIn {
             tracing_mode,
             ingress_register,
             self.ignore_post_policy_routes,
+            self.forward_raw_updates,
         )
         .run::<_, _, StandardTcpStream, BmpTcpInRunner>(Arc::new(
             StandardTcpListenerFactory,
@@ -246,6 +259,10 @@ impl BmpTcpIn {
 
     pub fn default_router_id_template() -> String {
         "{sys_name}".to_string()
+    }
+
+    fn default_forward_raw_updates() -> bool {
+        true
     }
 }
 
@@ -296,6 +313,7 @@ struct BmpTcpInRunner {
     tracing_mode: Arc<ArcSwap<TracingMode>>,
     ingress_register: Arc<ingress::Register>,
     ignore_post_policy_routes: bool,
+    forward_raw_updates: bool,
 }
 
 impl BmpTcpInRunner {
@@ -323,6 +341,7 @@ impl BmpTcpInRunner {
         tracing_mode: Arc<ArcSwap<TracingMode>>,
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
+        forward_raw_updates: bool,
     ) -> Self {
         Self {
             component,
@@ -342,6 +361,7 @@ impl BmpTcpInRunner {
             tracing_mode,
             ingress_register,
             ignore_post_policy_routes,
+            forward_raw_updates,
         }
     }
 
@@ -370,6 +390,7 @@ impl BmpTcpInRunner {
             roto_compiled: Default::default(),
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
 
         (runner, gate_agent)
@@ -510,6 +531,7 @@ impl BmpTcpInRunner {
                             self.bmp_metrics.clone(),
                             self.ingress_register.clone(),
                             self.ignore_post_policy_routes,
+                            self.forward_raw_updates,
                         );
 
                         F::accept_config(
@@ -557,6 +579,8 @@ impl BmpTcpInRunner {
                                     tracing_mode: new_tracing_mode,
                                     ignore_post_policy_routes:
                                         new_ignore_post_policy_routes,
+                                    forward_raw_updates:
+                                        new_forward_raw_updates,
                                 }),
                         } => {
                             // Runtime reconfiguration of this unit has
@@ -573,10 +597,13 @@ impl BmpTcpInRunner {
                             self.router_id_template
                                 .store(new_router_id_template.into());
                             self.tracing_mode.store(new_tracing_mode.into());
-                            // Plain field (not shared/ArcSwap): read at accept
-                            // time, so this takes effect for new connections.
+                            // Plain fields (not shared/ArcSwap): read at
+                            // accept time, so these take effect for new
+                            // connections.
                             self.ignore_post_policy_routes =
                                 new_ignore_post_policy_routes;
+                            self.forward_raw_updates =
+                                new_forward_raw_updates;
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -680,8 +707,7 @@ impl ConfigAcceptor for BmpTcpInRunner {
             let ka = TcpKeepalive::new()
                 .with_time(TCP_KEEPALIVE_IDLE)
                 .with_interval(TCP_KEEPALIVE_INTERVAL);
-            if let Err(e) =
-                SockRef::from(&tcp_stream).set_tcp_keepalive(&ka)
+            if let Err(e) = SockRef::from(&tcp_stream).set_tcp_keepalive(&ka)
             {
                 debug!(
                     "bmp-in: failed to set TCP keepalive for {}: {}",
@@ -808,6 +834,7 @@ mod tests {
             filter_name: Default::default(),
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -875,6 +902,7 @@ mod tests {
             filter_name: Default::default(),
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -946,6 +974,7 @@ mod tests {
             filter_name: Default::default(),
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1106,6 +1135,7 @@ mod tests {
             roto_compiled: None,
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
 
         (runner, gate_agent, status_reporter)

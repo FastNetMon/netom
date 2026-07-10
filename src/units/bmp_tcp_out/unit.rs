@@ -27,6 +27,7 @@ use crate::{
     },
     http_ng,
     ingress::register::Register,
+    ingress::IngressId,
     manager::{Component, WaitPoint},
     payload::Update,
     units::bgp_tcp_in::peer_config::PrefixOrExact,
@@ -154,6 +155,31 @@ pub struct BmpTcpOut {
     #[serde(default)]
     pub fan_in_peer_distinguisher: FanInPeerDistinguisher,
 
+    /// Restream Route Monitoring messages verbatim ("fastpath").
+    ///
+    /// When enabled, this unit consumes the `Update::RouteMonitoringRaw`
+    /// copies emitted by a `bmp-tcp-in` unit with `forward_raw_updates`
+    /// on (the default) and forwards the original, bit-identical BGP
+    /// UPDATE bytes — unknown path attributes, exact NLRI encoding and
+    /// original export timestamp preserved — under a per-peer header
+    /// consistent with the Peer Up it synthesized, instead of rebuilding
+    /// each UPDATE from parsed route payloads.
+    ///
+    /// Coverage is adaptive per peer: parsed payloads are skipped only
+    /// for peers whose raw copies are actually arriving, so peers with
+    /// no raw copies — non-BMP sources (BGP, MRT), ADD-PATH sessions, or
+    /// an upstream with `forward_raw_updates` off — keep using the
+    /// rebuild path, and no flag combination can drop data. The initial
+    /// per-client table dump is always rebuilt from the RIB (raw bytes
+    /// are not stored).
+    ///
+    /// Caveat: routes dropped or rewritten by roto filters in upstream
+    /// units are restreamed in their original form (fastpath is a
+    /// pre-filter mirror). Set to `false` if downstream consumers must
+    /// observe filtered data. Default: true.
+    #[serde(default = "BmpTcpOut::default_fastpath")]
+    pub fastpath: bool,
+
     /// Enable TLS encryption for client connections. Default: false.
     #[serde(default)]
     pub tls: bool,
@@ -223,6 +249,7 @@ impl BmpTcpOut {
             self.live_queue_depth,
             self.forward_router_info,
             self.fan_in_peer_distinguisher,
+            self.fastpath,
             self.acl,
             self.tls,
             self.tls_cert,
@@ -282,6 +309,10 @@ impl BmpTcpOut {
     fn default_forward_router_info() -> bool {
         true
     }
+
+    fn default_fastpath() -> bool {
+        true
+    }
 }
 
 //-------- BmpTcpOutRunner ---------------------------------------------------
@@ -315,6 +346,7 @@ struct BmpTcpOutRunner {
     live_queue_depth: usize,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    fastpath: bool,
     acl: Vec<PrefixOrExact>,
     tls: bool,
     tls_cert: Option<String>,
@@ -324,6 +356,11 @@ struct BmpTcpOutRunner {
     metrics: Arc<BmpTcpOutMetrics>,
     status_reporter: Arc<BmpTcpOutStatusReporter>,
     clients: Arc<RwLock<HashMap<Uuid, Arc<ClientState>>>>,
+    /// Peers whose live Route Monitoring currently arrives as verbatim
+    /// raw copies (fastpath). Marked when a `RouteMonitoringRaw` for the
+    /// ingress is seen, cleared on session teardown (`Withdraw` /
+    /// `WithdrawBulk`). See the coverage notes in `direct_update`.
+    raw_covered: dashmap::DashSet<IngressId>,
 }
 
 #[async_trait]
@@ -332,6 +369,64 @@ impl DirectUpdate for BmpTcpOutRunner {
         self.metrics
             .updates_received
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        // Fastpath routing decisions. Made once here, before dump-phase
+        // buffering and the per-client loop, so buffers and clients only
+        // ever see the representation they will actually send.
+        //
+        // Coverage is adaptive: a peer is "raw-covered" from the moment
+        // its first verbatim copy arrives until its session ends. The
+        // producer (bmp-tcp-in) emits the raw copy BEFORE the parsed
+        // payloads of the same message and does so for every message of
+        // an eligible session, so marking on first sight loses nothing
+        // and never duplicates. Peers without raw copies — non-BMP
+        // sources (BGP, MRT), ADD-PATH sessions, or a bmp-tcp-in with
+        // `forward_raw_updates` off — are never marked and keep using
+        // the rebuild path, whatever this unit's `fastpath` setting.
+        match &update {
+            // Verbatim Route Monitoring copies are only consumed in
+            // fastpath mode; otherwise the parsed payload path covers
+            // everything and the raw copy must not be buffered or sent.
+            Update::RouteMonitoringRaw { ingress_id, .. } => {
+                if !self.fastpath {
+                    return;
+                }
+                self.raw_covered.insert(*ingress_id);
+            }
+            // Parsed payloads of a raw-covered peer duplicate the raw
+            // copies; skip them. An Update carries routes of exactly one
+            // peer (units re-emit per source message), so the first
+            // payload decides.
+            Update::Single(payload) => {
+                if self.fastpath
+                    && self.raw_covered.contains(&payload.ingress_id)
+                {
+                    return;
+                }
+            }
+            Update::Bulk(payloads) => {
+                if self.fastpath {
+                    if let Some(payload) = payloads.first() {
+                        if self.raw_covered.contains(&payload.ingress_id) {
+                            return;
+                        }
+                    }
+                }
+            }
+            // Session teardown: drop coverage marks. Ingress ids are
+            // reused across reconnects (register Layer D), and the next
+            // session may not forward raw copies — a stale mark would
+            // then silently discard that peer's parsed payloads.
+            Update::Withdraw(ingress_id, _) => {
+                self.raw_covered.remove(ingress_id);
+            }
+            Update::WithdrawBulk(entries) => {
+                for (ingress_id, _) in entries.iter() {
+                    self.raw_covered.remove(ingress_id);
+                }
+            }
+            _ => {}
+        }
         // Snapshot client Arcs and drop the RwLock guard before any await
         // that can park. Holding `clients.read()` across
         // `buffer_update_if_dumping().await` deadlocks the writer task's
@@ -424,6 +519,7 @@ impl BmpTcpOutRunner {
         live_queue_depth: usize,
         forward_router_info: bool,
         fan_in_peer_distinguisher: FanInPeerDistinguisher,
+        fastpath: bool,
         acl: Vec<PrefixOrExact>,
         tls: bool,
         tls_cert: Option<String>,
@@ -443,6 +539,7 @@ impl BmpTcpOutRunner {
             live_queue_depth,
             forward_router_info,
             fan_in_peer_distinguisher,
+            fastpath,
             acl,
             tls,
             tls_cert,
@@ -452,6 +549,7 @@ impl BmpTcpOutRunner {
             metrics,
             status_reporter,
             clients: Arc::new(RwLock::new(HashMap::new())),
+            raw_covered: dashmap::DashSet::new(),
         }
     }
 

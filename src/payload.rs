@@ -224,10 +224,8 @@ impl PathAttributeInterner {
             buckets += shard.len();
             for entries in shard.values() {
                 weak_slots += entries.len();
-                live += entries
-                    .iter()
-                    .filter(|w| w.strong_count() > 0)
-                    .count();
+                live +=
+                    entries.iter().filter(|w| w.strong_count() > 0).count();
             }
         }
         (buckets, weak_slots, live)
@@ -481,6 +479,21 @@ pub enum Update {
     // 4-byte stats count followed by stat TLVs. The downstream re-streamer
     // re-prefixes a fresh common + per-peer header before sending.
     PeerStats { ingress_id: IngressId, body: Bytes },
+
+    // BMP Route Monitoring message forwarded verbatim from an upstream
+    // router (bmp-out "fastpath"). `body` is the raw bytes after the BMP
+    // common header: the original per-peer header (42 bytes) followed by
+    // the encapsulated BGP UPDATE PDU, untouched. The downstream
+    // re-streamer emits the UPDATE bytes unchanged under a fresh common +
+    // per-peer header (the PPH must match the Peer Up it synthesized for
+    // this peer), mirroring the A-flag and timestamp from the original
+    // PPH carried here.
+    //
+    // Emitted by bmp-tcp-in *in addition to* the parsed Single/Bulk
+    // payloads for the same message (the RIB still needs those); a
+    // fastpath-enabled bmp-tcp-out uses this variant and skips the parsed
+    // payloads of BMP-sourced ingresses to avoid duplication.
+    RouteMonitoringRaw { ingress_id: IngressId, body: Bytes },
 }
 
 impl Update {
@@ -503,6 +516,7 @@ impl Update {
             Update::OutputStream(..) => smallvec![],
             Update::Rtr(..) => smallvec![],
             Update::PeerStats { .. } => smallvec![],
+            Update::RouteMonitoringRaw { .. } => smallvec![],
         }
     }
 
@@ -527,9 +541,8 @@ impl Update {
             Update::WithdrawBulk(items) => {
                 // Box pointer is part of `base`; account for the heap
                 // SmallVec storage too.
-                base
-                    + items.len()
-                        * size_of::<(IngressId, Option<IngressInfo>)>()
+                base + items.len()
+                    * size_of::<(IngressId, Option<IngressInfo>)>()
             }
             Update::IngressReappeared(..) => base,
             Update::UpstreamStatusChange(..) => base,
@@ -539,6 +552,7 @@ impl Update {
             Update::Rtr(..) => base,
             // body is a Bytes (Arc-backed); shallow accounting skips it.
             Update::PeerStats { .. } => base,
+            Update::RouteMonitoringRaw { .. } => base,
         }
     }
 }

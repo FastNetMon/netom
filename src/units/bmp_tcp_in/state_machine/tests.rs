@@ -115,7 +115,8 @@ fn statistics_report() {
 
     // Then we forward the report verbatim as Update::PeerStats so
     // bmp-tcp-out can re-stream it to its clients.
-    let MessageType::RoutingUpdate { ref update } = res.message_type else {
+    let MessageType::RoutingUpdate { ref update, .. } = res.message_type
+    else {
         panic!(
             "expected RoutingUpdate {{ Update::PeerStats }}, got {:?}",
             res.message_type
@@ -250,6 +251,106 @@ fn duplicate_peer_up() {
         //                                   ^ 1 peer up
         //                       ^ 1 unprocessable BMP message
     );
+}
+
+#[test]
+fn route_monitoring_carries_raw_copy_for_fastpath() {
+    // Given a BMP state machine with one peer up
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (pph, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let route_mon_msg_buf = mk_route_monitoring_msg(&pph);
+    // Snapshot the wire bytes before the message is consumed.
+    let original_msg_bytes = route_mon_msg_buf.as_ref().to_vec();
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    // When it processes a Route Monitoring message
+    let res = processor.process_msg(Instant::now(), route_mon_msg_buf, None);
+
+    // Then the parsed payloads are accompanied by a verbatim raw copy
+    // (per-peer header + BGP UPDATE, i.e. everything after the 6-byte
+    // common header) attributed to the same peer ingress id.
+    let MessageType::RoutingUpdate { update, raw } = res.message_type else {
+        panic!("expected RoutingUpdate, got {:?}", res.message_type);
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert!(!payloads.is_empty());
+    let Some(Update::RouteMonitoringRaw { ingress_id, body }) = raw else {
+        panic!("expected a raw Route Monitoring copy for the fastpath");
+    };
+    assert_eq!(ingress_id, payloads[0].ingress_id);
+    // Byte-for-byte the original message minus the 6-byte common header,
+    // except the per-peer header flags byte: its A-flag (0x20) is
+    // rewritten from the SessionConfig that parsed the message, since
+    // downstream decodes the verbatim UPDATE bytes based on it.
+    assert_eq!(body[0], original_msg_bytes[6]);
+    assert_eq!(
+        body[1] & !0x20,
+        original_msg_bytes[7] & !0x20,
+        "non-A flag bits must be untouched"
+    );
+    assert_eq!(&body[2..], &original_msg_bytes[8..]);
+}
+
+#[test]
+fn end_of_rib_route_monitoring_also_carries_raw_copy() {
+    // Live EoR markers (Updating state) produce no parsed payloads, but
+    // eligible sessions must emit a raw copy for EVERY parsed message —
+    // fastpath consumers pass the EoR through verbatim (the rebuild path
+    // never restreamed live EoRs at all). The EoR that completes the
+    // initial dump is intercepted by the Dumping state's pre-processing
+    // (StateTransition) and carries no raw copy.
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (pph, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let dump_eor_msg_buf = mk_route_monitoring_end_of_rib_msg(&pph);
+    let eor_msg_buf = mk_route_monitoring_end_of_rib_msg(&pph);
+    let original_msg_bytes = eor_msg_buf.as_ref().to_vec();
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+    // First EoR ends the Dumping phase (state transition, no raw copy).
+    let processor = processor
+        .process_msg(Instant::now(), dump_eor_msg_buf, None)
+        .next_state;
+    assert!(matches!(processor, BmpState::Updating(_)));
+
+    // A live EoR in the Updating state must carry the raw copy.
+    let res = processor.process_msg(Instant::now(), eor_msg_buf, None);
+
+    let MessageType::RoutingUpdate { update, raw } = res.message_type else {
+        panic!("expected RoutingUpdate, got {:?}", res.message_type);
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert!(payloads.is_empty(), "EoR marker has no parsed payloads");
+    let Some(Update::RouteMonitoringRaw { body, .. }) = raw else {
+        panic!("expected a raw copy for the EoR marker");
+    };
+    assert_eq!(&body[2..], &original_msg_bytes[8..]);
 }
 
 #[test]
@@ -392,7 +493,7 @@ fn peer_up_route_monitoring_peer_down() {
         res.message_type,
         MessageType::RoutingUpdate { .. }
     ));
-    if let MessageType::RoutingUpdate { update } = res.message_type {
+    if let MessageType::RoutingUpdate { update, .. } = res.message_type {
         assert!(matches!(update, Update::Withdraw(1, None)));
     } else {
         unreachable!();
@@ -500,7 +601,7 @@ fn peer_down_cleans_up_synthesized_siblings() {
     // genuine entry AND the synthesized sibling.
     let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
 
-    let MessageType::RoutingUpdate { update } = res.message_type else {
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!(
             "expected RoutingUpdate after PeerDown, got {:?}",
             res.message_type
@@ -636,7 +737,7 @@ fn peer_down_cleans_up_when_carrying_synthesized_pph() {
 
     let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
 
-    let MessageType::RoutingUpdate { update } = res.message_type else {
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!(
             "expected RoutingUpdate after PeerDown, got {:?}",
             res.message_type
@@ -750,7 +851,7 @@ fn peer_down_cleans_up_when_pph_variant_was_never_synthesized() {
 
     let res = processor.process_msg(Instant::now(), peer_down_msg_buf, None);
 
-    let MessageType::RoutingUpdate { update } = res.message_type else {
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!(
             "expected RoutingUpdate after PeerDown, got {:?}",
             res.message_type
@@ -1034,7 +1135,7 @@ fn peer_down_spreads_withdrawals_across_multiple_bgp_updates_if_needed() {
         res.message_type,
         MessageType::RoutingUpdate { .. }
     ));
-    if let MessageType::RoutingUpdate { update } = res.message_type {
+    if let MessageType::RoutingUpdate { update, .. } = res.message_type {
         assert!(matches!(update, Update::Bulk(_)));
         if let Update::Bulk(mut bulk) = update {
             // Verify that the update had too many payload items to fit inline into the SmallVec and so it had to
@@ -1441,7 +1542,7 @@ fn route_monitoring_announce_route() {
         res.message_type,
         MessageType::RoutingUpdate { .. }
     ));
-    if let MessageType::RoutingUpdate { update } = res.message_type {
+    if let MessageType::RoutingUpdate { update, .. } = res.message_type {
         assert!(matches!(update, Update::Bulk(_)));
         if let Update::Bulk(updates) = &update {
             assert_eq!(updates.len(), 1);

@@ -32,6 +32,12 @@ pub enum MessageType {
 
     RoutingUpdate {
         update: Update,
+        /// Verbatim message bytes for the bmp-out fastpath
+        /// (`Update::RouteMonitoringRaw`), forwarded on the gate alongside
+        /// `update` when the unit's `forward_raw_updates` config is set.
+        /// Only present for Route Monitoring messages that parsed cleanly;
+        /// see the emission guards in `machine::route_monitoring`.
+        raw: Option<Update>,
     },
 
     StateTransition,

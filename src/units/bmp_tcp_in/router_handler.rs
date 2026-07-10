@@ -68,6 +68,10 @@ pub struct RouterHandler {
     /// Drop Adj-RIB-In post-policy Route Monitoring at ingest (see the unit's
     /// `ignore_post_policy_routes` config). Captured at connection accept.
     ignore_post_policy_routes: bool,
+    /// Forward verbatim Route Monitoring bytes for the bmp-out fastpath
+    /// (see the unit's `forward_raw_updates` config). Captured at connection
+    /// accept.
+    forward_raw_updates: bool,
 }
 
 impl RouterHandler {
@@ -85,6 +89,7 @@ impl RouterHandler {
         bmp_metrics: Arc<BmpStateMachineMetrics>,
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
+        forward_raw_updates: bool,
     ) -> Self {
         Self {
             gate,
@@ -100,6 +105,7 @@ impl RouterHandler {
             rtr_cache: Default::default(),
             ingress_register,
             ignore_post_policy_routes,
+            forward_raw_updates,
         }
     }
 
@@ -146,6 +152,7 @@ impl RouterHandler {
             roto_context: Arc::new(std::sync::Mutex::new(Ctx::empty())),
             ingress_register: Default::default(),
             ignore_post_policy_routes: false,
+            forward_raw_updates: false,
         };
 
         (mock, gate_agent, parent_gate)
@@ -635,7 +642,22 @@ impl RouterHandler {
                         );
                     }
 
-                    MessageType::RoutingUpdate { update } => {
+                    MessageType::RoutingUpdate { update, raw } => {
+                        // Verbatim message copy for the bmp-out fastpath.
+                        // It MUST precede its parsed counterpart on the
+                        // gate: a fastpath consumer marks the peer as
+                        // raw-covered when the first raw copy arrives and
+                        // only then starts skipping the peer's parsed
+                        // payloads — raw-first ordering means not a single
+                        // message is ever sent in both forms or in
+                        // neither. Only forwarded when enabled: it adds
+                        // one gate update per Route Monitoring message,
+                        // useless unless a downstream bmp-tcp-out uses it.
+                        if self.forward_raw_updates {
+                            if let Some(raw) = raw {
+                                self.gate.update_data(raw).await;
+                            }
+                        }
                         // Pass the routing update on to downstream units
                         // and/or targets. This is where we send an update
                         // down the pipeline.

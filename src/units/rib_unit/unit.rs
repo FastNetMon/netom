@@ -518,10 +518,7 @@ impl RibUnitRunner {
     /// on a tokio worker can stall the whole pipeline. Used for ingresses that
     /// are gone for good (synthesized peers already removed from the register),
     /// where mark-withdraw would leak their records forever.
-    async fn signal_removes_blocking(
-        &self,
-        ids: Vec<ingress::IngressId>,
-    ) {
+    async fn signal_removes_blocking(&self, ids: Vec<ingress::IngressId>) {
         if ids.is_empty() {
             return;
         }
@@ -601,17 +598,18 @@ impl RibUnitRunner {
                     let rib = rib_swap.load().clone();
                     drop(rib_swap);
                     let prev = std::mem::take(&mut candidates);
-                    candidates = match tokio::task::spawn_blocking(
-                        move || rib.gc_disconnected_bmp_peers(prev),
-                    )
-                    .await
-                    {
-                        Ok(next) => next,
-                        Err(e) => {
-                            error!("rib GC sweep task failed: {e}");
-                            HashSet::new()
-                        }
-                    };
+                    candidates =
+                        match tokio::task::spawn_blocking(move || {
+                            rib.gc_disconnected_bmp_peers(prev)
+                        })
+                        .await
+                        {
+                            Ok(next) => next,
+                            Err(e) => {
+                                error!("rib GC sweep task failed: {e}");
+                                HashSet::new()
+                            }
+                        };
                 }
             });
         }
@@ -629,8 +627,7 @@ impl RibUnitRunner {
             crate::tokio::spawn(&"rib-memstat".to_string(), async move {
                 const MEMSTAT_INTERVAL: std::time::Duration =
                     std::time::Duration::from_secs(300);
-                let mut interval =
-                    tokio::time::interval(MEMSTAT_INTERVAL);
+                let mut interval = tokio::time::interval(MEMSTAT_INTERVAL);
                 loop {
                     interval.tick().await;
                     let Some(rib_swap) = stats_rib.upgrade() else {
@@ -837,6 +834,16 @@ impl RibUnitRunner {
             Update::PeerStats { .. } => {
                 // BMP Statistics Report — not a route, no RIB work to do.
                 // Forward to downstream so bmp-tcp-out can re-stream it.
+                self.gate.update_data(update).await;
+            }
+
+            Update::RouteMonitoringRaw { .. } => {
+                // Verbatim BMP Route Monitoring bytes for the bmp-tcp-out
+                // fastpath. The routes it carries reach the RIB separately
+                // via the parsed Bulk payloads for the same message, so
+                // there is no RIB work to do here — just pass it on.
+                // Note: this deliberately bypasses this unit's roto filter;
+                // fastpath restreaming is a pre-filter mirror.
                 self.gate.update_data(update).await;
             }
 

@@ -1138,6 +1138,54 @@ pub fn build_statistics_report(peer: &PeerInfo, body: &[u8]) -> Vec<u8> {
     buf
 }
 
+/// Minimum length of a BGP UPDATE PDU: 16-byte marker + 2-byte length +
+/// 1-byte type + 2-byte withdrawn routes length + 2-byte total path
+/// attribute length.
+const BGP_UPDATE_MIN_LEN: usize = 23;
+
+/// Build a BMP Route Monitoring message around a verbatim upstream BGP
+/// UPDATE (the bmp-out "fastpath").
+///
+/// `body` is the original message as received from the upstream router,
+/// minus the BMP common header: the original 42-byte per-peer header
+/// followed by the encapsulated BGP UPDATE PDU. The UPDATE bytes are
+/// forwarded untouched — unknown path attributes, exact NLRI encoding and
+/// all. The per-peer header is re-synthesized from `peer` so it matches
+/// the Peer Up already sent for this peer on this client (peer identity,
+/// normalized policy flags, fan-in distinguisher), with two fields
+/// mirrored from the *original* header because they describe the verbatim
+/// payload rather than the peer:
+///   * the A-flag (RFC 7854 §4.2, legacy 2-byte AS_PATH encoding) — the
+///     UPDATE bytes keep whatever AS encoding the upstream session used,
+///     so the flag must travel with them;
+///   * the timestamp — the original export time, not our re-send time.
+///
+/// Returns `None` for a `body` too short to contain a per-peer header and
+/// a minimal UPDATE; such a message should be dropped, not sent.
+pub fn build_route_monitoring_raw(
+    peer: &PeerInfo,
+    body: &[u8],
+) -> Option<Vec<u8>> {
+    if body.len() < BMP_PER_PEER_HEADER_LEN + BGP_UPDATE_MIN_LEN {
+        return None;
+    }
+    let (orig_pph, bgp_update) = body.split_at(BMP_PER_PEER_HEADER_LEN);
+
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
+    let mut buf = Vec::with_capacity(total_len);
+    write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
+
+    let mut peer = peer.clone();
+    peer.peer_flags |= orig_pph[1] & 0x20;
+    let secs = u32::from_be_bytes(orig_pph[34..38].try_into().unwrap());
+    let micros = u32::from_be_bytes(orig_pph[38..42].try_into().unwrap());
+    write_per_peer_header(&mut buf, &peer, Some((secs, micros)));
+
+    buf.extend_from_slice(bgp_update);
+    Some(buf)
+}
+
 /// Build a BMP Route Monitoring message representing an End-of-RIB marker for
 /// the given AFI/SAFI.
 ///
@@ -1599,6 +1647,74 @@ mod tests {
         // Body must be appended verbatim after common + per-peer header.
         let body_offset = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN;
         assert_eq!(&msg[body_offset..], body);
+    }
+
+    #[test]
+    fn test_build_route_monitoring_raw() {
+        let peer = PeerInfo {
+            peer_type: PeerType::GlobalInstance,
+            peer_flags: 0x40, // post-policy, no A-flag of our own
+            peer_distinguisher: [1, 2, 3, 4, 5, 6, 7, 8],
+            peer_address: IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1)),
+            peer_asn: Asn::from_u32(65000),
+            peer_bgp_id: [10, 0, 0, 1],
+            local_addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            peer_hostname: None,
+            peer_software_version: None,
+            peer_role: None,
+            session_up_time: None,
+            peer_capabilities: Vec::new(),
+            admin_label: None,
+        };
+
+        // Original per-peer header: identity fields deliberately DIFFERENT
+        // from `peer` (they must be replaced by ours), A-flag set (must be
+        // mirrored), timestamp set (must be mirrored).
+        let mut orig_pph = [0u8; BMP_PER_PEER_HEADER_LEN];
+        orig_pph[1] = 0x20; // A-flag: legacy 2-byte AS_PATH encoding
+        orig_pph[25] = 99; // some other peer address
+        orig_pph[34..38].copy_from_slice(&1234u32.to_be_bytes());
+        orig_pph[38..42].copy_from_slice(&5678u32.to_be_bytes());
+
+        // Minimal BGP UPDATE: marker + len 23 + type 2 + two zero lengths.
+        let mut update = vec![0xFFu8; 16];
+        update.extend_from_slice(&23u16.to_be_bytes());
+        update.push(2);
+        update.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut body = orig_pph.to_vec();
+        body.extend_from_slice(&update);
+
+        let msg = build_route_monitoring_raw(&peer, &body).unwrap();
+
+        assert_eq!(msg[0], 3); // Version
+        assert_eq!(msg[5], 0); // Type = Route Monitoring
+        let len = u32::from_be_bytes([msg[1], msg[2], msg[3], msg[4]]);
+        assert_eq!(len as usize, msg.len());
+
+        let pph = &msg[BMP_COMMON_HEADER_LEN..][..BMP_PER_PEER_HEADER_LEN];
+        // Our flags plus the mirrored A-flag.
+        assert_eq!(pph[1], 0x40 | 0x20);
+        // Identity comes from `peer`, not the original header: fan-in
+        // distinguisher and the (v4-mapped) peer address.
+        assert_eq!(&pph[2..10], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut expected_addr = [0u8; 16];
+        expected_addr[12..].copy_from_slice(&[10, 0, 0, 1]);
+        assert_eq!(&pph[10..26], &expected_addr);
+        // Timestamp mirrored from the original header.
+        assert_eq!(&pph[34..42], &orig_pph[34..42]);
+
+        // The BGP UPDATE goes out verbatim.
+        let body_offset = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN;
+        assert_eq!(&msg[body_offset..], &update[..]);
+
+        // Truncated bodies are rejected, not sent.
+        assert!(build_route_monitoring_raw(
+            &peer,
+            &body[..BMP_PER_PEER_HEADER_LEN + BGP_UPDATE_MIN_LEN - 1]
+        )
+        .is_none());
+        assert!(build_route_monitoring_raw(&peer, &[]).is_none());
     }
 
     #[test]

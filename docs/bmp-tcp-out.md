@@ -36,6 +36,7 @@ tls_key = "/path/to/key.pem"
 | `max_client_buffer` | no | `100000` | Maximum number of updates buffered per client during the initial dump phase. If exceeded, the client is disconnected. See [Buffer Overflow](#buffer-overflow) below. |
 | `acl` | yes | — | List of allowed client IP addresses or CIDR prefixes. Use `["0.0.0.0/0", "::/0"]` to allow all. |
 | `forward_router_info` | no | `true` | Include upstream router identity (sysName/sysDescr) as a JSON Admin Label TLV (type 4, RFC 9736) in Peer Up messages. |
+| `fastpath` | no | `true` | Restream live Route Monitoring messages verbatim instead of rebuilding them from parsed routes, for peers whose raw copies arrive from a `bmp-tcp-in` unit with `forward_raw_updates` on (the default). See [Fastpath](#fastpath) below. |
 | `tls` | no | `false` | Enable TLS encryption for client connections. |
 | `tls_cert` | no | — | Path to PEM certificate file. If omitted with `tls = true`, a self-signed certificate is generated. |
 | `tls_key` | no | — | Path to PEM private key file. Required if `tls_cert` is set. |
@@ -172,6 +173,68 @@ No Admin Label TLV is present when:
 - `forward_router_info = false` in config, or
 - The upstream BMP router did not send sysName/sysDescr in its Initiation
   Message, or sent only placeholder values.
+
+## Fastpath
+
+Without fastpath, every restreamed Route Monitoring message is *rebuilt*:
+the upstream message is parsed into per-route payloads at ingest, stored in
+the RIB, and re-encoded into a fresh BGP UPDATE here. With fastpath the
+live path instead forwards the **original BGP UPDATE bytes verbatim**,
+re-synthesizing only the BMP common and per-peer headers.
+
+Fastpath is **on by default** on both ends:
+
+```toml
+[units.bmp-in]
+type = "bmp-tcp-in"
+forward_raw_updates = true   # default; emit verbatim copies before the parsed routes
+
+[units.bmp-out]
+type = "bmp-tcp-out"
+fastpath = true              # default; consume them, skip the rebuild path per covered peer
+```
+
+Coverage is **adaptive per peer**, so any flag combination is loss-free: a
+peer is served from raw copies only while its raw copies are actually
+arriving. `bmp-tcp-in` emits the raw copy *before* the parsed payloads of
+the same message and does so for every parsed message of an eligible
+session, so the switchover point can neither duplicate a message nor drop
+one. Coverage marks are cleared on Peer Down / session teardown, because
+ingress ids can be re-bound to reconnecting sessions with different
+settings.
+
+What fastpath changes:
+
+- **Fidelity** — path attributes, exotic/unknown attributes and the exact
+  NLRI encoding reach the consumer byte-for-byte; the per-peer header
+  timestamp is the original export time; the A-flag (legacy 2-byte AS
+  encoding) reflects the encoding the message actually parsed with. The
+  peer identity fields and the fan-in `peer_distinguisher` still come from
+  the Peer Up this unit synthesized, so the (peer, pd, rib_type) keying
+  stays consistent.
+- **Live EoR passthrough** — upstream End-of-RIB markers received after
+  the initial dump phase are forwarded verbatim (the rebuild path never
+  restreamed live EoRs at all). Messages carrying only NLRI types the RIB
+  cannot store are likewise forwarded instead of vanishing.
+- **Cost** — the per-route re-encode and pa-blob re-aggregation are
+  skipped on the live path.
+
+What it does *not* change:
+
+- **The initial table dump** stays on the rebuild path — raw bytes are not
+  stored in the RIB.
+- **Non-BMP sources** (BGP, MRT) have no raw copies; their routes keep
+  being rebuilt.
+- **ADD-PATH sessions** emit no raw copies (the synthesized Peer Up strips
+  the ADD-PATH capability, so a consumer would misparse path-id-carrying
+  NLRI); their storable routes keep flowing via the rebuild path.
+
+Caveat: fastpath is a **pre-filter mirror**. Routes dropped or rewritten by
+roto filters in upstream units are restreamed in their original form. Set
+`fastpath = false` on this unit if downstream consumers must observe
+filtered data. In pipelines with no bmp-tcp-out unit at all, set
+`forward_raw_updates = false` on bmp-tcp-in to save one gate update per
+Route Monitoring message.
 
 ## Prometheus Metrics
 

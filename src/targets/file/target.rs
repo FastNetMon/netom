@@ -111,10 +111,8 @@ impl FileRunner {
                     dst.write_all(
                         format!(
                             "[{}] ",
-                            e.timestamp.to_rfc3339_opts(
-                                SecondsFormat::Secs,
-                                true
-                            )
+                            e.timestamp
+                                .to_rfc3339_opts(SecondsFormat::Secs, true)
                         )
                         .as_ref(),
                     )
@@ -146,9 +144,7 @@ impl FileRunner {
             }
             Format::JsonMin => {
                 if let OutputStreamMessageRecord::Entry(e) = m {
-                    if let Ok(bytes) =
-                        serde_json::to_vec(&e.into_minimal())
-                    {
+                    if let Ok(bytes) = serde_json::to_vec(&e.into_minimal()) {
                         dst.write_all(&bytes).await?;
                         dst.write_all(b"\n").await?;
                     }
@@ -275,7 +271,8 @@ impl FileRunner {
                         | Update::IngressReappeared(..)
                         | Update::UpstreamStatusChange(..)
                         | Update::Rtr(..)
-                        | Update::PeerStats { .. } => {}
+                        | Update::PeerStats { .. }
+                        | Update::RouteMonitoringRaw { .. } => {}
                     }
                 }
             }

@@ -374,7 +374,20 @@ where
         update: Update,
     ) -> ProcessingResult {
         ProcessingResult::new(
-            MessageType::RoutingUpdate { update },
+            MessageType::RoutingUpdate { update, raw: None },
+            self.into(),
+        )
+    }
+
+    /// As [`mk_routing_update_result`], additionally carrying the verbatim
+    /// message bytes for the bmp-out fastpath.
+    pub fn mk_routing_update_result_with_raw(
+        self,
+        update: Update,
+        raw: Option<Update>,
+    ) -> ProcessingResult {
+        ProcessingResult::new(
+            MessageType::RoutingUpdate { update, raw },
             self.into(),
         )
     }
@@ -384,7 +397,7 @@ where
         update: Update,
     ) -> ProcessingResult {
         ProcessingResult::new(
-            MessageType::RoutingUpdate { update },
+            MessageType::RoutingUpdate { update, raw: None },
             next_state,
         )
     }
@@ -1157,9 +1170,63 @@ where
                             .status_reporter
                             .routing_update(update_report_msg);
 
-                        saved_self.mk_routing_update_result(Update::Bulk(
-                            Box::new(payloads),
-                        ))
+                        // bmp-out fastpath: attach the original message
+                        // bytes (per-peer header + encapsulated BGP UPDATE,
+                        // i.e. everything after the 6-byte common header) so
+                        // a fastpath-enabled bmp-tcp-out can restream the
+                        // UPDATE verbatim instead of rebuilding it from the
+                        // parsed payloads.
+                        //
+                        // Coverage must be session-consistent: bmp-out
+                        // marks a peer "raw-covered" on the first raw copy
+                        // and from then on skips that peer's parsed
+                        // payloads, so an eligible session must emit a raw
+                        // copy for EVERY successfully parsed message —
+                        // including EoR markers and messages whose NLRI we
+                        // cannot store (they carry no parsed counterpart;
+                        // forwarding them is a fidelity bonus). The only
+                        // session-level exclusion is ADD-PATH: the
+                        // synthesized Peer Up downstream strips the
+                        // ADD-PATH capability, so a consumer would misparse
+                        // raw path-id-carrying NLRI. ADD-PATH sessions emit
+                        // no raw copies at all and their storable routes
+                        // keep flowing via the rebuild path.
+                        //
+                        // The per-peer header's A-flag (legacy 2-byte
+                        // AS_PATH encoding) is rewritten from the
+                        // SessionConfig that actually parsed this message:
+                        // after an alternate-config retry the router's own
+                        // claim is known to be wrong, and downstream relies
+                        // on this flag to decode the verbatim UPDATE.
+                        let raw = if peer_config
+                            .enabled_addpaths()
+                            .next()
+                            .is_none()
+                        {
+                            saved_self.details.get_peer_ingress_id(&pph).map(
+                                |ingress_id| {
+                                    let mut body = msg.as_ref()
+                                        [BMP_COMMON_HDR_LEN..]
+                                        .to_vec();
+                                    if peer_config.four_octet_enabled() {
+                                        body[1] &= !0x20;
+                                    } else {
+                                        body[1] |= 0x20;
+                                    }
+                                    Update::RouteMonitoringRaw {
+                                        ingress_id,
+                                        body: Bytes::from(body),
+                                    }
+                                },
+                            )
+                        } else {
+                            None
+                        };
+
+                        saved_self.mk_routing_update_result_with_raw(
+                            Update::Bulk(Box::new(payloads)),
+                            raw,
+                        )
                     } else {
                         return saved_self.mk_invalid_message_result(
                             "Invalid BMP RouteMonitoring BGP UPDATE message. The message cannot be parsed.",
@@ -1506,6 +1573,12 @@ impl From<BmpStateDetails<Terminated>> for BmpState {
 /// How often to emit a rolled-up summary line for suppressed unknown-peer
 /// RouteMonitoring messages, instead of logging one warning per dropped route.
 const UNKNOWN_PEER_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Length of the BMP common header (RFC 7854 §4.1): version (1) +
+/// message length (4) + message type (1). What follows in a Route
+/// Monitoring message is the 42-byte per-peer header and the
+/// encapsulated BGP UPDATE PDU.
+const BMP_COMMON_HDR_LEN: usize = 6;
 
 /// What the caller should log for a RouteMonitoring message whose peer has no
 /// observed PeerUp. See [`PeerStates::note_unknown_peer`].

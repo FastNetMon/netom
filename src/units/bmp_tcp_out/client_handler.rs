@@ -286,7 +286,8 @@ pub async fn perform_initial_dump(
                                 forward_router_info,
                                 fan_in_peer_distinguisher,
                             );
-                            let peer_up = bmp_builder::build_peer_up(&pi, false);
+                            let peer_up =
+                                bmp_builder::build_peer_up(&pi, false);
                             if !sink(peer_up, 0) {
                                 client_gone = true;
                                 return false;
@@ -373,8 +374,7 @@ pub async fn perform_initial_dump(
                 let avg_rate = total_routes as f64
                     / now.duration_since(rib_walk_start).as_secs_f64();
                 let buf_len = client.dump_buffer.lock().await.len();
-                let buf_bytes =
-                    client.buffered_bytes.load(Ordering::Relaxed);
+                let buf_bytes = client.buffered_bytes.load(Ordering::Relaxed);
                 let bytes_sent_total = client
                     .bytes_sent
                     .load(Ordering::Relaxed)
@@ -700,10 +700,91 @@ pub async fn send_update_to_client(
             )
             .await
         }
+        Update::RouteMonitoringRaw { ingress_id, body } => {
+            // Fastpath: only reaches a client when the unit has
+            // `fastpath` enabled — `direct_update` drops these Updates
+            // (both from live forwarding and from the dump-phase buffer)
+            // otherwise.
+            send_raw_route_monitoring(
+                client,
+                *ingress_id,
+                body,
+                ingress_register,
+                forward_router_info,
+                fan_in_peer_distinguisher,
+                blocking,
+            )
+            .await
+        }
         _ => {
             // Other update types are ignored for BMP out
             true
         }
+    }
+}
+
+/// Forward an upstream BMP Route Monitoring message verbatim (fastpath).
+///
+/// `body` is the original per-peer header + encapsulated BGP UPDATE as
+/// received by bmp-tcp-in. The UPDATE bytes go out untouched;
+/// `bmp_builder::build_route_monitoring_raw` re-synthesizes the per-peer
+/// header so it matches the Peer Up this client was sent for `ingress_id`
+/// (mirroring the original A-flag and timestamp). Lazy Peer Up and the
+/// per-peer PeerInfo cache mirror `send_payload_to_client`.
+async fn send_raw_route_monitoring(
+    client: &Arc<ClientState>,
+    ingress_id: IngressId,
+    body: &bytes::Bytes,
+    ingress_register: &Arc<register::Register>,
+    forward_router_info: bool,
+    fan_in_peer_distinguisher: FanInPeerDistinguisher,
+    blocking: bool,
+) -> bool {
+    // Fast path: reuse the PeerInfo cached when the Peer Up (or a prior
+    // route) for this peer was sent — no register lookups per message.
+    if let Some(peer_info) = client.cached_peer_info(ingress_id).await {
+        return match bmp_builder::build_route_monitoring_raw(&peer_info, body)
+        {
+            Some(msg) => client.send_message_mode(msg, blocking).await,
+            None => true, // Malformed/truncated body; drop the message
+        };
+    }
+
+    // First sight of this peer on this client: ensure Peer Up goes first.
+    if client.register_known_peer_if_absent(ingress_id).await {
+        if let Some(info) = ingress_register.get(ingress_id) {
+            let peer_info = build_peer_info_for_emit(
+                &info,
+                ingress_register,
+                forward_router_info,
+                fan_in_peer_distinguisher,
+            );
+            let peer_up = bmp_builder::build_peer_up(&peer_info, false);
+            if !client.send_message_mode(peer_up, blocking).await {
+                client.remove_known_peer(ingress_id).await;
+                return false;
+            }
+        }
+    }
+
+    let peer_info = match ingress_register.get(ingress_id) {
+        Some(info) => Arc::new(build_peer_info_for_emit(
+            &info,
+            ingress_register,
+            forward_router_info,
+            fan_in_peer_distinguisher,
+        )),
+        None => {
+            // Peer is gone (e.g. just torn down); drop the message rather
+            // than emit one with bogus PPH fields.
+            return true;
+        }
+    };
+    client.cache_peer_info(ingress_id, peer_info.clone()).await;
+
+    match bmp_builder::build_route_monitoring_raw(&peer_info, body) {
+        Some(msg) => client.send_message_mode(msg, blocking).await,
+        None => true, // Malformed/truncated body; drop the message
     }
 }
 
