@@ -1,5 +1,28 @@
-.DS_Store
-.vscode
+# Build artifacts
 /target
-.devcontainer/
+
+# Hidden files: editor, OS and local tool state.
+# Whitelist the ones that belong in the repository.
+.*
+!/.gitignore
+!/.github/
+!/.dockerignore
+!/.gcloudignore
+
+# Logs, archives and local data
+*.log
+*.gz
 /test-data
+/rotonda
+
+# Local-only configs, deploy scripts and scratch notes
+/TODO
+ingress.txt
+license.json
+run*.sh
+deploy_vm.sh
+build_oldubuntu.sh
+cloudbuild.yaml
+compression*.patch
+rotonda*.conf
+filters.roto
