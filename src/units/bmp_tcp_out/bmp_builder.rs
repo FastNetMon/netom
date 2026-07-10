@@ -851,10 +851,11 @@ fn build_flowspec_bgp_update(
     let total_pa_len = pa_bytes.len() + mp_attr.len();
     let update_body_len = 2 + 2 + total_pa_len;
     let total_len = 19 + update_body_len;
-    if total_len > u16::MAX as usize {
+    if total_len > MAX_BGP_UPDATE_LEN {
         log::warn!(
             "bmp-out: dropping flowspec rule: re-encoded BGP UPDATE length \
-             {total_len} exceeds the 2-byte BGP length field"
+             {total_len} exceeds the negotiated {MAX_BGP_UPDATE_LEN}-byte \
+             BGP message limit"
         );
         return None;
     }
@@ -2939,6 +2940,26 @@ mod tests {
         assert_eq!(value[3] as usize, FS_NLRI_A.len());
         assert_eq!(&value[4..], FS_NLRI_A);
         assert_eq!(3 + pas[2] as usize, pa_len);
+    }
+
+    #[test]
+    fn oversized_flowspec_update_is_dropped() {
+        // The synthetic Peer Up OPEN does not negotiate Extended Messages,
+        // so even though the BGP length field is two bytes, UPDATEs remain
+        // capped at the classic 4096-byte limit.
+        let mut attrs = vec![0xd0, 99]; // optional, transitive, ext-length
+        attrs.extend_from_slice(&4070u16.to_be_bytes());
+        attrs.extend(std::iter::repeat_n(0u8, 4070));
+        let pamap = RotondaPaMap::from(attrs);
+
+        assert!(build_flowspec_route_monitoring(
+            &agg_test_peer(),
+            true,
+            FS_NLRI_A,
+            &pamap,
+            false,
+        )
+        .is_none());
     }
 
     #[test]
