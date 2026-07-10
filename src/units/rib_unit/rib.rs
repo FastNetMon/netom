@@ -523,6 +523,7 @@ impl Rib {
             .flowspec_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _count_mutation = self.flowspec_rule_counts.begin_mutation();
 
         // A withdrawn MUI may still own the previous session's records when
         // withdrawn attributes are retained. Clearing the family-wide bit
@@ -819,25 +820,45 @@ impl Rib {
         let Some(store) = (*self.flowspec).as_ref() else {
             return;
         };
-        let mut v4 = 0u64;
-        let mut v6 = 0u64;
-        for key in store.prefixes_keys_iter() {
-            if let Ok(Some(records)) =
-                store.get_records_for_prefix(&key, None, false)
-            {
-                let rules: u64 = records
-                    .iter()
-                    .filter(|r| r.status != RouteStatus::Withdrawn)
-                    .map(|r| r.meta.rule_count() as u64)
-                    .sum();
-                if key.is_v4() {
-                    v4 += rules;
-                } else {
-                    v6 += rules;
+        loop {
+            let Some(generation) =
+                self.flowspec_rule_counts.recount_generation()
+            else {
+                std::thread::yield_now();
+                continue;
+            };
+            let mut v4 = 0u64;
+            let mut v6 = 0u64;
+            for key in store.prefixes_keys_iter() {
+                if let Ok(Some(records)) =
+                    store.get_records_for_prefix(&key, None, false)
+                {
+                    let rules: u64 = records
+                        .iter()
+                        .filter(|r| r.status != RouteStatus::Withdrawn)
+                        .map(|r| r.meta.rule_count() as u64)
+                        .sum();
+                    if key.is_v4() {
+                        v4 += rules;
+                    } else {
+                        v6 += rules;
+                    }
                 }
             }
+            if !self
+                .flowspec_rule_counts
+                .generation_is_quiescent(generation)
+            {
+                continue;
+            }
+            self.flowspec_rule_counts.set(v4, v6);
+            if self
+                .flowspec_rule_counts
+                .generation_is_quiescent(generation)
+            {
+                return;
+            }
         }
-        self.flowspec_rule_counts.set(v4, v6);
     }
 
     fn insert_prefix(
@@ -969,6 +990,7 @@ impl Rib {
             .withdraw_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count_mutation = self.flowspec_rule_counts.begin_mutation();
 
         if !retain_withdrawn_attributes {
             self.compact_withdrawn_attributes_for_ingresses(ids);
@@ -1094,6 +1116,8 @@ impl Rib {
             }
         }
 
+        drop(count_mutation);
+        drop(_guard);
         // Whole-mui status flips change which flowspec rules are visible
         // without going through insert_flowspec.
         self.recount_flowspec_rules();
@@ -1120,6 +1144,7 @@ impl Rib {
             .withdraw_lock
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let count_mutation = self.flowspec_rule_counts.begin_mutation();
 
         for &id in ids {
             if let Some(store) = (*self.unicast).as_ref() {
@@ -1156,6 +1181,8 @@ impl Rib {
                 }
             }
         }
+        drop(count_mutation);
+        drop(_guard);
         self.recount_flowspec_rules();
     }
 
@@ -3821,5 +3848,57 @@ mod tests {
         let rows = flowspec_rows(&rib);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rule.nlri, FS_DST_PROTO);
+    }
+
+    #[test]
+    fn flowspec_rule_counts_survive_concurrent_recounts() {
+        let rib = Arc::new(test_rib());
+        let mui: IngressId = 91;
+        let writer_rib = rib.clone();
+        let writer = std::thread::spawn(move || {
+            let rule = mk_flowspec_v4(FS_DST_PROTO);
+            for ltime in 1..=250 {
+                writer_rib
+                    .insert(
+                        &rule,
+                        RouteStatus::Active,
+                        ltime * 2,
+                        mui,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                writer_rib
+                    .insert(
+                        &rule,
+                        RouteStatus::Withdrawn,
+                        ltime * 2 + 1,
+                        mui,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+            }
+        });
+
+        let lifecycle_rib = rib.clone();
+        let lifecycle = std::thread::spawn(move || {
+            for _ in 0..100 {
+                lifecycle_rib.withdraw_for_ingress(
+                    mui,
+                    Some(AfiSafiType::Ipv4FlowSpec),
+                    true,
+                );
+            }
+        });
+        writer.join().unwrap();
+        lifecycle.join().unwrap();
+
+        let rule = mk_flowspec_v4(FS_DST_PROTO);
+        rib.insert(&rule, RouteStatus::Active, 1000, mui, false, false)
+            .unwrap();
+        rib.recount_flowspec_rules();
+        assert_eq!(flowspec_rows(&rib).len(), 1);
+        assert_eq!(rib.flowspec_rule_counts.snapshot(), (1, 0));
     }
 }

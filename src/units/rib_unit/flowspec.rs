@@ -316,21 +316,68 @@ pub fn decode_actions(pamap: &RotondaPaMap) -> Vec<String> {
 pub struct FlowSpecRuleCounts {
     v4: AtomicU64,
     v6: AtomicU64,
+    /// Optimistic recount coordination. Writers never wait: lifecycle
+    /// recounts retry when either value changes while they scan the store.
+    active_writers: AtomicU64,
+    generation: AtomicU64,
 }
 
 impl FlowSpecRuleCounts {
+    pub fn begin_mutation(&self) -> FlowSpecRuleCountMutation<'_> {
+        self.active_writers.fetch_add(1, Ordering::AcqRel);
+        FlowSpecRuleCountMutation { counts: self }
+    }
+
     pub fn add(&self, is_v4: bool, delta: i64) {
         let gauge = if is_v4 { &self.v4 } else { &self.v6 };
         if delta >= 0 {
             gauge.fetch_add(delta as u64, Ordering::Relaxed);
         } else {
-            gauge.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+            let amount = delta.unsigned_abs();
+            let _ = gauge.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |current| Some(current.saturating_sub(amount)),
+            );
         }
     }
 
     pub fn set(&self, v4: u64, v6: u64) {
         self.v4.store(v4, Ordering::Relaxed);
         self.v6.store(v6, Ordering::Relaxed);
+    }
+
+    pub fn recount_generation(&self) -> Option<u64> {
+        if self.active_writers.load(Ordering::Acquire) != 0 {
+            return None;
+        }
+        let generation = self.generation.load(Ordering::Acquire);
+        (self.active_writers.load(Ordering::Acquire) == 0)
+            .then_some(generation)
+    }
+
+    pub fn generation_is_quiescent(&self, generation: u64) -> bool {
+        self.active_writers.load(Ordering::Acquire) == 0
+            && self.generation.load(Ordering::Acquire) == generation
+    }
+
+    #[cfg(test)]
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.v4.load(Ordering::Relaxed),
+            self.v6.load(Ordering::Relaxed),
+        )
+    }
+}
+
+pub struct FlowSpecRuleCountMutation<'a> {
+    counts: &'a FlowSpecRuleCounts,
+}
+
+impl Drop for FlowSpecRuleCountMutation<'_> {
+    fn drop(&mut self) {
+        self.counts.generation.fetch_add(1, Ordering::Release);
+        self.counts.active_writers.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -539,5 +586,21 @@ mod tests {
 
         drop(first);
         assert_eq!(metrics.rules(), (5, 7));
+    }
+
+    #[test]
+    fn rule_counts_saturate_and_track_mutations() {
+        let counts = FlowSpecRuleCounts::default();
+        counts.add(true, -1);
+        assert_eq!(counts.v4.load(Ordering::Relaxed), 0);
+
+        let generation = counts.recount_generation().unwrap();
+        {
+            let _mutation = counts.begin_mutation();
+            assert!(counts.recount_generation().is_none());
+            counts.add(true, 1);
+        }
+        assert!(!counts.generation_is_quiescent(generation));
+        assert_eq!(counts.v4.load(Ordering::Relaxed), 1);
     }
 }
