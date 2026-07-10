@@ -15,7 +15,7 @@ use routecore::bgp::nlri::afisafi::{AfiSafiNlri, IsPrefix};
 use routecore::bgp::types::AfiSafiType;
 use routecore::bmp::message::PeerType;
 
-use crate::ingress::{IngressId, IngressInfo};
+use crate::ingress::{IngressId, IngressInfo, IngressType};
 use crate::payload::{RotondaPaMap, RotondaRoute};
 use crate::roto_runtime::types::PeerRibType;
 
@@ -158,6 +158,27 @@ impl PeerInfo {
             Some(PeerRibType::Loc) | None => peer_flags |= 0x40,
         }
 
+        let mut peer_capabilities =
+            info.remote_capabilities.clone().unwrap_or_default();
+        if info.ingress_type == Some(IngressType::Mrt) {
+            // MRT records do not carry the OPEN that negotiated their
+            // address families. BMP-out nevertheless has to advertise each
+            // family before replaying MP_REACH_NLRI for it. Advertise every
+            // family the RIB can currently re-emit for synthetic MRT peers;
+            // advertising an unused family is harmless, while omitting one
+            // makes a later UPDATE invalid for downstream BGP consumers.
+            for (afi, safi) in [(2u16, 1u8), (1, 133), (2, 133)] {
+                peer_capabilities.extend_from_slice(&[
+                    1,
+                    4,
+                    afi.to_be_bytes()[0],
+                    afi.to_be_bytes()[1],
+                    0,
+                    safi,
+                ]);
+            }
+        }
+
         PeerInfo {
             peer_type,
             peer_flags,
@@ -174,10 +195,7 @@ impl PeerInfo {
             session_up_time: info.session_up_time.map(|dt| {
                 (dt.timestamp() as u32, dt.timestamp_subsec_micros())
             }),
-            peer_capabilities: info
-                .remote_capabilities
-                .clone()
-                .unwrap_or_default(),
+            peer_capabilities,
             admin_label: None,
         }
     }
@@ -3000,6 +3018,22 @@ mod tests {
             ]
         );
         assert!(!peer.supports_afisafi(AfiSafiType::Ipv6FlowSpec));
+    }
+
+    #[test]
+    fn mrt_peer_advertises_reemittable_mp_families() {
+        let info = IngressInfo::new().with_ingress_type(IngressType::Mrt);
+        let peer = PeerInfo::from_ingress_info(&info);
+
+        assert_eq!(
+            peer.supported_afisafis(),
+            vec![
+                AfiSafiType::Ipv4Unicast,
+                AfiSafiType::Ipv6Unicast,
+                AfiSafiType::Ipv4FlowSpec,
+                AfiSafiType::Ipv6FlowSpec,
+            ]
+        );
     }
 
     /// Two rules sharing one attribute set aggregate into ONE UPDATE with
