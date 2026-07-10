@@ -36,33 +36,79 @@ const MRTGEN_E2E_ROUTES: &str = r#"[
         "prefix": "192.0.2.0/24",
         "nexthop": "198.51.100.1",
         "as_path": [64500, 64496],
-        "standard_communities": ["64500:100"]
+        "origin": "incomplete",
+        "med": 50,
+        "local_pref": 150,
+        "atomic_aggregate": true,
+        "aggregator": "4200000001:203.0.113.9",
+        "originator_id": "198.51.100.9",
+        "cluster_list": ["198.51.100.10", "198.51.100.11"],
+        "standard_communities": ["64500:100", "no-export"],
+        "extended_communities": ["rt:64500:200", "soo:4200000001:300"],
+        "large_communities": ["64500:400:500"]
     },
     {
         "prefix": "2001:db8:100::/48",
         "nexthop": "2001:db8::1",
         "as_path": [64501, 4200000001],
-        "local_pref": 150
+        "origin": "egp",
+        "med": 75,
+        "local_pref": 200,
+        "ipv6_extended_communities": ["rt:2001:db8::5:600"],
+        "large_communities": ["4200000001:700:800"]
+    },
+    {
+        "prefix": "203.0.113.7/32",
+        "nexthop": "198.51.100.2",
+        "as_path": []
+    },
+    {
+        "prefix": "2001:db8::7/128",
+        "nexthop": "2001:db8::2",
+        "as_path": []
     }
 ]"#;
 
-#[tokio::test(flavor = "multi_thread")]
-async fn ingests_mrtgen_file_into_rib() {
+async fn ingest_mrtgen_routes(
+    format: mrtgen::RouteFormat,
+    extension: &str,
+) -> Arc<RibUnitRunner> {
     use crate::comms::{DirectLink, Gate};
     use crate::ingress;
     use crate::units::mrt_file_in::unit::MrtInRunner;
-    use mrtgen::{generate_from_routes, routes_from_json, RouteFormat};
+    use mrtgen::{generate_from_routes, routes_from_json};
+    use std::io::Write;
 
     let routes = routes_from_json(MRTGEN_E2E_ROUTES).unwrap();
-    let corpus = generate_from_routes(
-        &routes,
-        RouteFormat::TableDumpV2,
-        1_700_000_000,
-    )
-    .unwrap();
-    let path = std::env::temp_dir()
-        .join(format!("netom-mrtgen-e2e-{}.mrt", std::process::id()));
-    std::fs::write(&path, &corpus.bytes).unwrap();
+    let corpus =
+        generate_from_routes(&routes, format, 1_700_000_000).unwrap();
+    let path = std::env::temp_dir().join(format!(
+        "netom-mrtgen-e2e-{}.{}",
+        std::process::id(),
+        extension
+    ));
+    match extension {
+        "mrt" => std::fs::write(&path, &corpus.bytes).unwrap(),
+        "gz" => {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut encoder = flate2::write::GzEncoder::new(
+                file,
+                flate2::Compression::default(),
+            );
+            encoder.write_all(&corpus.bytes).unwrap();
+            encoder.finish().unwrap();
+        }
+        "bz2" => {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut encoder = bzip2::write::BzEncoder::new(
+                file,
+                bzip2::Compression::default(),
+            );
+            encoder.write_all(&corpus.bytes).unwrap();
+            encoder.finish().unwrap();
+        }
+        _ => unreachable!(),
+    }
 
     let (mrt_gate, mut mrt_gate_agent) = Gate::new(0);
     let update_gate = mrt_gate.clone();
@@ -89,16 +135,14 @@ async fn ingests_mrtgen_file_into_rib() {
     gate_task.abort();
 
     result.expect("MRT input should reach the RIB through the gate");
-    assert_eq!(
-        rib_runner
-            .rib()
-            .store()
-            .unwrap()
-            .prefixes_count()
-            .in_memory(),
-        2
-    );
+    rib_runner
+}
 
+fn assert_e2e_prefixes(runner: &RibUnitRunner) {
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        4
+    );
     let options = MatchOptions {
         match_type: MatchType::ExactMatch,
         include_withdrawn: false,
@@ -107,11 +151,104 @@ async fn ingests_mrtgen_file_into_rib() {
         mui: None,
         include_history: IncludeHistory::None,
     };
-    for prefix in ["192.0.2.0/24", "2001:db8:100::/48"] {
+    for prefix in [
+        "192.0.2.0/24",
+        "2001:db8:100::/48",
+        "203.0.113.7/32",
+        "2001:db8::7/128",
+    ] {
         let prefix = Prefix::from_str(prefix).unwrap();
-        let result =
-            rib_runner.rib().match_prefix(&prefix, &options).unwrap();
+        let result = runner.rib().match_prefix(&prefix, &options).unwrap();
         assert_eq!(result.records.len(), 1, "missing {prefix} from RIB");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_attributes_into_rib_and_json() {
+    use crate::representation::Json;
+    use crate::units::rib_unit::http_ng::QueryFilter;
+    use routecore::bgp::path_attributes::{
+        AggregatorInfo, ClusterIds, ExtendedCommunitiesList,
+        LargeCommunitiesList,
+    };
+    use routecore::bgp::types::{
+        AtomicAggregate, LocalPref, MultiExitDisc, OriginatorId,
+    };
+
+    let runner =
+        ingest_mrtgen_routes(mrtgen::RouteFormat::TableDumpV2, "mrt").await;
+    assert_e2e_prefixes(&runner);
+
+    let prefix = Prefix::from_str("192.0.2.0/24").unwrap();
+    let record = stored_record(&runner, &prefix);
+    let attrs = record.meta.path_attributes();
+    assert_eq!(attrs.get::<MultiExitDisc>().unwrap().0, 50);
+    assert_eq!(attrs.get::<LocalPref>().unwrap().0, 150);
+    assert!(attrs.get::<AtomicAggregate>().is_some());
+    assert_eq!(
+        attrs.get::<AggregatorInfo>().unwrap().asn().into_u32(),
+        4_200_000_001
+    );
+    assert_eq!(
+        attrs.get::<OriginatorId>().unwrap().0.to_string(),
+        "198.51.100.9"
+    );
+    assert_eq!(attrs.get::<ClusterIds>().unwrap().len(), 2);
+    assert_eq!(
+        attrs
+            .get::<StandardCommunitiesList>()
+            .unwrap()
+            .communities()
+            .len(),
+        2
+    );
+    assert_eq!(
+        attrs
+            .get::<ExtendedCommunitiesList>()
+            .unwrap()
+            .communities()
+            .len(),
+        2
+    );
+    assert_eq!(
+        attrs
+            .get::<LargeCommunitiesList>()
+            .unwrap()
+            .communities()
+            .len(),
+        1
+    );
+
+    let mut json = Vec::new();
+    runner
+        .rib()
+        .search_and_output_routes(
+            Json(&mut json),
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            QueryFilter::default(),
+        )
+        .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(json["data"]["nlri"], "192.0.2.0/24");
+    assert_eq!(json["data"]["routes"][0]["status"], "active");
+    assert!(json["data"]["routes"][0]["pathAttributes"].is_array());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_bgp4mp_updates() {
+    let runner =
+        ingest_mrtgen_routes(mrtgen::RouteFormat::Bgp4mp, "mrt").await;
+    assert_e2e_prefixes(&runner);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_compressed_mrtgen_files() {
+    for extension in ["gz", "bz2"] {
+        let runner =
+            ingest_mrtgen_routes(mrtgen::RouteFormat::TableDumpV2, extension)
+                .await;
+        assert_e2e_prefixes(&runner);
     }
 }
 
