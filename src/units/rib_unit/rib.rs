@@ -45,7 +45,8 @@ use crate::{
 };
 
 use super::flowspec::{
-    FlowSpecQueryRow, FlowSpecRuleSet, FlowSpecStore, FlowSpecValidity,
+    FlowSpecQueryRow, FlowSpecRuleCounts, FlowSpecRuleSet, FlowSpecStore,
+    FlowSpecValidity,
 };
 use super::{http_ng::Include, QueryFilter};
 
@@ -155,6 +156,7 @@ pub struct Rib {
     /// or the family default route for rules without a usable one. The
     /// record value per `(prefix, mui)` is a whole [`FlowSpecRuleSet`] blob.
     flowspec: Arc<Option<FlowSpecStore>>,
+    flowspec_rule_counts: Arc<FlowSpecRuleCounts>,
     pub(crate) ingress_register: Arc<ingress::Register>,
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
@@ -188,10 +190,13 @@ impl Rib {
         roto_package: Option<Arc<RotoPackage>>,
         roto_context: Arc<Mutex<Ctx>>,
     ) -> Result<Self, PrefixStoreError> {
+        let flowspec_rule_counts =
+            super::flowspec::flowspec_metrics().register_rule_counts();
         Ok(Rib {
             unicast: Arc::new(Some(Store::try_default()?)),
             multicast: Arc::new(Some(Store::try_default()?)),
             flowspec: Arc::new(Some(FlowSpecStore::try_default()?)),
+            flowspec_rule_counts,
             ingress_register,
             roto_package,
             roto_context,
@@ -551,24 +556,28 @@ impl Rib {
                 // Unknown rule (or peer) — nothing to withdraw.
                 return Ok(no_op);
             }
-            metrics.add_rules(is_v4, -1);
             let (status, ltime) = if ruleset.is_empty() {
                 (RouteStatus::Withdrawn, ltime)
             } else {
                 (RouteStatus::Active, ltime)
             };
             let pubrec = Record::new(mui, ltime, status, ruleset);
-            return store.insert(&key, pubrec, None);
+            let report = store.insert(&key, pubrec, None);
+            if report.is_ok() {
+                self.flowspec_rule_counts.add(is_v4, -1);
+            }
+            return report;
         }
         metrics.note_update(is_v4, false);
 
         let validity = self.validate_flowspec(nlri_raw, is_v4, mui);
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
-        if !replaced {
-            metrics.add_rules(is_v4, 1);
-        }
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
-        store.insert(&key, pubrec, None)
+        let report = store.insert(&key, pubrec, None);
+        if report.is_ok() && !replaced {
+            self.flowspec_rule_counts.add(is_v4, 1);
+        }
+        report
     }
 
     /// RFC 8955 §6 validation of one FlowSpec rule. The result stored at
@@ -680,7 +689,7 @@ impl Rib {
                 }
             }
         }
-        super::flowspec::flowspec_metrics().set_rules(v4, v6);
+        self.flowspec_rule_counts.set(v4, v6);
     }
 
     fn insert_prefix(

@@ -27,7 +27,7 @@ use rotonda_store::rib::config::MemoryOnlyConfig;
 use rotonda_store::rib::StarCastRib;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use crate::metrics;
 use crate::payload::RotondaPaMap;
@@ -313,16 +313,36 @@ pub fn decode_actions(pamap: &RotondaPaMap) -> Vec<String> {
 /// Process-global FlowSpec accounting, modeled on `UnsupportedNlriMetrics`:
 /// held alive by a `LazyLock`, registered once in the manager.
 #[derive(Debug, Default)]
+pub struct FlowSpecRuleCounts {
+    v4: AtomicU64,
+    v6: AtomicU64,
+}
+
+impl FlowSpecRuleCounts {
+    pub fn add(&self, is_v4: bool, delta: i64) {
+        let gauge = if is_v4 { &self.v4 } else { &self.v6 };
+        if delta >= 0 {
+            gauge.fetch_add(delta as u64, Ordering::Relaxed);
+        } else {
+            gauge.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn set(&self, v4: u64, v6: u64) {
+        self.v4.store(v4, Ordering::Relaxed);
+        self.v6.store(v6, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Default)]
 pub struct FlowSpecMetrics {
     pub v4_announced: AtomicU64,
     pub v4_withdrawn: AtomicU64,
     pub v6_announced: AtomicU64,
     pub v6_withdrawn: AtomicU64,
-    /// Stored-rule gauges. Delta-maintained by `insert_flowspec` and
-    /// recounted (cheap at flowspec scale) after whole-mui removal and
-    /// compaction, so GC cannot make them drift.
-    pub v4_rules: AtomicU64,
-    pub v6_rules: AtomicU64,
+    /// Per-RIB stored-rule contributions. The hot path updates only its local
+    /// atomics; collection sums live RIBs and prunes dropped ones.
+    rule_counts: Mutex<Vec<Weak<FlowSpecRuleCounts>>>,
 }
 
 impl FlowSpecMetrics {
@@ -336,18 +356,31 @@ impl FlowSpecMetrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub fn add_rules(&self, is_v4: bool, delta: i64) {
-        let gauge = if is_v4 { &self.v4_rules } else { &self.v6_rules };
-        if delta >= 0 {
-            gauge.fetch_add(delta as u64, Ordering::Relaxed);
-        } else {
-            gauge.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
-        }
+    pub fn register_rule_counts(&self) -> Arc<FlowSpecRuleCounts> {
+        let counts = Arc::new(FlowSpecRuleCounts::default());
+        self.rule_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(Arc::downgrade(&counts));
+        counts
     }
 
-    pub fn set_rules(&self, v4: u64, v6: u64) {
-        self.v4_rules.store(v4, Ordering::Relaxed);
-        self.v6_rules.store(v6, Ordering::Relaxed);
+    fn rules(&self) -> (u64, u64) {
+        let mut counts = self
+            .rule_counts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut v4 = 0u64;
+        let mut v6 = 0u64;
+        counts.retain(|weak| {
+            let Some(count) = weak.upgrade() else {
+                return false;
+            };
+            v4 = v4.saturating_add(count.v4.load(Ordering::Relaxed));
+            v6 = v6.saturating_add(count.v6.load(Ordering::Relaxed));
+            true
+        });
+        (v4, v6)
     }
 }
 
@@ -391,13 +424,14 @@ impl metrics::Source for FlowSpecMetrics {
         });
 
         target.append(&RULES_METRIC, None, |records| {
+            let (v4, v6) = self.rules();
             records.label_value(
                 &[("afi", "ipv4")],
-                self.v4_rules.load(Ordering::Relaxed),
+                v4,
             );
             records.label_value(
                 &[("afi", "ipv6")],
-                self.v6_rules.load(Ordering::Relaxed),
+                v6,
             );
         });
     }
@@ -492,5 +526,18 @@ mod tests {
         // remove on hostile bytes
         let mut rs = FlowSpecRuleSet::from(vec![9, 1, 2, 3]);
         assert!(!rs.remove(&[1, 2]));
+    }
+
+    #[test]
+    fn metrics_sum_live_rib_rule_counts() {
+        let metrics = FlowSpecMetrics::default();
+        let first = metrics.register_rule_counts();
+        let second = metrics.register_rule_counts();
+        first.set(2, 3);
+        second.set(5, 7);
+        assert_eq!(metrics.rules(), (7, 10));
+
+        drop(first);
+        assert_eq!(metrics.rules(), (5, 7));
     }
 }
