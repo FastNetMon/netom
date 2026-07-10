@@ -519,16 +519,20 @@ impl Rib {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
         // A withdrawn MUI may still own the previous session's records when
-        // withdrawn attributes are retained.  Clearing the global withdrawn
-        // bit would make every one of those records active again.  Drop the
-        // old session first; the current announcement then starts a clean
-        // Adj-RIB-In for this ingress.
+        // withdrawn attributes are retained. Clearing the family-wide bit
+        // would make those records active again, so empty only this FlowSpec
+        // family before accepting its first new announcement. Do not use the
+        // whole-ingress removal path here: a family-scoped withdrawal must
+        // not erase unrelated unicast, multicast, or opposite-family routes.
         if route_status == RouteStatus::Active
-            && (store.mui_is_withdrawn_v4(mui)
-                || store.mui_is_withdrawn_v6(mui))
+            && if key.is_v4() {
+                store.mui_is_withdrawn_v4(mui)
+            } else {
+                store.mui_is_withdrawn_v6(mui)
+            }
         {
             // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
-            self.remove_for_ingresses(&[mui]);
+            self.reset_flowspec_family(store, mui, key.is_v4())?;
             self.ingress_register.update_info(
                 mui,
                 ingress::IngressInfo::new()
@@ -578,6 +582,52 @@ impl Rib {
             self.flowspec_rule_counts.add(is_v4, 1);
         }
         report
+    }
+
+    /// Remove retained rules for one FlowSpec family and make that family's
+    /// withdrawn-MUI bitmap active again. The caller holds `flowspec_lock`.
+    fn reset_flowspec_family(
+        &self,
+        store: &FlowSpecStore,
+        mui: IngressId,
+        is_v4: bool,
+    ) -> Result<(), PrefixStoreError> {
+        let _guard = self
+            .withdraw_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys: Vec<Prefix> = if is_v4 {
+            store.prefixes_keys_iter_v4().collect()
+        } else {
+            store.prefixes_keys_iter_v6().collect()
+        };
+
+        for key in keys {
+            let owns_key = store
+                .get_records_for_prefix(&key, Some(mui), true)
+                .map_err(|_| PrefixStoreError::StoreNotReadyError)?
+                .is_some_and(|records| {
+                    records.iter().any(|record| record.multi_uniq_id == mui)
+                });
+            if owns_key {
+                store.insert(
+                    &key,
+                    Record::new(
+                        mui,
+                        0,
+                        RouteStatus::Withdrawn,
+                        FlowSpecRuleSet::default(),
+                    ),
+                    None,
+                )?;
+            }
+        }
+
+        if is_v4 {
+            store.mark_mui_as_active_v4(mui)
+        } else {
+            store.mark_mui_as_active_v6(mui)
+        }
     }
 
     /// RFC 8955 §6 validation of one FlowSpec rule. The result stored at
@@ -3472,6 +3522,13 @@ mod tests {
         let rib = test_rib();
         let mui: IngressId = 9;
         let rule = mk_flowspec_v4(FS_DST_PROTO);
+        let unicast_prefix = Prefix::from_str("10.0.0.0/16").unwrap();
+        let unicast = RotondaRoute::Ipv4Unicast(
+            unicast_prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(&unicast, RouteStatus::Active, 1, mui, false, false)
+            .unwrap();
         rib.insert(&rule, RouteStatus::Active, 1, mui, false, false)
             .unwrap();
         assert_eq!(flowspec_rows(&rib).len(), 1);
@@ -3489,6 +3546,16 @@ mod tests {
         rib.insert(&rule, RouteStatus::Active, 2, mui, false, false)
             .unwrap();
         assert_eq!(flowspec_rows(&rib).len(), 1);
+        let unicast_records = rib
+            .store()
+            .unwrap()
+            .get_records_for_prefix(&unicast_prefix, Some(mui), false)
+            .unwrap()
+            .unwrap();
+        assert!(unicast_records.iter().any(|record| {
+            record.multi_uniq_id == mui
+                && record.status == RouteStatus::Active
+        }));
 
         // Family-agnostic peer-down (None) also covers flowspec.
         rib.withdraw_for_ingress(mui, None, true);
