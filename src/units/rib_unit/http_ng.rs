@@ -352,6 +352,52 @@ struct FlowSpecRow {
 const MAX_FLOWSPEC_HTTP_ROWS: usize = 10_000;
 const MAX_FLOWSPEC_HTTP_RAW_BYTES: usize = 16 * 1024 * 1024;
 
+fn check_flowspec_filter(filter: &QueryFilter) -> Result<(), ApiError> {
+    let mut unsupported = Vec::new();
+    if filter.origin_asn.is_some() {
+        unsupported.push("filter[originAsn]");
+    }
+    if filter.otc.is_some() {
+        unsupported.push("filter[otc]");
+    }
+    if filter.community.is_some() {
+        unsupported.push("filter[community]");
+    }
+    if filter.large_community.is_some() {
+        unsupported.push("filter[largeCommunity]");
+    }
+    if filter.rib_type.is_some() {
+        unsupported.push("filter[ribType]");
+    }
+    if filter.rov_status.is_some() {
+        unsupported.push("filter[rovStatus]");
+    }
+    if filter.peer_asn.is_some() {
+        unsupported.push("filter[peerAsn]");
+    }
+    if filter.peer_addr.is_some() {
+        unsupported.push("filter[peerAddress]");
+    }
+    if filter.fields_path_attributes.is_some() {
+        unsupported.push("fields[pathAttributes]");
+    }
+    if filter.roto_function.is_some() {
+        unsupported.push("function[roto]");
+    }
+    if filter.format != OutputFormat::Json {
+        unsupported.push("format");
+    }
+
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::BadRequest(format!(
+            "unsupported FlowSpec query parameter(s): {}",
+            unsupported.join(", ")
+        )))
+    }
+}
+
 fn build_flowspec_response(
     rib: std::sync::Arc<super::rib::Rib>,
     family_v4: bool,
@@ -427,6 +473,7 @@ async fn flowspec_response(
     prefix: Option<Prefix>,
     filter: QueryFilter,
 ) -> Result<axum::response::Response, ApiError> {
+    check_flowspec_filter(&filter)?;
     let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
         ApiError::ServiceUnavailable(
             "too many concurrent RIB queries in progress; retry shortly"
@@ -627,4 +674,27 @@ async fn search_ipv6unicast_all(
 ) -> Result<impl IntoResponse, ApiError> {
     filter.enable_more_specifics();
     search_ipv6unicast(Path((0.into(), 0)), filter, state).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flowspec_filters_are_either_applied_or_rejected() {
+        assert!(check_flowspec_filter(&QueryFilter::default()).is_ok());
+
+        let unsupported = QueryFilter {
+            origin_asn: Some(Asn::from_u32(64500)),
+            format: OutputFormat::Jsonl,
+            ..QueryFilter::default()
+        };
+        let Err(ApiError::BadRequest(message)) =
+            check_flowspec_filter(&unsupported)
+        else {
+            panic!("unsupported FlowSpec filters must return BadRequest");
+        };
+        assert!(message.contains("filter[originAsn]"));
+        assert!(message.contains("format"));
+    }
 }
