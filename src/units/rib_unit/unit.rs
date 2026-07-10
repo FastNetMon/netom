@@ -532,23 +532,24 @@ impl RibUnitRunner {
         }
     }
 
-    /// Run `Rib::mark_ingress_active` on the blocking pool.
+    /// Drop records retained from an ingress's previous session on the
+    /// blocking pool before accepting the new session's Adj-RIB-In.
     ///
     /// Same rationale as `signal_withdraws_blocking`: it walks the same
     /// roaring bitmap atomic and serialises through `withdraw_lock`, so
     /// running it inline on a tokio worker can stall the pipeline while
     /// waiting for the lock and/or while doing the bitmap walk itself.
-    async fn mark_ingress_active_blocking(
+    async fn reset_ingress_blocking(
         &self,
         ingress_id: ingress::IngressId,
     ) {
         let rib = self.rib.load().clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            rib.mark_ingress_active(ingress_id);
+            rib.remove_for_ingresses(&[ingress_id]);
         })
         .await
         {
-            error!("mark_ingress_active blocking task failed: {}", e);
+            error!("reset ingress blocking task failed: {}", e);
         }
     }
 
@@ -801,13 +802,10 @@ impl RibUnitRunner {
 
             Update::IngressReappeared(ingress_id) => {
                 debug!("Got IngressReappeared for {ingress_id}");
-                self.mark_ingress_active_blocking(ingress_id).await;
-                // FIX B: the store was reactivated above, but the register may
-                // still carry the Disconnected state set on teardown. Restore
-                // it to Connected so consumers that enumerate peers by register
-                // state (e.g. bmp_tcp_out's dump) see this peer again. Mirrors
-                // the teardown's `update_info(.., with_state(Disconnected))`;
-                // `update_info` merges, so only the state field changes.
+                self.reset_ingress_blocking(ingress_id).await;
+                // The register may still carry the Disconnected state set on
+                // teardown. Restore it after dropping the previous session's
+                // retained RIB records.
                 self.ingress_register.update_info(
                     ingress_id,
                     ingress::IngressInfo::new().with_state(

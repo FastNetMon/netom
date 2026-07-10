@@ -160,8 +160,9 @@ pub struct Rib {
     roto_context: Arc<Mutex<Ctx>>,
     path_attribute_interner: Arc<PathAttributeInterner>,
     // Serialises every writer to the per-store `withdrawn_muis_bmin`
-    // roaring bitmap: `withdraw_for_ingress` (mark_mui_as_withdrawn) AND
-    // `mark_ingress_active` (mark_mui_as_active). rotonda-store 0.5.0's
+    // roaring bitmap: `withdraw_for_ingress` (mark_mui_as_withdrawn) and
+    // `remove_for_ingresses` (`remove_mui` marks the MUI active).
+    // rotonda-store 0.5.0's
     // `TreeBitMap::update_withdrawn_muis_bmin` has a CAS retry loop that
     // never reloads its `expected` value, so any concurrent writer that
     // loses a CAS race livelocks indefinitely. Holding this mutex around
@@ -512,6 +513,24 @@ impl Rib {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
+        // A withdrawn MUI may still own the previous session's records when
+        // withdrawn attributes are retained.  Clearing the global withdrawn
+        // bit would make every one of those records active again.  Drop the
+        // old session first; the current announcement then starts a clean
+        // Adj-RIB-In for this ingress.
+        if route_status == RouteStatus::Active
+            && (store.mui_is_withdrawn_v4(mui)
+                || store.mui_is_withdrawn_v6(mui))
+        {
+            // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
+            self.remove_for_ingresses(&[mui]);
+            self.ingress_register.update_info(
+                mui,
+                ingress::IngressInfo::new()
+                    .with_state(ingress::register::IngressState::Connected),
+            );
+        }
+
         let mut ruleset = store
             .get_records_for_prefix(&key, Some(mui), true)
             .map_err(|_| PrefixStoreError::StoreNotReadyError)?
@@ -542,23 +561,6 @@ impl Rib {
             return store.insert(&key, pubrec, None);
         }
         metrics.note_update(is_v4, false);
-
-        // Mirror insert_prefix's reactivation of a mui flagged withdrawn in
-        // the store-global bitmap (e.g. a peer that reconnected): without
-        // this the fresh rules would be masked as withdrawn.
-        if route_status == RouteStatus::Active
-            && (store.mui_is_withdrawn_v4(mui)
-                || store.mui_is_withdrawn_v6(mui))
-        {
-            // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
-            self.mark_ingress_active(mui);
-            self.ingress_register.update_info(
-                mui,
-                ingress::IngressInfo::new().with_state(
-                    ingress::register::IngressState::Connected,
-                ),
-            );
-        }
 
         let validity = self.validate_flowspec(nlri_raw, is_v4, mui);
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
@@ -743,33 +745,19 @@ impl Rib {
             });
         }
 
-        // A reused mui (e.g. a synthesized peer whose session reconnected,
-        // or any peer that rebinds) may still be flagged withdrawn in the
-        // store's global `withdrawn_muis_bmin` from its previous teardown. A
-        // plain insert does not clear that flag, so the re-announced routes
-        // would be masked as withdrawn (the global flag overrides the local
-        // record status). Clear it on the first active (re)announcement.
-        // `mui_is_withdrawn_*` is a cheap lock-free bitmap check; the
-        // lock-taking `mark_ingress_active` only fires on the rare
-        // withdrawn->active transition, after which subsequent routes for this
-        // mui see it already active.
+        // A reused MUI may still own retained records from its previous
+        // session.  Merely clearing the global withdrawn bit would resurrect
+        // all of them, including prefixes not announced in the new session.
+        // Remove the old session on the first active announcement instead.
         if route_status == RouteStatus::Active
-            && (store.mui_is_withdrawn_v4(mui) || store.mui_is_withdrawn_v6(mui))
+            && (store.mui_is_withdrawn_v4(mui)
+                || store.mui_is_withdrawn_v6(mui))
         {
-            self.mark_ingress_active(mui);
-            // FIX B: this is the reactivation path the synthesized CHILD peers
-            // take (not Update::IngressReappeared). The store is now active but
-            // the register may still hold the Disconnected state set on the
-            // previous teardown, which makes register-state-filtered consumers
-            // (bmp_tcp_out's full-RIB dump) skip this peer's active routes.
-            // Restore it to Connected. Guarded by the same withdrawn->active
-            // transition as `mark_ingress_active`, so it stays off the
-            // per-route hot path. `update_info` merges, so only state changes.
+            self.remove_for_ingresses(&[mui]);
             self.ingress_register.update_info(
                 mui,
-                ingress::IngressInfo::new().with_state(
-                    ingress::register::IngressState::Connected,
-                ),
+                ingress::IngressInfo::new()
+                    .with_state(ingress::register::IngressState::Connected),
             );
         }
 
@@ -959,11 +947,10 @@ impl Rib {
     /// reclaiming their memory — as opposed to `withdraw_for_ingresses`, which
     /// only marks them withdrawn (a status bit) and keeps the records around.
     ///
-    /// This is for ids that are gone for good: synthesized BMP peers that mint
-    /// a fresh ingress id every session and never rebind, so mark-withdraw
-    /// would leak one record slot per announced prefix forever. Disconnected
-    /// parents that may reappear must keep going through
-    /// `withdraw_for_ingresses` instead.
+    /// This is used both for ids that are gone for good and to discard a
+    /// retained previous session before reusing an id. Synthesized BMP peers
+    /// that mint a fresh ingress id every session must take this path so
+    /// mark-withdraw does not leak one record slot per announced prefix.
     pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
         if ids.is_empty() {
             return;
@@ -1311,60 +1298,6 @@ impl Rib {
             added += 1;
         }
         added
-    }
-
-    pub fn mark_ingress_active(&self, ingress_id: IngressId) {
-        // Same hazard as `withdraw_for_ingress`: `mark_mui_as_active_*`
-        // walks `update_withdrawn_muis_bmin`, whose CAS retry loop
-        // livelocks under concurrent writers. Serialise with the
-        // withdraw path.
-        let _guard = self
-            .withdraw_lock
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Err(e) = (*self.unicast)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v4(ingress_id)
-        {
-            error!("failed to mark MUI as active in unicast v4 rib: {e}")
-        }
-        if let Err(e) = (*self.unicast)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v6(ingress_id)
-        {
-            error!("failed to mark MUI as active in unicast v6 rib: {e}")
-        }
-        if let Err(e) = (*self.multicast)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v4(ingress_id)
-        {
-            error!("failed to mark MUI as active in multicast v4 rib: {e}")
-        }
-        if let Err(e) = (*self.multicast)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v6(ingress_id)
-        {
-            error!("failed to mark MUI as active in multicast v6 rib: {e}")
-        }
-        if let Err(e) = (*self.flowspec)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v4(ingress_id)
-        {
-            error!("failed to mark MUI as active in flowspec v4 rib: {e}")
-        }
-        if let Err(e) = (*self.flowspec)
-            .as_ref()
-            .unwrap()
-            .mark_mui_as_active_v6(ingress_id)
-        {
-            error!("failed to mark MUI as active in flowspec v6 rib: {e}")
-        }
-        self.recount_flowspec_rules();
     }
 
     /// Layer C garbage-collection sweep. Reclaims two kinds of idle BMP
@@ -3527,5 +3460,30 @@ mod tests {
         // Family-agnostic peer-down (None) also covers flowspec.
         rib.withdraw_for_ingress(mui, None, true);
         assert!(flowspec_rows(&rib).is_empty());
+    }
+
+    #[test]
+    fn flowspec_reconnect_does_not_resurrect_unannounced_rules() {
+        let rib = test_rib();
+        let mui: IngressId = 10;
+        let rule_a = mk_flowspec_v4(FS_DST_PROTO);
+        let rule_b = mk_flowspec_v4(FS_DST_DPORT);
+
+        rib.insert(&rule_a, RouteStatus::Active, 1, mui, true, false)
+            .unwrap();
+        rib.insert(&rule_b, RouteStatus::Active, 2, mui, true, false)
+            .unwrap();
+        assert_eq!(flowspec_rows(&rib).len(), 2);
+
+        rib.withdraw_for_ingress(mui, None, true);
+        assert!(flowspec_rows(&rib).is_empty());
+
+        // The new session announces only A. B belongs to the old session
+        // and must remain gone when the MUI is made active again.
+        rib.insert(&rule_a, RouteStatus::Active, 3, mui, true, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rule.nlri, FS_DST_PROTO);
     }
 }
