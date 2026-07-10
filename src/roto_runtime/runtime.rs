@@ -357,10 +357,34 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
     }
 
     /// Return a formatted string for the prefix
+    ///
+    /// For FlowSpec routes this is the rule's destination-prefix component
+    /// when one is usable as a key, else the family default route
+    /// (`0.0.0.0/0` / `::/0`) — the same prefix the rule is keyed on in
+    /// the RIB.
     #[roto_method(rt, MutRotondaRoute, fmt_prefix)]
     fn rr_fmt_prefix(rr: Val<MutRotondaRoute>) -> Arc<str> {
         let rr = rr.borrow();
         rr.index_prefix().to_string().into()
+    }
+
+    /// Whether this `RotondaRoute` is a FlowSpec rule (SAFI 133)
+    #[roto_method(rt, MutRotondaRoute, is_flowspec)]
+    fn rr_is_flowspec(rr: Val<MutRotondaRoute>) -> bool {
+        let rr = rr.borrow();
+        rr.is_flowspec()
+    }
+
+    /// Return the human-readable FlowSpec rule, or an empty string for
+    /// non-FlowSpec routes
+    #[roto_method(rt, MutRotondaRoute, fmt_flowspec)]
+    fn rr_fmt_flowspec(rr: Val<MutRotondaRoute>) -> Arc<str> {
+        let rr = rr.borrow();
+        match &*rr {
+            RotondaRoute::Ipv4FlowSpec(n, ..) => n.to_string().into(),
+            RotondaRoute::Ipv6FlowSpec(n, ..) => n.to_string().into(),
+            _ => "".into(),
+        }
     }
 
     /// Return a formatted string for the ROV status

@@ -117,6 +117,14 @@ filter rib_in_pre(
     ingress_info: IngressInfo,
 ) {
 
+    # FlowSpec rules (SAFI 133) pass through here like any other route.
+    # route.prefix() is the rule's destination-prefix component (or the
+    # family default route when it has none), and route.fmt_flowspec()
+    # renders the full match (e.g. "dst 10.0.1.0/24, proto =17").
+    if route.is_flowspec() {
+        output.log_custom(133, 0);
+    }
+
     if prefix_lists.contains("my_prefixes", route.prefix()) {
         output.log_prefix(route.prefix());
     }

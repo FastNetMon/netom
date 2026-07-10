@@ -560,13 +560,97 @@ impl Rib {
             );
         }
 
-        let replaced =
-            ruleset.upsert(nlri_raw, pamap, FlowSpecValidity::NotValidated);
+        let validity = self.validate_flowspec(nlri_raw, is_v4, mui);
+        let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         if !replaced {
             metrics.add_rules(is_v4, 1);
         }
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         store.insert(&key, pubrec, None)
+    }
+
+    /// RFC 8955 §6 validation of one FlowSpec rule, evaluated at insert
+    /// time only (validity is NOT re-evaluated when the unicast RIB later
+    /// changes — documented staleness). Never rejects: a monitor wants to
+    /// SEE invalid rules, so the result is stored on the rule and surfaced
+    /// via the HTTP API.
+    ///
+    /// Collector semantics: per-peer mui identity stands in for
+    /// "originator", and the peer's remote ASN (ingress register) stands
+    /// in for the neighboring AS.
+    ///
+    /// * no usable destination prefix (absent component, or RFC 8956
+    ///   offset != 0) -> `Unvalidatable`;
+    /// * (a) the best-match unicast route for the destination prefix must
+    ///   have an Active record from the same peer;
+    /// * (b) no more-specific unicast route may come from a peer with a
+    ///   different remote ASN (only checked when both ASNs are known).
+    fn validate_flowspec(
+        &self,
+        nlri_raw: &[u8],
+        is_v4: bool,
+        ingress_id: IngressId,
+    ) -> FlowSpecValidity {
+        let Some(nlri) = super::flowspec::parse_raw_nlri(nlri_raw, is_v4)
+        else {
+            return FlowSpecValidity::Unvalidatable;
+        };
+        let Some(dst) = nlri.dst_prefix() else {
+            return FlowSpecValidity::Unvalidatable;
+        };
+        let Some(store) = (*self.unicast).as_ref() else {
+            return FlowSpecValidity::NotValidated;
+        };
+
+        let guard = &epoch::pin();
+        let match_options = MatchOptions {
+            match_type: rotonda_store::match_options::MatchType::LongestMatch,
+            include_withdrawn: false,
+            include_less_specifics: false,
+            include_more_specifics: true,
+            mui: None,
+            include_history:
+                rotonda_store::match_options::IncludeHistory::None,
+        };
+        let Ok(res) = store.match_prefix(&dst, &match_options, guard) else {
+            return FlowSpecValidity::NotValidated;
+        };
+
+        // (a) originator check on the best-match unicast route.
+        let best_match_ok = res.prefix.is_some()
+            && res.records.iter().any(|r| {
+                r.multi_uniq_id == ingress_id
+                    && r.status != RouteStatus::Withdrawn
+            });
+        if !best_match_ok {
+            return FlowSpecValidity::Invalid;
+        }
+
+        // (b) more-specifics from a different neighboring AS.
+        let our_asn = self
+            .ingress_register
+            .get(ingress_id)
+            .and_then(|info| info.remote_asn);
+        if let (Some(our_asn), Some(more_specifics)) =
+            (our_asn, res.more_specifics.as_ref())
+        {
+            for pr in more_specifics.iter() {
+                for r in pr.meta.iter() {
+                    if r.status == RouteStatus::Withdrawn {
+                        continue;
+                    }
+                    let other_asn = self
+                        .ingress_register
+                        .get(r.multi_uniq_id)
+                        .and_then(|info| info.remote_asn);
+                    if matches!(other_asn, Some(asn) if asn != our_asn) {
+                        return FlowSpecValidity::Invalid;
+                    }
+                }
+            }
+        }
+
+        FlowSpecValidity::Valid
     }
 
     /// Recount the stored-rule gauges by walking the (small) flowspec
@@ -3329,6 +3413,92 @@ mod tests {
             .query_flowspec(true, Some(key), true, false, None)
             .unwrap();
         assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn flowspec_validation_states() {
+        let rib = test_rib();
+        let reg = rib.ingress_register.clone();
+        let peer_a = reg.register();
+        let peer_b = reg.register();
+        reg.update_info(
+            peer_a,
+            IngressInfo::new().with_remote_asn(Asn::from_u32(65001)),
+        );
+        reg.update_info(
+            peer_b,
+            IngressInfo::new().with_remote_asn(Asn::from_u32(65002)),
+        );
+
+        // Best-match unicast route for the rules' dst prefix, from peer A.
+        let uni = RotondaRoute::Ipv4Unicast(
+            Prefix::from_str("10.0.0.0/16").unwrap().try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(&uni, RouteStatus::Active, 1, peer_a, false, false)
+            .unwrap();
+
+        let rule = mk_flowspec_v4(FS_DST_PROTO); // dst 10.0.1.0/24
+
+        // (a) satisfied: same peer as the best-match unicast route.
+        rib.insert(&rule, RouteStatus::Active, 2, peer_a, false, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rule.validity, FlowSpecValidity::Valid);
+
+        // (a) violated: rule from a peer that does not hold the best-match
+        // unicast route.
+        rib.insert(&rule, RouteStatus::Active, 3, peer_b, false, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        let b_row = rows
+            .iter()
+            .find(|r| r.ingress_id == peer_b)
+            .expect("rule from peer B stored");
+        assert_eq!(b_row.rule.validity, FlowSpecValidity::Invalid);
+        // ... but it IS stored: invalid rules are the interesting signal.
+
+        // No destination prefix component: unvalidatable, keyed at 0/0.
+        let nodst = mk_flowspec_v4(FS_NO_DST);
+        rib.insert(&nodst, RouteStatus::Active, 4, peer_a, false, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        let nodst_row = rows
+            .iter()
+            .find(|r| r.key_prefix.len() == 0)
+            .expect("no-dst rule stored");
+        assert_eq!(
+            nodst_row.rule.validity,
+            FlowSpecValidity::Unvalidatable
+        );
+
+        // (b) violated: a more-specific unicast route from a different
+        // neighboring AS invalidates the rule on (re-)announcement.
+        let more_specific = RotondaRoute::Ipv4Unicast(
+            Prefix::from_str("10.0.1.128/25")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(
+            &more_specific,
+            RouteStatus::Active,
+            5,
+            peer_b,
+            false,
+            false,
+        )
+        .unwrap();
+        rib.insert(&rule, RouteStatus::Active, 6, peer_a, false, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        let a_row = rows
+            .iter()
+            .find(|r| r.ingress_id == peer_a && r.key_prefix.len() == 24)
+            .expect("rule from peer A stored");
+        assert_eq!(a_row.rule.validity, FlowSpecValidity::Invalid);
     }
 
     #[test]
