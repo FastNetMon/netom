@@ -571,11 +571,10 @@ impl Rib {
         store.insert(&key, pubrec, None)
     }
 
-    /// RFC 8955 §6 validation of one FlowSpec rule, evaluated at insert
-    /// time only (validity is NOT re-evaluated when the unicast RIB later
-    /// changes — documented staleness). Never rejects: a monitor wants to
-    /// SEE invalid rules, so the result is stored on the rule and surfaced
-    /// via the HTTP API.
+    /// RFC 8955 §6 validation of one FlowSpec rule. The result stored at
+    /// insert time is a snapshot; `query_flowspec` refreshes it against the
+    /// current unicast RIB before exposing it. Never rejects: a monitor wants
+    /// to SEE invalid rules.
     ///
     /// Collector semantics: per-peer mui identity stands in for
     /// "originator", and the peer's remote ASN (ingress register) stands
@@ -1745,6 +1744,25 @@ impl Rib {
                     }
                 }
             }
+        }
+
+        // Validation depends on destination prefix and origin peer, not on
+        // the rule's remaining traffic-match components. Refresh only the
+        // rows being returned and share the result among rules with the same
+        // (key, peer). This keeps all revalidation off the unicast ingest hot
+        // path and bounds work to one lookup per distinct pair in the query.
+        let mut validity_cache:
+            HashMap<(Prefix, IngressId), FlowSpecValidity> = HashMap::new();
+        for row in &mut rows {
+            let cache_key = (row.key_prefix, row.ingress_id);
+            let validity = *validity_cache.entry(cache_key).or_insert_with(|| {
+                self.validate_flowspec(
+                    &row.rule.nlri,
+                    family_v4,
+                    row.ingress_id,
+                )
+            });
+            row.rule.validity = validity;
         }
         Ok(rows)
     }
@@ -3363,19 +3381,27 @@ mod tests {
             IngressInfo::new().with_remote_asn(Asn::from_u32(65002)),
         );
 
+        let rule = mk_flowspec_v4(FS_DST_PROTO); // dst 10.0.1.0/24
+
+        // A FlowSpec rule can arrive before its covering unicast route during
+        // a dump. It is initially invalid, then becomes valid on the next
+        // query without requiring a FlowSpec re-announcement.
+        rib.insert(&rule, RouteStatus::Active, 1, peer_a, false, false)
+            .unwrap();
+        assert_eq!(
+            flowspec_rows(&rib)[0].rule.validity,
+            FlowSpecValidity::Invalid
+        );
+
         // Best-match unicast route for the rules' dst prefix, from peer A.
         let uni = RotondaRoute::Ipv4Unicast(
             Prefix::from_str("10.0.0.0/16").unwrap().try_into().unwrap(),
             RotondaPaMap::empty_path_attributes(),
         );
-        rib.insert(&uni, RouteStatus::Active, 1, peer_a, false, false)
+        rib.insert(&uni, RouteStatus::Active, 2, peer_a, false, false)
             .unwrap();
-
-        let rule = mk_flowspec_v4(FS_DST_PROTO); // dst 10.0.1.0/24
 
         // (a) satisfied: same peer as the best-match unicast route.
-        rib.insert(&rule, RouteStatus::Active, 2, peer_a, false, false)
-            .unwrap();
         let rows = flowspec_rows(&rib);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].rule.validity, FlowSpecValidity::Valid);
@@ -3407,7 +3433,7 @@ mod tests {
         );
 
         // (b) violated: a more-specific unicast route from a different
-        // neighboring AS invalidates the rule on (re-)announcement.
+        // neighboring AS invalidates the existing rule on the next query.
         let more_specific = RotondaRoute::Ipv4Unicast(
             Prefix::from_str("10.0.1.128/25")
                 .unwrap()
@@ -3424,8 +3450,6 @@ mod tests {
             false,
         )
         .unwrap();
-        rib.insert(&rule, RouteStatus::Active, 6, peer_a, false, false)
-            .unwrap();
         let rows = flowspec_rows(&rib);
         let a_row = rows
             .iter()
