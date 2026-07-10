@@ -69,7 +69,78 @@ const MRTGEN_E2E_ROUTES: &str = r#"[
     }
 ]"#;
 
+/// Diverse FlowSpec rules (RFC 8955/8956) covering every component type,
+/// both address families, rules with and without a destination prefix, and
+/// every traffic action mrtgen can encode. The unicast route comes first so
+/// the 192.0.2.0/24 rule validates against it (same peer, RFC 8955 §6).
+const MRTGEN_FLOWSPEC_ROUTES: &str = r#"[
+    {
+        "prefix": "192.0.2.0/24",
+        "nexthop": "198.51.100.1",
+        "as_path": [64500]
+    },
+    {
+        "flowspec": {
+            "dst_prefix": "192.0.2.0/24",
+            "protocol": [6],
+            "dst_port": [80, 443]
+        },
+        "actions": { "rate_limit_bytes": 0 }
+    },
+    {
+        "flowspec": {
+            "dst_prefix": "198.51.100.0/24",
+            "protocol": [6],
+            "tcp_flags": [{"flags": ["syn"], "match": true}],
+            "packet_length": [{"range": [512, 1500]}]
+        },
+        "actions": { "redirect": "65100:999", "sample": true }
+    },
+    {
+        "flowspec": {
+            "dst_prefix": "198.51.100.0/24",
+            "protocol": [1],
+            "icmp_type": [8],
+            "icmp_code": [0],
+            "dscp": [46],
+            "fragment": [{"flags": ["is-fragment"]}]
+        },
+        "actions": { "traffic_marking": 22, "terminal_action": true }
+    },
+    {
+        "flowspec": {
+            "src_prefix": "203.0.113.0/24",
+            "protocol": [17],
+            "src_port": [{"range": [1024, 65535]}]
+        },
+        "actions": { "redirect": "198.51.100.9:100" }
+    },
+    {
+        "flowspec": {
+            "dst_prefix": "2001:db8:1::/48",
+            "protocol": [6],
+            "dst_port": [443]
+        },
+        "actions": { "rate_limit_bytes": 1000000.0 }
+    },
+    {
+        "flowspec": {
+            "src_prefix": "2001:db8:2::/48",
+            "flow_label": [{"gt": 0}]
+        },
+        "actions": { "rate_limit_bytes": 0 }
+    }
+]"#;
+
 async fn ingest_mrtgen_routes(
+    format: mrtgen::RouteFormat,
+    extension: &str,
+) -> Arc<RibUnitRunner> {
+    ingest_mrtgen_routes_json(MRTGEN_E2E_ROUTES, format, extension).await
+}
+
+async fn ingest_mrtgen_routes_json(
+    routes_json: &str,
     format: mrtgen::RouteFormat,
     extension: &str,
 ) -> Arc<RibUnitRunner> {
@@ -79,12 +150,14 @@ async fn ingest_mrtgen_routes(
     use mrtgen::{generate_from_routes, routes_from_json};
     use std::io::Write;
 
-    let routes = routes_from_json(MRTGEN_E2E_ROUTES).unwrap();
+    let routes = routes_from_json(routes_json).unwrap();
     let corpus =
         generate_from_routes(&routes, format, 1_700_000_000).unwrap();
     let path = std::env::temp_dir().join(format!(
-        "netom-mrtgen-e2e-{}.{}",
+        "netom-mrtgen-e2e-{}-{:x}.{}",
         std::process::id(),
+        // distinct corpora must not collide on the same pid
+        routes_json.len(),
         extension
     ));
     match extension {
@@ -240,6 +313,89 @@ async fn ingests_mrtgen_bgp4mp_updates() {
     let runner =
         ingest_mrtgen_routes(mrtgen::RouteFormat::Bgp4mp, "mrt").await;
     assert_e2e_prefixes(&runner);
+}
+
+/// End-to-end FlowSpec via MRT: a mrtgen-generated BGP4MP file with diverse
+/// SAFI 133 rules must land in the flowspec store with correct keying
+/// (dst-prefix, or the family default route without one), RFC 8955 §6
+/// validity, decodable NLRI bytes and decodable traffic actions.
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_flowspec_rules() {
+    use super::flowspec::{decode_actions, parse_raw_nlri, FlowSpecValidity};
+
+    let runner = ingest_mrtgen_routes_json(
+        MRTGEN_FLOWSPEC_ROUTES,
+        mrtgen::RouteFormat::Bgp4mp,
+        "mrt",
+    )
+    .await;
+
+    // The plain unicast route travelled alongside the flowspec rules.
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        1
+    );
+
+    let v4 = runner
+        .rib()
+        .query_flowspec(true, None, false, false, None)
+        .unwrap();
+    let v6 = runner
+        .rib()
+        .query_flowspec(false, None, false, false, None)
+        .unwrap();
+    assert_eq!(v4.len(), 4, "expected 4 stored IPv4 flowspec rules");
+    assert_eq!(v6.len(), 2, "expected 2 stored IPv6 flowspec rules");
+
+    // Every stored rule must parse back from its raw NLRI bytes and carry
+    // decodable traffic actions (each corpus rule has at least one).
+    for (rows, family_v4) in [(&v4, true), (&v6, false)] {
+        for row in rows.iter() {
+            let nlri = parse_raw_nlri(&row.rule.nlri, family_v4)
+                .unwrap_or_else(|| {
+                    panic!("undecodable NLRI at {}", row.key_prefix)
+                });
+            assert!(
+                !decode_actions(&row.rule.pamap).is_empty(),
+                "no decoded actions for {nlri} at {}",
+                row.key_prefix
+            );
+        }
+    }
+
+    // Keying: one rule per dst-prefix, two sharing 198.51.100.0/24, and the
+    // dst-less rules at their family default route.
+    let key_count = |rows: &[_], key: &str| {
+        rows.iter()
+            .filter(|r: &&super::flowspec::FlowSpecQueryRow| {
+                r.key_prefix.to_string() == key
+            })
+            .count()
+    };
+    assert_eq!(key_count(&v4, "192.0.2.0/24"), 1);
+    assert_eq!(key_count(&v4, "198.51.100.0/24"), 2);
+    assert_eq!(key_count(&v4, "0.0.0.0/0"), 1);
+    assert_eq!(key_count(&v6, "2001:db8:1::/48"), 1);
+    assert_eq!(key_count(&v6, "::/0"), 1);
+
+    // RFC 8955 §6 validity: the 192.0.2.0/24 rule is covered by the unicast
+    // route from the same peer (ingested first) -> Valid; the other keyed
+    // rules have no covering unicast route -> Invalid; dst-less rules are
+    // Unvalidatable.
+    for row in v4.iter().chain(v6.iter()) {
+        let expected = match row.key_prefix.to_string().as_str() {
+            "192.0.2.0/24" => FlowSpecValidity::Valid,
+            "198.51.100.0/24" | "2001:db8:1::/48" => {
+                FlowSpecValidity::Invalid
+            }
+            _ => FlowSpecValidity::Unvalidatable,
+        };
+        assert_eq!(
+            row.rule.validity, expected,
+            "validity mismatch at {}",
+            row.key_prefix
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

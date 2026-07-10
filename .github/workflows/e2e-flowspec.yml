@@ -1,0 +1,31 @@
+# Manual end-to-end FlowSpec tests (RFC 8955/8956).
+#
+# Two paths into the flowspec store, both verified through the HTTP API:
+#  - mrt:    mrtgen-generated BGP4MP file ingested by an mrt-file-in unit
+#  - exabgp: live BGP session with exabgp announcing diverse rules
+name: e2e-flowspec
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  mrt:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Ensure correct Rust toolchain version
+      uses: dtolnay/rust-toolchain@stable
+    - name: FlowSpec MRT ingest end-to-end
+      run: ./scripts/e2e-flowspec-mrt.sh
+
+  exabgp:
+    runs-on: ubuntu-24.04
+    steps:
+    - uses: actions/checkout@v4
+    - name: Ensure correct Rust toolchain version
+      uses: dtolnay/rust-toolchain@stable
+    - name: FlowSpec BGP (exabgp) end-to-end
+      run: ./scripts/e2e-flowspec-exabgp.sh
