@@ -11,7 +11,7 @@ use std::sync::Arc;
 use inetnum::addr::Prefix;
 use inetnum::asn::Asn;
 use routecore::bgp::message::open::Capabilities;
-use routecore::bgp::nlri::afisafi::IsPrefix;
+use routecore::bgp::nlri::afisafi::{AfiSafiNlri, IsPrefix};
 use routecore::bgp::types::AfiSafiType;
 use routecore::bmp::message::PeerType;
 
@@ -378,12 +378,31 @@ fn build_bgp_open(
         caps.push(1); // SAFI=1
     }
 
+    // Capability: Multiprotocol Extensions - IPv4 FlowSpec (SAFI 133).
+    // Always advertised: per-peer negotiated families are not tracked
+    // (IngressInfo keeps only raw capability blobs), and advertising 133
+    // here keeps the "an End-of-RIB is sent for every family advertised in
+    // the OPEN" invariant that the dump relies on.
+    caps.push(1);
+    caps.push(4);
+    caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
+    caps.push(0);
+    caps.push(133); // SAFI=133
+    if include_ipv6 {
+        // Capability: Multiprotocol Extensions - IPv6 FlowSpec
+        caps.push(1);
+        caps.push(4);
+        caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
+        caps.push(0);
+        caps.push(133); // SAFI=133
+    }
+
     if advertise_graceful_restart {
         // Capability: Graceful Restart (code 64) - RFC 4724.
         // Advertising this tells receivers to expect matching End-of-RIB
-        // markers for the listed AFI/SAFIs.
+        // markers for the listed AFI/SAFIs (unicast + flowspec).
         caps.push(64); // Capability code
-        let gr_afi_count = if include_ipv6 { 2 } else { 1 };
+        let gr_afi_count = if include_ipv6 { 4 } else { 2 };
         let gr_len = 2 + gr_afi_count * 4; // restart flags/time + entries
         caps.push(gr_len as u8);
         caps.extend_from_slice(&0u16.to_be_bytes());
@@ -395,6 +414,16 @@ fn build_bgp_open(
             // IPv6 Unicast with forwarding state not preserved
             caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
             caps.push(1); // SAFI=1
+            caps.push(0); // Flags for this AFI/SAFI
+        }
+        // IPv4 FlowSpec
+        caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
+        caps.push(133); // SAFI=133
+        caps.push(0); // Flags for this AFI/SAFI
+        if include_ipv6 {
+            // IPv6 FlowSpec
+            caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
+            caps.push(133); // SAFI=133
             caps.push(0); // Flags for this AFI/SAFI
         }
     }
@@ -700,14 +729,145 @@ pub fn build_route_monitoring_from_route(
                     .ok()?;
             (prefix, pamap)
         }
-        // FlowSpec re-emission lands with the bmp-out flowspec builder;
-        // until then flowspec routes are not emitted to bmp-out clients.
-        RotondaRoute::Ipv4FlowSpec(..) | RotondaRoute::Ipv6FlowSpec(..) => {
-            return None;
+        RotondaRoute::Ipv4FlowSpec(nlri, pamap) => {
+            return build_flowspec_route_monitoring(
+                peer,
+                true,
+                nlri.nlri().raw().as_ref(),
+                pamap,
+                is_withdrawal,
+            );
+        }
+        RotondaRoute::Ipv6FlowSpec(nlri, pamap) => {
+            return build_flowspec_route_monitoring(
+                peer,
+                false,
+                nlri.nlri().raw().as_ref(),
+                pamap,
+                is_withdrawal,
+            );
         }
     };
 
     build_route_monitoring(peer, prefix, pamap, is_withdrawal)
+}
+
+/// Append raw FlowSpec NLRI bytes with their RFC 8955 §4.1 length header:
+/// one byte for lengths < 240, else two bytes `0xFnnn` (max 4095).
+fn append_flowspec_nlri(buf: &mut Vec<u8>, raw: &[u8]) {
+    let len = raw.len().min(4095);
+    if len >= 240 {
+        buf.extend_from_slice(&(0xf000u16 | len as u16).to_be_bytes());
+    } else {
+        buf.push(len as u8);
+    }
+    buf.extend_from_slice(&raw[..len]);
+}
+
+/// Wire length of a FlowSpec NLRI (length header + raw bytes).
+fn flowspec_nlri_encoded_len(raw: &[u8]) -> usize {
+    raw.len() + if raw.len() >= 240 { 2 } else { 1 }
+}
+
+/// Build the BGP UPDATE for one FlowSpec rule: the original path attributes
+/// minus MP_REACH/MP_UNREACH, plus a synthesized MP_REACH_NLRI (announce;
+/// SAFI 133, zero-length next hop per RFC 8955) or MP_UNREACH_NLRI
+/// (withdraw) carrying the raw NLRI verbatim.
+fn build_flowspec_bgp_update(
+    is_v4: bool,
+    nlri_raw: &[u8],
+    pamap: &RotondaPaMap,
+    is_withdrawal: bool,
+) -> Option<Vec<u8>> {
+    let afi: u16 = if is_v4 { 1 } else { 2 };
+    const SAFI_FLOWSPEC: u8 = 133;
+
+    let mp_attr = if is_withdrawal {
+        // MP_UNREACH_NLRI: AFI(2) + SAFI(1) + NLRI
+        let value_len = 3 + flowspec_nlri_encoded_len(nlri_raw);
+        let mut buf = Vec::with_capacity(4 + value_len);
+        if value_len > 255 {
+            buf.push(0x90);
+            buf.push(15);
+            buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        } else {
+            buf.push(0x80);
+            buf.push(15);
+            buf.push(value_len as u8);
+        }
+        buf.extend_from_slice(&afi.to_be_bytes());
+        buf.push(SAFI_FLOWSPEC);
+        append_flowspec_nlri(&mut buf, nlri_raw);
+        buf
+    } else {
+        // MP_REACH_NLRI: AFI(2) + SAFI(1) + NHLEN(1)=0 + Reserved(1) + NLRI
+        let value_len = 5 + flowspec_nlri_encoded_len(nlri_raw);
+        let mut buf = Vec::with_capacity(4 + value_len);
+        if value_len > 255 {
+            buf.push(0x90);
+            buf.push(14);
+            buf.extend_from_slice(&(value_len as u16).to_be_bytes());
+        } else {
+            buf.push(0x80);
+            buf.push(14);
+            buf.push(value_len as u8);
+        }
+        buf.extend_from_slice(&afi.to_be_bytes());
+        buf.push(SAFI_FLOWSPEC);
+        buf.push(0); // next hop length 0 — flowspec carries no next hop
+        buf.push(0); // reserved
+        append_flowspec_nlri(&mut buf, nlri_raw);
+        buf
+    };
+
+    // A withdrawal carries only the MP_UNREACH attribute; an announcement
+    // keeps the original (filtered) attributes so the traffic-action
+    // extended communities travel with the rule.
+    let pa_bytes = if is_withdrawal {
+        Vec::new()
+    } else {
+        filter_raw_path_attributes(pamap).0
+    };
+
+    let total_pa_len = pa_bytes.len() + mp_attr.len();
+    let update_body_len = 2 + 2 + total_pa_len;
+    let total_len = 19 + update_body_len;
+    if total_len > u16::MAX as usize {
+        log::warn!(
+            "bmp-out: dropping flowspec rule: re-encoded BGP UPDATE length \
+             {total_len} exceeds the 2-byte BGP length field"
+        );
+        return None;
+    }
+
+    let mut buf = Vec::with_capacity(total_len);
+    buf.extend_from_slice(&BGP_MARKER);
+    buf.extend_from_slice(&(total_len as u16).to_be_bytes());
+    buf.push(BGP_MSG_UPDATE);
+    buf.extend_from_slice(&0u16.to_be_bytes()); // Withdrawn Routes Length
+    buf.extend_from_slice(&(total_pa_len as u16).to_be_bytes());
+    buf.extend_from_slice(&pa_bytes);
+    buf.extend_from_slice(&mp_attr);
+    Some(buf)
+}
+
+/// Wrap one FlowSpec rule's BGP UPDATE in a BMP Route Monitoring message.
+fn build_flowspec_route_monitoring(
+    peer: &PeerInfo,
+    is_v4: bool,
+    nlri_raw: &[u8],
+    pamap: &RotondaPaMap,
+    is_withdrawal: bool,
+) -> Option<Vec<u8>> {
+    let bgp_update =
+        build_flowspec_bgp_update(is_v4, nlri_raw, pamap, is_withdrawal)?;
+    let total_len =
+        BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
+    let mut buf = Vec::with_capacity(total_len);
+    write_common_header(&mut buf, BMP_MSG_ROUTE_MONITORING, total_len as u32);
+    write_per_peer_header(&mut buf, peer, None);
+    buf.extend_from_slice(&bgp_update);
+    Some(buf)
 }
 
 fn hash_pa_blob(blob: &[u8]) -> u64 {
@@ -906,6 +1066,123 @@ impl AggGroup {
     }
 }
 
+/// FlowSpec twin of [`AggGroup`]: rules sharing one (peer, family,
+/// attribute-set) accumulate and emit as one UPDATE with a single shared
+/// MP_REACH_NLRI (SAFI 133, zero-length next hop) carrying all the NLRI.
+/// Kept in a separate map from the unicast groups so flowspec and unicast
+/// NLRI can never be mixed into one UPDATE by construction.
+struct FsAggGroup {
+    raw: Arc<[u8]>,
+    is_v4: bool,
+    /// Raw NLRI bytes per rule (without length headers).
+    nlris: Vec<Vec<u8>>,
+    /// Running encoded NLRI length (with length headers).
+    nlri_total: usize,
+    /// Encoded BGP UPDATE length with zero NLRI.
+    base_len: usize,
+}
+
+impl FsAggGroup {
+    fn new(pamap: &RotondaPaMap, is_v4: bool) -> Self {
+        let (pa_bytes, _) = filter_raw_path_attributes(pamap);
+        // header(19) + withdrawn_len(2) + pa_len(2) + attrs
+        // + MP_REACH ext-len header(4) + AFI(2)+SAFI(1)+NHLEN(1)+Reserved(1)
+        let base_len = 19 + 2 + 2 + pa_bytes.len() + 4 + 5;
+        Self {
+            raw: pamap.raw_arc(),
+            is_v4,
+            nlris: Vec::new(),
+            nlri_total: 0,
+            base_len,
+        }
+    }
+
+    fn blob(&self) -> &[u8] {
+        self.raw.get(2..).unwrap_or(&[])
+    }
+
+    fn is_empty(&self) -> bool {
+        self.nlris.is_empty()
+    }
+
+    fn bgp_update_len(&self) -> usize {
+        self.base_len + self.nlri_total
+    }
+
+    fn cost(&self) -> usize {
+        AGG_MEM_PER_GROUP
+            + self
+                .nlris
+                .iter()
+                .map(|n| AGG_MEM_PER_PREFIX + n.len())
+                .sum::<usize>()
+    }
+
+    fn push(&mut self, nlri_raw: Vec<u8>) {
+        self.nlri_total += flowspec_nlri_encoded_len(&nlri_raw);
+        self.nlris.push(nlri_raw);
+    }
+
+    fn reset_nlris(&mut self) {
+        self.nlris.clear();
+        self.nlri_total = 0;
+    }
+
+    /// Encode all accumulated rules into one BMP Route Monitoring message.
+    fn emit(
+        &self,
+        peer: &PeerInfo,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        if self.nlris.is_empty() {
+            return true;
+        }
+        let (pa_bytes, _) = filter_pa_from_raw(&self.raw);
+        let afi: u16 = if self.is_v4 { 1 } else { 2 };
+
+        let mut nlri = Vec::with_capacity(self.nlri_total);
+        for raw in &self.nlris {
+            append_flowspec_nlri(&mut nlri, raw);
+        }
+
+        // Single MP_REACH_NLRI (always extended-length, like the unicast
+        // aggregate encoder): AFI + SAFI 133 + nh_len 0 + reserved + NLRI.
+        let value_len = 2 + 1 + 1 + 1 + nlri.len();
+        let total_pa_len = pa_bytes.len() + 4 + value_len;
+        let update_body_len = 2 + 2 + total_pa_len;
+        let total_len = 19 + update_body_len;
+
+        let mut bgp_update = Vec::with_capacity(total_len);
+        bgp_update.extend_from_slice(&BGP_MARKER);
+        bgp_update.extend_from_slice(&(total_len as u16).to_be_bytes());
+        bgp_update.push(BGP_MSG_UPDATE);
+        bgp_update.extend_from_slice(&0u16.to_be_bytes());
+        bgp_update.extend_from_slice(&(total_pa_len as u16).to_be_bytes());
+        bgp_update.extend_from_slice(&pa_bytes);
+        bgp_update.push(0x90); // Optional, extended length
+        bgp_update.push(14);
+        bgp_update.extend_from_slice(&(value_len as u16).to_be_bytes());
+        bgp_update.extend_from_slice(&afi.to_be_bytes());
+        bgp_update.push(133);
+        bgp_update.push(0); // next hop length 0
+        bgp_update.push(0); // reserved
+        bgp_update.extend_from_slice(&nlri);
+
+        let total_len = BMP_COMMON_HEADER_LEN
+            + BMP_PER_PEER_HEADER_LEN
+            + bgp_update.len();
+        let mut buf = Vec::with_capacity(total_len);
+        write_common_header(
+            &mut buf,
+            BMP_MSG_ROUTE_MONITORING,
+            total_len as u32,
+        );
+        write_per_peer_header(&mut buf, peer, None);
+        buf.extend_from_slice(&bgp_update);
+        sink(buf, self.nlris.len())
+    }
+}
+
 /// Accumulates dump-phase routes and emits them as aggregated multi-NLRI BGP
 /// UPDATEs: prefixes sharing one (peer, address-family, attribute-set) are
 /// packed into a single BMP Route Monitoring message instead of one message
@@ -920,6 +1197,10 @@ impl AggGroup {
 /// dumping half-empty groups (which a flush-everything policy would do).
 pub struct RouteAggregator {
     groups: HashMap<(IngressId, bool, u64), AggGroup>,
+    // FlowSpec groups live in their own map so flowspec and unicast NLRI
+    // structurally cannot share an UPDATE; they draw on the same byte
+    // budget as the unicast groups.
+    fs_groups: HashMap<(IngressId, bool, u64), FsAggGroup>,
     peer_info: HashMap<IngressId, PeerInfo>,
     buffered_bytes: usize,
     max_bytes: usize,
@@ -936,6 +1217,7 @@ impl RouteAggregator {
     ) -> Self {
         Self {
             groups: HashMap::new(),
+            fs_groups: HashMap::new(),
             peer_info,
             buffered_bytes: 0,
             max_bytes,
@@ -1057,6 +1339,81 @@ impl RouteAggregator {
         true
     }
 
+    /// FlowSpec twin of [`add`](Self::add): accumulate one stored rule
+    /// (raw NLRI bytes) into the flowspec groups. Same peer contract,
+    /// size-limit handling and shared byte budget.
+    pub fn add_flowspec(
+        &mut self,
+        ingress_id: IngressId,
+        is_v4: bool,
+        nlri_raw: &[u8],
+        pamap: &RotondaPaMap,
+        sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
+    ) -> bool {
+        let peer = match self.peer_info.get(&ingress_id) {
+            Some(pi) => pi.clone(),
+            None => return true,
+        };
+        let peer = &peer;
+        let raw = pamap.as_ref();
+        let blob = raw.get(2..).unwrap_or(&[]);
+        let key = (ingress_id, is_v4, hash_pa_blob(blob));
+        let nlri_len = flowspec_nlri_encoded_len(nlri_raw);
+
+        let mut group = match self.fs_groups.remove(&key) {
+            Some(g) if g.blob() == blob => {
+                self.buffered_bytes -= g.cost();
+                g
+            }
+            Some(other) => {
+                self.buffered_bytes -= other.cost();
+                if !other.emit(peer, sink) {
+                    return false;
+                }
+                self.groups_created += 1;
+                FsAggGroup::new(pamap, is_v4)
+            }
+            None => {
+                self.groups_created += 1;
+                FsAggGroup::new(pamap, is_v4)
+            }
+        };
+
+        if !group.is_empty()
+            && group.bgp_update_len() + nlri_len > MAX_BGP_UPDATE_LEN
+        {
+            if !group.emit(peer, sink) {
+                return false;
+            }
+            group.reset_nlris();
+        }
+
+        if group.is_empty() && group.base_len + nlri_len > MAX_BGP_UPDATE_LEN
+        {
+            // Attribute set alone overflows the limit: emit single (the
+            // builder drops the truly oversized case with a warning).
+            if let Some(msg) = build_flowspec_route_monitoring(
+                peer, is_v4, nlri_raw, pamap, false,
+            ) {
+                if !sink(msg, 1) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        group.push(nlri_raw.to_vec());
+        self.buffered_bytes += group.cost();
+        self.fs_groups.insert(key, group);
+
+        if self.buffered_bytes > self.max_bytes {
+            if !self.evict_until_under_budget(sink) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Flush the fullest open groups until the buffered total is back under
     /// `max_bytes`. Fullest-first maximises routes/msg on each evicted
     /// message and frees the most memory per flush, so the surviving small
@@ -1094,6 +1451,35 @@ impl RouteAggregator {
                 }
             }
         }
+
+        // Still over target after draining unicast groups (or flowspec
+        // dominates the buffer): evict flowspec groups, fullest-first.
+        if self.buffered_bytes > target {
+            let mut fs_keys: Vec<(IngressId, bool, u64)> =
+                self.fs_groups.keys().copied().collect();
+            fs_keys.sort_unstable_by_key(|k| {
+                std::cmp::Reverse(
+                    self.fs_groups
+                        .get(k)
+                        .map(|g| g.nlris.len())
+                        .unwrap_or(0),
+                )
+            });
+            for k in fs_keys {
+                if self.buffered_bytes <= target {
+                    break;
+                }
+                if let Some(group) = self.fs_groups.remove(&k) {
+                    self.buffered_bytes -= group.cost();
+                    self.budget_evictions += 1;
+                    if let Some(peer) = self.peer_info.get(&k.0) {
+                        if !group.emit(peer, sink) {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
         true
     }
 
@@ -1108,6 +1494,16 @@ impl RouteAggregator {
         let groups: Vec<((IngressId, bool, u64), AggGroup)> =
             self.groups.drain().collect();
         for (key, group) in groups {
+            if let Some(peer) = self.peer_info.get(&key.0) {
+                if !group.emit(peer, sink) {
+                    self.buffered_bytes = 0;
+                    return false;
+                }
+            }
+        }
+        let fs_groups: Vec<((IngressId, bool, u64), FsAggGroup)> =
+            self.fs_groups.drain().collect();
+        for (key, group) in fs_groups {
             if let Some(peer) = self.peer_info.get(&key.0) {
                 if !group.emit(peer, sink) {
                     self.buffered_bytes = 0;
@@ -1204,7 +1600,11 @@ pub fn build_end_of_rib_marker(
 ) -> Option<Vec<u8>> {
     match afisafi {
         AfiSafiType::Ipv4Unicast => Some(build_eor_ipv4(peer)),
-        AfiSafiType::Ipv6Unicast => Some(build_eor_mp_unreach(peer, afisafi)),
+        AfiSafiType::Ipv6Unicast
+        | AfiSafiType::Ipv4FlowSpec
+        | AfiSafiType::Ipv6FlowSpec => {
+            Some(build_eor_mp_unreach(peer, afisafi))
+        }
         _ => None,
     }
 }
@@ -1807,8 +2207,9 @@ mod tests {
             let cap_len = caps[pos + 1] as usize;
             if cap_code == 64 {
                 found_gr = true;
-                // For IPv4-only: 2 (restart flags/time) + 4 (one AFI/SAFI) = 6
-                assert_eq!(cap_len, 6);
+                // For IPv4-only: 2 (restart flags/time) + 4*2 (IPv4 Unicast
+                // + IPv4 FlowSpec) = 10
+                assert_eq!(cap_len, 10);
             }
             pos += 2 + cap_len;
         }
@@ -1834,8 +2235,9 @@ mod tests {
             let cap_code = caps[pos];
             let cap_len = caps[pos + 1] as usize;
             if cap_code == 64 {
-                // For IPv6: 2 (restart flags/time) + 4*2 (two AFI/SAFIs) = 10
-                assert_eq!(cap_len, 10);
+                // For IPv6: 2 (restart flags/time) + 4*4 (v4/v6 Unicast +
+                // v4/v6 FlowSpec) = 18
+                assert_eq!(cap_len, 18);
             }
             pos += 2 + cap_len;
         }
@@ -2437,5 +2839,215 @@ mod tests {
         assert!(evicted_within_limit);
         // The budget was small enough that eviction actually fired.
         assert!(agg.stats().1 > 0, "expected budget evictions to occur");
+    }
+    // ------------ FlowSpec emission -----------------------------------
+
+    // {dst 10.0.1.0/24, proto =17} raw NLRI (no length header)
+    const FS_NLRI_A: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+    // {dst 10.0.1.0/24, dport =53}
+    const FS_NLRI_B: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
+
+    fn fs_pamap() -> RotondaPaMap {
+        // ORIGIN=IGP + EXTENDED_COMMUNITIES traffic-rate 0 (drop)
+        RotondaPaMap::from(vec![
+            0x40, 1, 1, 0, // ORIGIN
+            0xc0, 16, 8, 0x80, 0x06, 0, 0, 0, 0, 0, 0, // drop
+        ])
+    }
+
+    /// Announce: MP_REACH with AFI 1 / SAFI 133 / zero-length next hop and
+    /// the NLRI bytes verbatim after the RFC 8955 length header; original
+    /// (filtered) attributes preserved.
+    #[test]
+    fn flowspec_announce_update_bytes() {
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let msg = build_flowspec_route_monitoring(
+            &peer, true, FS_NLRI_A, &pamap, false,
+        )
+        .unwrap();
+
+        assert_eq!(msg[5], BMP_MSG_ROUTE_MONITORING);
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+        assert_eq!(bgp_len, bgp.len());
+        assert_eq!(bgp[18], BGP_MSG_UPDATE);
+        assert_eq!(u16::from_be_bytes([bgp[19], bgp[20]]), 0); // Withdrawn
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        let pas = &bgp[23..23 + pa_len];
+        // original attributes survive (ORIGIN + ext communities)...
+        assert_eq!(&pas[..4], &[0x40, 1, 1, 0]);
+        assert_eq!(&pas[4..15], &[0xc0, 16, 8, 0x80, 0x06, 0, 0, 0, 0, 0, 0]);
+        // ...followed by the synthesized MP_REACH
+        let mp = &pas[15..];
+        assert_eq!(mp[0], 0x80); // Optional
+        assert_eq!(mp[1], 14); // MP_REACH_NLRI
+        let value = &mp[3..3 + mp[2] as usize];
+        assert_eq!(u16::from_be_bytes([value[0], value[1]]), 1); // AFI
+        assert_eq!(value[2], 133); // SAFI
+        assert_eq!(value[3], 0); // next hop length 0
+        assert_eq!(value[4], 0); // reserved
+        // length header + raw NLRI, byte-for-byte
+        assert_eq!(value[5] as usize, FS_NLRI_A.len());
+        assert_eq!(&value[6..], FS_NLRI_A);
+        // nothing after the attributes
+        assert_eq!(23 + pa_len, bgp.len());
+    }
+
+    /// Withdrawal: an UPDATE whose only attribute is MP_UNREACH_NLRI with
+    /// SAFI 133 and the NLRI bytes.
+    #[test]
+    fn flowspec_withdrawal_update_bytes() {
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let msg = build_flowspec_route_monitoring(
+            &peer, true, FS_NLRI_A, &pamap, true,
+        )
+        .unwrap();
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        assert_eq!(u16::from_be_bytes([bgp[19], bgp[20]]), 0); // Withdrawn
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        let pas = &bgp[23..23 + pa_len];
+        assert_eq!(pas[0], 0x80);
+        assert_eq!(pas[1], 15); // MP_UNREACH_NLRI — the only attribute
+        let value = &pas[3..3 + pas[2] as usize];
+        assert_eq!(u16::from_be_bytes([value[0], value[1]]), 1);
+        assert_eq!(value[2], 133);
+        assert_eq!(value[3] as usize, FS_NLRI_A.len());
+        assert_eq!(&value[4..], FS_NLRI_A);
+        assert_eq!(3 + pas[2] as usize, pa_len);
+    }
+
+    #[test]
+    fn flowspec_eor_bytes() {
+        let peer = agg_test_peer();
+        let msg =
+            build_end_of_rib_marker(&peer, AfiSafiType::Ipv4FlowSpec)
+                .unwrap();
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        let pas = &bgp[23..23 + pa_len];
+        // Empty MP_UNREACH: AFI 1, SAFI 133, no NLRI.
+        assert_eq!(pas, &[0x80, 15, 3, 0x00, 0x01, 133]);
+        // And the v6 variant carries AFI 2.
+        let msg =
+            build_end_of_rib_marker(&peer, AfiSafiType::Ipv6FlowSpec)
+                .unwrap();
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        assert_eq!(&bgp[23..23 + pa_len], &[0x80, 15, 3, 0x00, 0x02, 133]);
+    }
+
+    #[test]
+    fn bgp_open_advertises_flowspec() {
+        let open = build_bgp_open(
+            Asn::from_u32(65000),
+            [0u8; 4],
+            &OpenCapExtras::default(),
+            true,
+            false,
+        );
+        let bgp_body = &open[19..];
+        let opt_params_len = bgp_body[9] as usize;
+        let caps = &bgp_body[12..10 + opt_params_len];
+        let mut mp_caps: Vec<(u16, u8)> = Vec::new();
+        let mut pos = 0;
+        while pos < caps.len() {
+            let code = caps[pos];
+            let len = caps[pos + 1] as usize;
+            if code == 1 {
+                mp_caps.push((
+                    u16::from_be_bytes([caps[pos + 2], caps[pos + 3]]),
+                    caps[pos + 5],
+                ));
+            }
+            pos += 2 + len;
+        }
+        assert!(mp_caps.contains(&(1, 1)));
+        assert!(mp_caps.contains(&(2, 1)));
+        assert!(mp_caps.contains(&(1, 133)));
+        assert!(mp_caps.contains(&(2, 133)));
+    }
+
+    /// Two rules sharing one attribute set aggregate into ONE UPDATE with
+    /// one MP_REACH carrying both NLRI.
+    #[test]
+    fn flowspec_aggregation_packs_rules() {
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let mut agg = RouteAggregator::new(
+            1024 * 1024,
+            HashMap::from([(1u32, peer)]),
+        );
+        let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut sink = |msg: Vec<u8>, n: usize| {
+            messages.push((msg, n));
+            true
+        };
+        assert!(agg.add_flowspec(1, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg.add_flowspec(1, true, FS_NLRI_B, &pamap, &mut sink));
+        assert!(agg.flush_all(&mut sink));
+        assert_eq!(messages.len(), 1);
+        let (msg, n) = &messages[0];
+        assert_eq!(*n, 2);
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+        let pas = &bgp[23..23 + pa_len];
+        // shared attrs once, then one extended-length MP_REACH
+        let mp = &pas[15..];
+        assert_eq!(mp[0], 0x90);
+        assert_eq!(mp[1], 14);
+        let value_len = u16::from_be_bytes([mp[2], mp[3]]) as usize;
+        let value = &mp[4..4 + value_len];
+        assert_eq!(value[2], 133);
+        assert_eq!(value[3], 0); // nh_len 0
+        // both NLRI present, each with its length header
+        let nlri = &value[5..];
+        assert_eq!(nlri[0] as usize, FS_NLRI_A.len());
+        assert_eq!(&nlri[1..1 + FS_NLRI_A.len()], FS_NLRI_A);
+        let second = &nlri[1 + FS_NLRI_A.len()..];
+        assert_eq!(second[0] as usize, FS_NLRI_B.len());
+        assert_eq!(&second[1..], FS_NLRI_B);
+    }
+
+    /// A unicast route and a flowspec rule with the SAME peer and the SAME
+    /// attribute set must never share an UPDATE.
+    #[test]
+    fn flowspec_and_unicast_never_share_an_update() {
+        let peer = agg_test_peer();
+        let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]);
+        let mut agg = RouteAggregator::new(
+            1024 * 1024,
+            HashMap::from([(1u32, peer)]),
+        );
+        let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut sink = |msg: Vec<u8>, n: usize| {
+            messages.push((msg, n));
+            true
+        };
+        let prefix =
+            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 0)), 24)
+                .unwrap();
+        assert!(agg.add(1, prefix, &pamap, &mut sink));
+        assert!(agg.add_flowspec(1, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg.flush_all(&mut sink));
+        assert_eq!(messages.len(), 2);
+    }
+
+    /// NLRI of 240 bytes or more get the two-byte 0xFnnn length encoding.
+    #[test]
+    fn flowspec_long_nlri_two_byte_length() {
+        // A syntactically irrelevant long blob: length encoding is what is
+        // under test, and append_flowspec_nlri does not re-validate.
+        let long_nlri = vec![0xaau8; 300];
+        let mut buf = Vec::new();
+        append_flowspec_nlri(&mut buf, &long_nlri);
+        assert_eq!(buf.len(), 2 + 300);
+        assert_eq!(
+            u16::from_be_bytes([buf[0], buf[1]]),
+            0xf000 | 300u16
+        );
+        assert_eq!(&buf[2..], &long_nlri[..]);
+        assert_eq!(flowspec_nlri_encoded_len(&long_nlri), 302);
     }
 }

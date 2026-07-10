@@ -314,6 +314,82 @@ pub async fn perform_initial_dump(
             }
             true
         });
+        // FlowSpec table walk (SAFI 133), sharing the same aggregator and
+        // peer map as the unicast walk so a flowspec-only peer gets exactly
+        // one Peer Up and the same byte budget applies. Runs before the
+        // final flush; the SAFI-133 EoR markers go out with the other EoRs
+        // after this walker joins.
+        let fs_walk_result = if client_gone {
+            Ok(0)
+        } else {
+            rib_for_walk.stream_flowspec_records(|pr| {
+                let key_prefix = pr.prefix;
+                for record in pr.meta {
+                    let ingress_id = record.multi_uniq_id;
+                    let mut sink = |msg: Vec<u8>, n: usize| {
+                        msg_tx.blocking_send((msg, n)).is_ok()
+                    };
+                    // Same mid-walk peer discovery as the unicast walk
+                    // above (FIX A): flowspec-only peers must still get
+                    // their Peer Up before their rules.
+                    if !aggregator.has_peer(ingress_id) {
+                        match ingress_register_for_walk.get(ingress_id) {
+                            Some(info)
+                                if matches!(
+                                    info.ingress_type,
+                                    Some(IngressType::BgpViaBmp)
+                                        | Some(IngressType::Bgp)
+                                        | Some(IngressType::Mrt)
+                                ) =>
+                            {
+                                let pi = build_peer_info_for_emit(
+                                    &info,
+                                    &ingress_register_for_walk,
+                                    forward_router_info,
+                                    fan_in_peer_distinguisher,
+                                );
+                                let peer_up =
+                                    bmp_builder::build_peer_up(&pi, false);
+                                if !sink(peer_up, 0) {
+                                    client_gone = true;
+                                    return false;
+                                }
+                                aggregator
+                                    .insert_peer(ingress_id, pi.clone());
+                                discovered.push((ingress_id, pi));
+                            }
+                            _ => {
+                                *skipped_unknown
+                                    .entry(ingress_id)
+                                    .or_insert(0) += 1;
+                                continue;
+                            }
+                        }
+                    }
+                    let is_v4 = key_prefix.is_v4();
+                    for rule in record.meta.iter() {
+                        *routes_per_ingress
+                            .entry(ingress_id)
+                            .or_insert(0) += 1;
+                        if !aggregator.add_flowspec(
+                            ingress_id,
+                            is_v4,
+                            &rule.nlri,
+                            &rule.pamap,
+                            &mut sink,
+                        ) {
+                            client_gone = true;
+                            return false;
+                        }
+                    }
+                }
+                true
+            })
+        };
+        let walk_result = match (walk_result, fs_walk_result) {
+            (Ok(unicast), Ok(flowspec)) => Ok(unicast + flowspec),
+            (Err(e), _) | (_, Err(e)) => Err(e),
+        };
         // Flush whatever is still buffered into final aggregated messages,
         // unless the client already disconnected.
         if !client_gone {
@@ -514,7 +590,12 @@ pub async fn perform_initial_dump(
             None => continue,
         };
 
-        for afisafi in [AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast] {
+        for afisafi in [
+            AfiSafiType::Ipv4Unicast,
+            AfiSafiType::Ipv6Unicast,
+            AfiSafiType::Ipv4FlowSpec,
+            AfiSafiType::Ipv6FlowSpec,
+        ] {
             if let Some(msg) =
                 bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
             {
@@ -531,7 +612,12 @@ pub async fn perform_initial_dump(
     // markers, exactly like the enumerated peers above.
     for (ingress_id, peer_info) in &discovered {
         client.add_known_peer(*ingress_id).await;
-        for afisafi in [AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast] {
+        for afisafi in [
+            AfiSafiType::Ipv4Unicast,
+            AfiSafiType::Ipv6Unicast,
+            AfiSafiType::Ipv4FlowSpec,
+            AfiSafiType::Ipv6FlowSpec,
+        ] {
             if let Some(msg) =
                 bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
             {
