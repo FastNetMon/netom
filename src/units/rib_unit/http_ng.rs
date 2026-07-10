@@ -349,7 +349,10 @@ struct FlowSpecRow {
     attributes: crate::payload::RotondaPaMap,
 }
 
-fn flowspec_response(
+const MAX_FLOWSPEC_HTTP_ROWS: usize = 10_000;
+const MAX_FLOWSPEC_HTTP_RAW_BYTES: usize = 16 * 1024 * 1024;
+
+fn build_flowspec_response(
     rib: std::sync::Arc<super::rib::Rib>,
     family_v4: bool,
     prefix: Option<Prefix>,
@@ -364,8 +367,15 @@ fn flowspec_response(
             filter.include.contains(&Include::LessSpecifics),
             filter.include.contains(&Include::MoreSpecifics),
             filter.ingress_id,
+            Some((MAX_FLOWSPEC_HTTP_ROWS, MAX_FLOWSPEC_HTTP_RAW_BYTES)),
         )
-        .map_err(ApiError::InternalServerError)?;
+        .map_err(|err| {
+            if err.starts_with("FlowSpec query exceeds the response limit") {
+                ApiError::BadRequest(format!("{err}; narrow the query"))
+            } else {
+                ApiError::InternalServerError(err)
+            }
+        })?;
 
     // Parse once per row for Display + RFC 8955 §5.1 ordering.
     let mut parsed: Vec<_> = rows
@@ -411,6 +421,31 @@ fn flowspec_response(
         .into_response())
 }
 
+async fn flowspec_response(
+    rib: std::sync::Arc<super::rib::Rib>,
+    family_v4: bool,
+    prefix: Option<Prefix>,
+    filter: QueryFilter,
+) -> Result<axum::response::Response, ApiError> {
+    let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "too many concurrent RIB queries in progress; retry shortly"
+                .to_string(),
+        )
+    })?;
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        build_flowspec_response(rib, family_v4, prefix, &filter)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!(
+            "FlowSpec query task failed: {e}"
+        ))
+    })?
+}
+
 fn load_rib(
     state: &ApiState,
 ) -> Result<std::sync::Arc<super::rib::Rib>, ApiError> {
@@ -430,7 +465,7 @@ async fn search_ipv4flowspec(
     let prefix = Prefix::new_v4(prefix, prefix_len)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let rib = load_rib(&state)?;
-    flowspec_response(rib, true, Some(prefix), &filter)
+    flowspec_response(rib, true, Some(prefix), filter).await
 }
 
 async fn search_ipv4flowspec_all(
@@ -438,7 +473,7 @@ async fn search_ipv4flowspec_all(
     state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let rib = load_rib(&state)?;
-    flowspec_response(rib, true, None, &filter)
+    flowspec_response(rib, true, None, filter).await
 }
 
 async fn search_ipv6flowspec(
@@ -449,7 +484,7 @@ async fn search_ipv6flowspec(
     let prefix = Prefix::new_v6(prefix, prefix_len)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     let rib = load_rib(&state)?;
-    flowspec_response(rib, false, Some(prefix), &filter)
+    flowspec_response(rib, false, Some(prefix), filter).await
 }
 
 async fn search_ipv6flowspec_all(
@@ -457,7 +492,7 @@ async fn search_ipv6flowspec_all(
     state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
     let rib = load_rib(&state)?;
-    flowspec_response(rib, false, None, &filter)
+    flowspec_response(rib, false, None, filter).await
 }
 
 async fn generic_afisafi_all(

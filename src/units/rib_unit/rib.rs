@@ -1729,16 +1729,19 @@ impl Rib {
         include_less_specifics: bool,
         include_more_specifics: bool,
         ingress_id: Option<IngressId>,
+        limits: Option<(usize, usize)>,
     ) -> Result<Vec<FlowSpecQueryRow>, String> {
         let store = (*self.flowspec)
             .as_ref()
             .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?;
 
         let mut rows: Vec<FlowSpecQueryRow> = Vec::new();
-        let push_records =
+        let mut raw_bytes = 0usize;
+        let mut push_records =
             |rows: &mut Vec<FlowSpecQueryRow>,
              key: Prefix,
-             records: Vec<Record<FlowSpecRuleSet>>| {
+             records: Vec<Record<FlowSpecRuleSet>>|
+             -> Result<(), String> {
                 for r in records {
                     if r.status == RouteStatus::Withdrawn {
                         continue;
@@ -1749,6 +1752,22 @@ impl Rib {
                         }
                     }
                     for rule in r.meta.iter() {
+                        if let Some((max_rows, max_raw_bytes)) = limits {
+                            let rule_bytes = rule
+                                .nlri
+                                .len()
+                                .saturating_add(rule.pamap.as_ref().len());
+                            if rows.len() >= max_rows
+                                || raw_bytes.saturating_add(rule_bytes)
+                                    > max_raw_bytes
+                            {
+                                return Err(format!(
+                                    "FlowSpec query exceeds the response limit \
+                                     ({max_rows} rules or {max_raw_bytes} raw bytes)"
+                                ));
+                            }
+                            raw_bytes += rule_bytes;
+                        }
                         rows.push(FlowSpecQueryRow {
                             key_prefix: key,
                             ingress_id: r.multi_uniq_id,
@@ -1756,6 +1775,7 @@ impl Rib {
                         });
                     }
                 }
+                Ok(())
             };
 
         match prefix {
@@ -1769,7 +1789,7 @@ impl Rib {
                     if let Ok(Some(records)) =
                         store.get_records_for_prefix(&key, None, false)
                     {
-                        push_records(&mut rows, key, records);
+                        push_records(&mut rows, key, records)?;
                     }
                 }
             }
@@ -1788,7 +1808,7 @@ impl Rib {
                     .match_prefix(&prefix, &match_options, guard)
                     .map_err(|e| e.to_string())?;
                 if let Some(key) = res.prefix {
-                    push_records(&mut rows, key, res.records);
+                    push_records(&mut rows, key, res.records)?;
                 }
                 for set in [res.less_specifics, res.more_specifics]
                     .into_iter()
@@ -1799,7 +1819,7 @@ impl Rib {
                             &mut rows,
                             pr.prefix,
                             pr.meta.clone(),
-                        );
+                        )?;
                     }
                 }
             }
@@ -3288,7 +3308,8 @@ mod tests {
     const FS_NO_DST: &[u8] = &[0x03, 0x81, 0x11, 0x06, 0x81, 0x35];
 
     fn flowspec_rows(rib: &Rib) -> Vec<FlowSpecQueryRow> {
-        rib.query_flowspec(true, None, false, false, None).unwrap()
+        rib.query_flowspec(true, None, false, false, None, None)
+            .unwrap()
     }
 
     /// Guard test for the design's central storage assumption: a rule with
@@ -3404,7 +3425,7 @@ mod tests {
 
         // Exact-match query on the dst prefix
         let rows = rib
-            .query_flowspec(true, Some(key), false, false, None)
+            .query_flowspec(true, Some(key), false, false, None, None)
             .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(
@@ -3414,15 +3435,36 @@ mod tests {
 
         // ... filtered by peer
         let rows = rib
-            .query_flowspec(true, Some(key), false, false, Some(2))
+            .query_flowspec(true, Some(key), false, false, Some(2), None)
             .unwrap();
         assert_eq!(rows.len(), 1);
 
         // Less-specifics of the dst prefix include the 0/0 no-dst rule.
         let rows = rib
-            .query_flowspec(true, Some(key), true, false, None)
+            .query_flowspec(true, Some(key), true, false, None, None)
             .unwrap();
         assert_eq!(rows.len(), 3);
+
+        assert!(rib
+            .query_flowspec(
+                true,
+                None,
+                false,
+                false,
+                None,
+                Some((2, usize::MAX)),
+            )
+            .is_err());
+        assert!(rib
+            .query_flowspec(
+                true,
+                None,
+                false,
+                false,
+                None,
+                Some((usize::MAX, 1)),
+            )
+            .is_err());
     }
 
     #[test]

@@ -338,11 +338,11 @@ async fn ingests_mrtgen_flowspec_rules() {
 
     let v4 = runner
         .rib()
-        .query_flowspec(true, None, false, false, None)
+        .query_flowspec(true, None, false, false, None, None)
         .unwrap();
     let v6 = runner
         .rib()
-        .query_flowspec(false, None, false, false, None)
+        .query_flowspec(false, None, false, false, None, None)
         .unwrap();
     assert_eq!(v4.len(), 4, "expected 4 stored IPv4 flowspec rules");
     assert_eq!(v6.len(), 2, "expected 2 stored IPv6 flowspec rules");
