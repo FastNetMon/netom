@@ -204,6 +204,41 @@ impl PeerInfo {
             self.peer_distinguisher = tag;
         }
     }
+
+    /// Whether the upstream peer advertised support for an AFI/SAFI. IPv4
+    /// unicast is implicit in base BGP; every other supported family requires
+    /// an MP-BGP capability in the received OPEN.
+    pub fn supports_afisafi(&self, afisafi: AfiSafiType) -> bool {
+        if afisafi == AfiSafiType::Ipv4Unicast {
+            return true;
+        }
+        let (want_afi, want_safi) = match afisafi {
+            AfiSafiType::Ipv6Unicast => (2u16, 1u8),
+            AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
+            AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+            _ => return false,
+        };
+        Capabilities(&self.peer_capabilities).iter().any(|cap| {
+            let raw = cap.as_ref();
+            raw.len() == 6
+                && raw[0] == 1
+                && raw[1] == 4
+                && u16::from_be_bytes([raw[2], raw[3]]) == want_afi
+                && raw[5] == want_safi
+        })
+    }
+
+    pub fn supported_afisafis(&self) -> Vec<AfiSafiType> {
+        [
+            AfiSafiType::Ipv4Unicast,
+            AfiSafiType::Ipv6Unicast,
+            AfiSafiType::Ipv4FlowSpec,
+            AfiSafiType::Ipv6FlowSpec,
+        ]
+        .into_iter()
+        .filter(|afisafi| self.supports_afisafi(*afisafi))
+        .collect()
+    }
 }
 
 /// Derive a stable 8-byte fan-in distinguisher tag for the given upstream
@@ -330,17 +365,14 @@ pub fn build_termination_message() -> Vec<u8> {
     buf
 }
 
-/// Build a synthetic BGP OPEN message.
 /// Build a *synthetic* BGP OPEN for the Peer Up notification.
 ///
 /// This is a normalized OPEN, not a copy of what the monitored router
-/// actually exchanged: we advertise a fixed capability set (4-octet ASN,
-/// MP-BGP for the AFI/SAFIs we re-emit, optional Graceful Restart) and cap
-/// downstream UPDATE size at the classic 4096 limit. `bgp_id` is the only
-/// field plumbed through from the real session — for the *received* OPEN we
-/// pass the peer's BGP Identifier (router-id) so it matches the per-peer
-/// header; the *sent* OPEN's identifier (the monitored router's own
-/// router-id) is not carried by BMP and stays zero.
+/// actually exchanged: we advertise 4-octet ASN, the peer's MP-BGP families,
+/// optional Graceful Restart, and selected compatible upstream capabilities.
+/// Downstream UPDATE size remains capped at the classic 4096 limit. For the
+/// received OPEN, `bgp_id` is the peer's real BGP Identifier; the monitored
+/// router's identifier is not carried by BMP, so the sent OPEN uses zero.
 ///
 /// FUTURE (under consideration): replay the received OPEN verbatim instead
 /// of synthesizing one. That would faithfully preserve the real BGP
@@ -352,7 +384,7 @@ fn build_bgp_open(
     asn: Asn,
     bgp_id: [u8; 4],
     extras: &OpenCapExtras,
-    include_ipv6: bool,
+    afisafis: &[AfiSafiType],
     advertise_graceful_restart: bool,
 ) -> Vec<u8> {
     let mut caps = Vec::new();
@@ -362,39 +394,19 @@ fn build_bgp_open(
     caps.push(4);
     caps.extend_from_slice(&u32::from(asn).to_be_bytes());
 
-    // Capability: Multiprotocol Extensions - IPv4 Unicast (code 1)
-    caps.push(1);
-    caps.push(4);
-    caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
-    caps.push(0);
-    caps.push(1); // SAFI=1
-
-    if include_ipv6 {
-        // Capability: Multiprotocol Extensions - IPv6 Unicast
+    for afisafi in afisafis {
+        let (afi, safi) = match afisafi {
+            AfiSafiType::Ipv4Unicast => (1u16, 1u8),
+            AfiSafiType::Ipv6Unicast => (2u16, 1u8),
+            AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
+            AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+            _ => continue,
+        };
         caps.push(1);
         caps.push(4);
-        caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
+        caps.extend_from_slice(&afi.to_be_bytes());
         caps.push(0);
-        caps.push(1); // SAFI=1
-    }
-
-    // Capability: Multiprotocol Extensions - IPv4 FlowSpec (SAFI 133).
-    // Always advertised: per-peer negotiated families are not tracked
-    // (IngressInfo keeps only raw capability blobs), and advertising 133
-    // here keeps the "an End-of-RIB is sent for every family advertised in
-    // the OPEN" invariant that the dump relies on.
-    caps.push(1);
-    caps.push(4);
-    caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
-    caps.push(0);
-    caps.push(133); // SAFI=133
-    if include_ipv6 {
-        // Capability: Multiprotocol Extensions - IPv6 FlowSpec
-        caps.push(1);
-        caps.push(4);
-        caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
-        caps.push(0);
-        caps.push(133); // SAFI=133
+        caps.push(safi);
     }
 
     if advertise_graceful_restart {
@@ -402,29 +414,20 @@ fn build_bgp_open(
         // Advertising this tells receivers to expect matching End-of-RIB
         // markers for the listed AFI/SAFIs (unicast + flowspec).
         caps.push(64); // Capability code
-        let gr_afi_count = if include_ipv6 { 4 } else { 2 };
-        let gr_len = 2 + gr_afi_count * 4; // restart flags/time + entries
+        let gr_len = 2 + afisafis.len() * 4;
         caps.push(gr_len as u8);
         caps.extend_from_slice(&0u16.to_be_bytes());
-        // IPv4 Unicast with forwarding state not preserved.
-        caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
-        caps.push(1); // SAFI=1
-        caps.push(0); // Flags for this AFI/SAFI
-        if include_ipv6 {
-            // IPv6 Unicast with forwarding state not preserved
-            caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
-            caps.push(1); // SAFI=1
-            caps.push(0); // Flags for this AFI/SAFI
-        }
-        // IPv4 FlowSpec
-        caps.extend_from_slice(&1u16.to_be_bytes()); // AFI=1
-        caps.push(133); // SAFI=133
-        caps.push(0); // Flags for this AFI/SAFI
-        if include_ipv6 {
-            // IPv6 FlowSpec
-            caps.extend_from_slice(&2u16.to_be_bytes()); // AFI=2
-            caps.push(133); // SAFI=133
-            caps.push(0); // Flags for this AFI/SAFI
+        for afisafi in afisafis {
+            let (afi, safi) = match afisafi {
+                AfiSafiType::Ipv4Unicast => (1u16, 1u8),
+                AfiSafiType::Ipv6Unicast => (2u16, 1u8),
+                AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
+                AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+                _ => continue,
+            };
+            caps.extend_from_slice(&afi.to_be_bytes());
+            caps.push(safi);
+            caps.push(0); // forwarding state not preserved
         }
     }
 
@@ -585,9 +588,7 @@ pub fn build_peer_up(
     peer: &PeerInfo,
     advertise_graceful_restart: bool,
 ) -> Vec<u8> {
-    // BMP-out can emit IPv4 and IPv6 unicast route-monitoring messages for a
-    // peer regardless of whether the peer's transport address is IPv4 or IPv6.
-    let include_ipv6 = true;
+    let afisafis = peer.supported_afisafis();
     // Sent OPEN: the monitored router's own router-id is not carried by BMP,
     // so leave it zero and advertise no peer-supplied extras. Received OPEN:
     // stamp the peer's BGP Identifier so it agrees with the per-peer header's
@@ -602,14 +603,14 @@ pub fn build_peer_up(
         peer.peer_asn,
         [0u8; 4],
         &OpenCapExtras::default(),
-        include_ipv6,
+        &afisafis,
         advertise_graceful_restart,
     );
     let received_open = build_bgp_open(
         peer.peer_asn,
         peer.peer_bgp_id,
         &received_extras,
-        include_ipv6,
+        &afisafis,
         advertise_graceful_restart,
     );
     let max_tlv_len = u16::MAX as usize;
@@ -2190,7 +2191,7 @@ mod tests {
             Asn::from_u32(65000),
             [0u8; 4],
             &OpenCapExtras::default(),
-            false,
+            &[AfiSafiType::Ipv4Unicast],
             true,
         );
         // Find GR capability (code 64) in the capabilities
@@ -2207,9 +2208,8 @@ mod tests {
             let cap_len = caps[pos + 1] as usize;
             if cap_code == 64 {
                 found_gr = true;
-                // For IPv4-only: 2 (restart flags/time) + 4*2 (IPv4 Unicast
-                // + IPv4 FlowSpec) = 10
-                assert_eq!(cap_len, 10);
+                // restart flags/time + one IPv4-unicast tuple
+                assert_eq!(cap_len, 6);
             }
             pos += 2 + cap_len;
         }
@@ -2223,7 +2223,12 @@ mod tests {
             Asn::from_u32(65000),
             [0u8; 4],
             &OpenCapExtras::default(),
-            true,
+            &[
+                AfiSafiType::Ipv4Unicast,
+                AfiSafiType::Ipv6Unicast,
+                AfiSafiType::Ipv4FlowSpec,
+                AfiSafiType::Ipv6FlowSpec,
+            ],
             true,
         );
         let bgp_body = &open_v6[19..];
@@ -2249,7 +2254,7 @@ mod tests {
             Asn::from_u32(65000),
             [0u8; 4],
             &OpenCapExtras::default(),
-            true,
+            &[AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast],
             false,
         );
         let bgp_body = &open[19..];
@@ -2944,7 +2949,12 @@ mod tests {
             Asn::from_u32(65000),
             [0u8; 4],
             &OpenCapExtras::default(),
-            true,
+            &[
+                AfiSafiType::Ipv4Unicast,
+                AfiSafiType::Ipv6Unicast,
+                AfiSafiType::Ipv4FlowSpec,
+                AfiSafiType::Ipv6FlowSpec,
+            ],
             false,
         );
         let bgp_body = &open[19..];
@@ -2967,6 +2977,29 @@ mod tests {
         assert!(mp_caps.contains(&(2, 1)));
         assert!(mp_caps.contains(&(1, 133)));
         assert!(mp_caps.contains(&(2, 133)));
+    }
+
+    #[test]
+    fn peer_afisafis_follow_received_mp_capabilities() {
+        let mut peer = agg_test_peer();
+        assert_eq!(
+            peer.supported_afisafis(),
+            vec![AfiSafiType::Ipv4Unicast]
+        );
+
+        peer.peer_capabilities = vec![
+            1, 4, 0, 2, 0, 1, // IPv6 unicast
+            1, 4, 0, 1, 0, 133, // IPv4 FlowSpec
+        ];
+        assert_eq!(
+            peer.supported_afisafis(),
+            vec![
+                AfiSafiType::Ipv4Unicast,
+                AfiSafiType::Ipv6Unicast,
+                AfiSafiType::Ipv4FlowSpec,
+            ]
+        );
+        assert!(!peer.supports_afisafi(AfiSafiType::Ipv6FlowSpec));
     }
 
     /// Two rules sharing one attribute set aggregate into ONE UPDATE with

@@ -590,12 +590,7 @@ pub async fn perform_initial_dump(
             None => continue,
         };
 
-        for afisafi in [
-            AfiSafiType::Ipv4Unicast,
-            AfiSafiType::Ipv6Unicast,
-            AfiSafiType::Ipv4FlowSpec,
-            AfiSafiType::Ipv6FlowSpec,
-        ] {
+        for afisafi in peer_info.supported_afisafis() {
             if let Some(msg) =
                 bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
             {
@@ -612,12 +607,7 @@ pub async fn perform_initial_dump(
     // markers, exactly like the enumerated peers above.
     for (ingress_id, peer_info) in &discovered {
         client.add_known_peer(*ingress_id).await;
-        for afisafi in [
-            AfiSafiType::Ipv4Unicast,
-            AfiSafiType::Ipv6Unicast,
-            AfiSafiType::Ipv4FlowSpec,
-            AfiSafiType::Ipv6FlowSpec,
-        ] {
+        for afisafi in peer_info.supported_afisafis() {
             if let Some(msg) =
                 bmp_builder::build_end_of_rib_marker(peer_info, afisafi)
             {
@@ -1223,7 +1213,9 @@ mod tests {
                     .with_ingress_type(IngressType::BgpViaBmp)
                     .with_state(IngressState::Connected)
                     .with_remote_addr(addr.parse::<IpAddr>().unwrap())
-                    .with_remote_asn(Asn::from_u32(65000)),
+                    .with_remote_asn(Asn::from_u32(65000))
+                    // MP-BGP capability: IPv4 FlowSpec.
+                    .with_remote_capabilities(vec![1, 4, 0, 1, 0, 133]),
             );
         }
 
@@ -1342,7 +1334,7 @@ mod tests {
             .position(|k| *k == MsgKind::Route(1, 133))
             .unwrap();
         assert!(last_unicast_route < first_fs_route);
-        // 4 EoRs per peer: v4/v6 unicast + v4/v6 flowspec.
+        // Each peer advertised v4 FlowSpec; neither advertised v6.
         let eors: Vec<(u16, u8)> = kinds
             .iter()
             .filter_map(|k| match k {
@@ -1350,10 +1342,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(eors.len(), 8);
+        assert_eq!(eors.len(), 4);
         assert_eq!(
             eors.iter().filter(|(_, safi)| *safi == 133).count(),
-            4
+            2
         );
     }
 
