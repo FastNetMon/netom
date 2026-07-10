@@ -21,7 +21,7 @@ path = "doc/bin/print_netom_std_doc.rs"
 [workspace.package]
 version = "0.6.0-fnm10"
 edition = "2021"
-rust-version = "1.87"
+rust-version = "1.88"
 authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fastnetmon.com>"]
 
 
@@ -29,7 +29,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 #members = []
 
 [workspace.dependencies]
-routecore          = { version = "0.7.1", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
+routecore          = { git = "https://github.com/nuclearcat/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { version = "0.1.1", features = ["arbitrary", "serde"] }
 rotonda-store      = { git = "https://github.com/nuclearcat/rotonda-store", branch = "fnm-gc" }   # fork: Layer A remove_mui
 log                = "0.4"
