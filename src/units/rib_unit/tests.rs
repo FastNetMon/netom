@@ -31,6 +31,90 @@ use std::{str::FromStr, sync::Arc};
 
 use super::status_reporter::RibUnitStatusReporter;
 
+const MRTGEN_E2E_ROUTES: &str = r#"[
+    {
+        "prefix": "192.0.2.0/24",
+        "nexthop": "198.51.100.1",
+        "as_path": [64500, 64496],
+        "standard_communities": ["64500:100"]
+    },
+    {
+        "prefix": "2001:db8:100::/48",
+        "nexthop": "2001:db8::1",
+        "as_path": [64501, 4200000001],
+        "local_pref": 150
+    }
+]"#;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_file_into_rib() {
+    use crate::comms::{DirectLink, Gate};
+    use crate::ingress;
+    use crate::units::mrt_file_in::unit::MrtInRunner;
+    use mrtgen::{generate_from_routes, routes_from_json, RouteFormat};
+
+    let routes = routes_from_json(MRTGEN_E2E_ROUTES).unwrap();
+    let corpus = generate_from_routes(
+        &routes,
+        RouteFormat::TableDumpV2,
+        1_700_000_000,
+    )
+    .unwrap();
+    let path = std::env::temp_dir()
+        .join(format!("netom-mrtgen-e2e-{}.mrt", std::process::id()));
+    std::fs::write(&path, &corpus.bytes).unwrap();
+
+    let (mrt_gate, mut mrt_gate_agent) = Gate::new(0);
+    let update_gate = mrt_gate.clone();
+    let gate_task =
+        tokio::spawn(
+            async move { while mrt_gate.process().await.is_ok() {} },
+        );
+
+    let (rib_runner, _rib_gate_agent) = RibUnitRunner::mock("").unwrap();
+    let rib_runner = Arc::new(rib_runner);
+    let mut link: DirectLink = mrt_gate_agent.create_link().into();
+    link.connect(rib_runner.clone(), false).await.unwrap();
+
+    let ingresses = Arc::new(ingress::Register::new());
+    let parent_id = ingresses.register();
+    let result = MrtInRunner::process_file(
+        update_gate,
+        ingresses,
+        parent_id,
+        path.clone(),
+    )
+    .await;
+    let _ = std::fs::remove_file(path);
+    gate_task.abort();
+
+    result.expect("MRT input should reach the RIB through the gate");
+    assert_eq!(
+        rib_runner
+            .rib()
+            .store()
+            .unwrap()
+            .prefixes_count()
+            .in_memory(),
+        2
+    );
+
+    let options = MatchOptions {
+        match_type: MatchType::ExactMatch,
+        include_withdrawn: false,
+        include_less_specifics: false,
+        include_more_specifics: false,
+        mui: None,
+        include_history: IncludeHistory::None,
+    };
+    for prefix in ["192.0.2.0/24", "2001:db8:100::/48"] {
+        let prefix = Prefix::from_str(prefix).unwrap();
+        let result =
+            rib_runner.rib().match_prefix(&prefix, &options).unwrap();
+        assert_eq!(result.records.len(), 1, "missing {prefix} from RIB");
+    }
+}
+
 #[ignore]
 #[tokio::test]
 async fn process_non_route_update() {

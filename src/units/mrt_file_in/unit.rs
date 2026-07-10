@@ -264,7 +264,7 @@ impl MrtInRunner {
         Ok((announcements_sent, withdrawals_sent))
     }
 
-    async fn process_file(
+    pub(crate) async fn process_file(
         gate: Gate,
         ingresses: Arc<ingress::Register>,
         parent_id: IngressId,
