@@ -1062,7 +1062,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2033,6 +2033,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mrtgen"
+version = "0.1.0"
+source = "git+https://github.com/FastNetMon/mrtgen.git?rev=02fdb5a59ca7a9d344d229e0bde58fa423ccfd62#02fdb5a59ca7a9d344d229e0bde58fa423ccfd62"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "netom"
 version = "0.6.0-fnm10"
 dependencies = [
@@ -2068,6 +2077,7 @@ dependencies = [
  "log-reroute",
  "memmap2 0.9.10",
  "micromap",
+ "mrtgen",
  "non-empty-vec",
  "octseq",
  "paste",
@@ -2767,7 +2777,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git#8564e6e96195eafbc07040f39b0181061d565caf"
+source = "git+https://github.com/nuclearcat/routecore.git#346e9cee77e097edb01a8c0bb8d9f96d4f61b11d"
 dependencies = [
  "bytes",
  "chrono",
@@ -2911,7 +2921,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3316,7 +3326,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

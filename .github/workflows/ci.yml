@@ -22,5 +22,5 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
     - name: Build
       run: cargo build --verbose
-    - name: Run tests
+    - name: Run tests, including mrtgen MRT corpus
       run: cargo test --lib --verbose

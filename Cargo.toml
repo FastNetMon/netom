@@ -111,6 +111,7 @@ tikv-jemallocator  = { version = "0.6", features = ["profiling", "background_thr
 [dev-dependencies]
 hex                = "0.4"
 env_logger         = "0.11"
+mrtgen             = { git = "https://github.com/FastNetMon/mrtgen.git", rev = "02fdb5a59ca7a9d344d229e0bde58fa423ccfd62" }
 prometheus-parse   = "0.2"
 reqwest            = { version = "0.12", default-features = false, features = ["json"] }
 rumqttd            = { version = "0.20.0", default-features = false }

@@ -18,7 +18,7 @@ use routecore::bgp::nlri::afisafi::{Ipv4UnicastNlri, Nlri};
 use routecore::bgp::types::AfiSafiType;
 use routecore::bgp::workshop::route::RouteWorkshop;
 use routecore::bgp::ParseError;
-use routecore::mrt::MrtFile;
+use routecore::mrt::{MessageSubType, MrtFile, TableDumpv2SubType};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
@@ -283,7 +283,7 @@ impl MrtInRunner {
         let mut buf = Vec::<u8>::new();
 
         let t0 = Instant::now();
-        let mrt_file = match filename
+        let mrt_bytes: &[u8] = match filename
             .as_path()
             .extension()
             .and_then(std::ffi::OsStr::to_str)
@@ -297,7 +297,7 @@ impl MrtInRunner {
                     &filename.to_string_lossy(),
                     t0.elapsed().as_millis()
                 );
-                MrtFile::new(&buf[..])
+                &buf[..]
             }
             Some("bz2") => {
                 let mut bz2 = BzDecoder::new(&mmap[..]);
@@ -310,16 +310,19 @@ impl MrtInRunner {
                     &filename.to_string_lossy(),
                     t0.elapsed().as_millis()
                 );
-                MrtFile::new(&buf[..])
+                &buf[..]
             }
-            _ => MrtFile::new(&mmap[..]),
+            _ => &mmap[..],
         };
+        let mrt_file = MrtFile::new(mrt_bytes);
 
         let mut routes_sent = 0;
 
         // --- Dump part (RIB entries)
         //
-        if let Ok(peer_index_table) = mrt_file.pi() {
+        let rib_bytes = supported_rib_records(mrt_bytes)?;
+        let rib_file = MrtFile::new(&rib_bytes);
+        if let Ok(peer_index_table) = rib_file.pi() {
             debug!(
                 "found peer index table of len {} in {}",
                 peer_index_table.len(),
@@ -340,7 +343,7 @@ impl MrtInRunner {
                 ingress_map.push(id);
             }
 
-            let rib_entries = mrt_file.rib_entries()?;
+            let rib_entries = rib_file.rib_entries()?;
             for (afisafi, peer_id, _peer_entry, prefix, raw_attr) in
                 rib_entries
             {
@@ -761,5 +764,90 @@ impl From<std::io::Error> for MrtError {
 impl From<MrtError> for std::io::Error {
     fn from(e: MrtError) -> Self {
         std::io::Error::other(e.to_string())
+    }
+}
+
+/// Return a TABLE_DUMP_V2 stream containing only the records understood by
+/// Routecore's legacy `rib_entries()` iterator.
+///
+/// A real MRT file can mix the peer-index table and IPv4/IPv6 unicast RIBs
+/// with multicast, generic, ADD-PATH, or unrelated MRT record types. The
+/// fallible `records()` iterator safely frames all of them, while
+/// `rib_entries()` still assumes every record after the peer-index table is a
+/// plain unicast RIB and panics for other valid subtypes. Filtering by framed
+/// record boundaries lets Rotonda retain the supported routes and skip the
+/// rest without panicking.
+fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
+    let file = MrtFile::new(raw);
+    let mut offset = 0usize;
+    let mut filtered = Vec::new();
+
+    for record in file.records() {
+        let record = record?;
+        let size = 12usize
+            .checked_add(record.length() as usize)
+            .ok_or_else(|| MrtError::other("MRT record length overflow"))?;
+        let end = offset
+            .checked_add(size)
+            .filter(|end| *end <= raw.len())
+            .ok_or_else(|| MrtError::other("MRT record exceeds input"))?;
+
+        if matches!(
+            record.subtype(),
+            MessageSubType::TableDumpv2SubType(
+                TableDumpv2SubType::PeerIndexTable
+                    | TableDumpv2SubType::RibIpv4Unicast
+                    | TableDumpv2SubType::RibIpv6Unicast
+            )
+        ) {
+            filtered.extend_from_slice(&raw[offset..end]);
+        }
+        offset = end;
+    }
+
+    Ok(filtered)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use mrtgen::{generate, GeneratorConfig};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn processes_mrtgen_valid_corpus() {
+        let corpus = generate(&GeneratorConfig {
+            include_skip: false,
+            include_combo: false,
+            include_attr_errors: false,
+            ..GeneratorConfig::default()
+        });
+        assert!(corpus.manifest.counts.valid > 0);
+        assert_eq!(corpus.manifest.counts.skip, 0);
+        assert_eq!(corpus.manifest.counts.abort, 0);
+
+        let path = std::env::temp_dir()
+            .join(format!("netom-mrtgen-valid-{}.mrt", std::process::id()));
+        std::fs::write(&path, &corpus.bytes).unwrap();
+
+        let (gate, _gate_agent) = Gate::new(0);
+        let metrics = gate.metrics();
+        let ingresses = Arc::new(ingress::Register::new());
+        let parent_id = ingresses.register();
+
+        let result = MrtInRunner::process_file(
+            gate,
+            ingresses.clone(),
+            parent_id,
+            path.clone(),
+        )
+        .await;
+        let _ = std::fs::remove_file(path);
+
+        result.expect("Rotonda should process mrtgen's valid MRT corpus");
+        assert!(metrics.num_updates.load(Ordering::SeqCst) > 0);
+        assert!(ingresses.memory_summary().total > 0);
     }
 }
