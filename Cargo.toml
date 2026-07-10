@@ -138,7 +138,7 @@ name = "netom"
 maintainer = "FastNetMon Inc <support@fastnetmon.com>"
 license-file = ["LICENSE", "0"]
 extended-description = """\
-FastNetMon Inc maintained fork of Netom, a BGP/BMP routing data engine
+FastNetMon Inc maintained fork of Rotonda, a BGP/BMP routing data engine
 originally developed by NLnet Labs. Applications that you can build with
 Netom include, but are not limited to, a route monitor, a route collector,
 a route server, or a route reflector."""

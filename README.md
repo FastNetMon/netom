@@ -8,6 +8,25 @@ release. The original upstream project is available at
 <https://github.com/NLnetLabs/rotonda/>. See [NOTICE.md](NOTICE.md) for fork
 attribution and licensing notes.
 
+## Why Netom?
+
+Netom is focused on production deployments that collect, process, and
+redistribute large volumes of BGP and BMP routing data. Compared with the
+Rotonda version from which it was forked, Netom adds:
+
+- BMP restreaming with an initial RIB dump followed by live updates;
+- bounded buffers, streaming full-RIB exports, and slow-consumer protection;
+- stronger BMP peer lifecycle, reconnect, withdrawal, and memory handling;
+- TLS and access controls for BMP consumers;
+- TCP MD5 authentication for BGP sessions;
+- additional operational metrics, memory diagnostics, packaging, and
+  large-scale MRT ingestion testing.
+
+These changes make Netom particularly suitable for FastNetMon and other
+high-volume routing-monitoring pipelines. Rotonda continues to evolve
+independently, so users should choose between the projects based on the
+features and compatibility requirements of their deployment.
+
 The current version of Netom allows you to open BGP and BMP sessions and
 collect incoming routes from many peers into a in-memory database, modeled as
 a Routing Information Base (RIB). It also supports importing routes from MRT
@@ -46,12 +65,12 @@ Upstream NLnet Labs community resources may not apply to this fork.
 
 #### Flexibility
    The behaviour of the units can be modeled by using a small, fun programming
-   language called `Roto`, that we created to combine flexibility and
-   ease-of-use. Right now, `Roto` is used define filters that run in the hot
-   path of the Netom pipeline. It's our goal to integrate filter definition,
+   language called `Roto`, developed by NLnet Labs to combine flexibility and
+   ease-of-use. Right now, `Roto` is used to define filters that run in the hot
+   path of the Netom pipeline. Netom aims to integrate filter definition,
    configuration syntax, and query syntax into `Roto` scripts in one place.
-   Modifying, versioning and provisioning of your `Roto` scripts should be
-   as straight forward as possible.
+   Modifying, versioning and provisioning of your `Roto` scripts should be as
+   straightforward as possible.
 
 #### Tailored Performance
    Netom aims to offer units that perform the same task, but with different
