@@ -18,7 +18,9 @@ use routecore::bgp::nlri::afisafi::{Ipv4UnicastNlri, Nlri};
 use routecore::bgp::types::AfiSafiType;
 use routecore::bgp::workshop::route::RouteWorkshop;
 use routecore::bgp::ParseError;
-use routecore::mrt::{MessageSubType, MrtFile, TableDumpv2SubType};
+use routecore::mrt::{
+    MessageSubType, MrtFile, RibEntryNlri, TableDumpv2SubType,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use smallvec::SmallVec;
@@ -344,35 +346,39 @@ impl MrtInRunner {
             }
 
             let rib_entries = rib_file.rib_entries()?;
-            for (afisafi, peer_id, _peer_entry, prefix, raw_attr) in
+            for (afisafi, peer_id, _peer_entry, nlri, raw_attr) in
                 rib_entries
             {
-                let rr = match afisafi {
-                    AfiSafiType::Ipv4Unicast => {
+                let rr = match (afisafi, nlri) {
+                    (AfiSafiType::Ipv4Unicast, RibEntryNlri::Prefix(prefix)) => {
                         RotondaRoute::Ipv4Unicast(
                             prefix.try_into().map_err(MrtError::other)?,
                             RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
                         )
                     }
-                    AfiSafiType::Ipv6Unicast => {
+                    (AfiSafiType::Ipv6Unicast, RibEntryNlri::Prefix(prefix)) => {
                         let raw_attr = normalize_mrt_mp_reach(raw_attr, 2, 1, &prefix);
                         RotondaRoute::Ipv6Unicast(
                             prefix.try_into().map_err(MrtError::other)?,
                             RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
                         )
                     }
-                    AfiSafiType::Ipv4Multicast |
-                    AfiSafiType::Ipv4MplsUnicast |
-                    AfiSafiType::Ipv4MplsVpnUnicast |
-                    AfiSafiType::Ipv4RouteTarget |
-                    AfiSafiType::Ipv4FlowSpec |
-                    AfiSafiType::Ipv6Multicast |
-                    AfiSafiType::Ipv6MplsUnicast |
-                    AfiSafiType::Ipv6MplsVpnUnicast |
-                    AfiSafiType::Ipv6FlowSpec |
-                    AfiSafiType::L2VpnVpls |
-                    AfiSafiType::L2VpnEvpn |
-                    AfiSafiType::Unsupported(_, _) => {
+                    (
+                        AfiSafiType::Ipv4FlowSpec | AfiSafiType::Ipv6FlowSpec,
+                        RibEntryNlri::FlowSpec(raw_nlri),
+                    ) => {
+                        match mk_flowspec_route(afisafi, raw_nlri, raw_attr) {
+                            Some(rr) => rr,
+                            None => {
+                                debug!(
+                                    "malformed {} RIB_GENERIC entry, skipping",
+                                    afisafi
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                    (afisafi, _) => {
                         debug!("unsupported AFI/SAFI {}, skipping", afisafi);
                         continue
                     }
@@ -767,6 +773,49 @@ impl From<MrtError> for std::io::Error {
     }
 }
 
+/// Build a flowspec RotondaRoute from a RIB_GENERIC entry: re-frame the raw
+/// NLRI bytes with their RFC 8955 §4.1 length header and parse them into the
+/// owned-Bytes NLRI wrapper. Returns `None` on malformed bytes.
+fn mk_flowspec_route(
+    afisafi: AfiSafiType,
+    raw_nlri: Vec<u8>,
+    raw_attr: Vec<u8>,
+) -> Option<RotondaRoute> {
+    use routecore::bgp::nlri::flowspec::FlowSpecNlri;
+    use routecore::bgp::types::Afi;
+
+    let len = raw_nlri.len();
+    let mut wire = Vec::with_capacity(len + 2);
+    if len >= 240 {
+        wire.extend_from_slice(
+            &(0xf000u16 | u16::try_from(len).ok().filter(|l| *l <= 4095)?)
+                .to_be_bytes(),
+        );
+    } else {
+        wire.push(len as u8);
+    }
+    wire.extend_from_slice(&raw_nlri);
+    let bytes = bytes::Bytes::from(wire);
+    let mut parser = octseq::Parser::from_ref(&bytes);
+    let pamap = RotondaPaMap::new(
+        routecore::bgp::path_attributes::OwnedPathAttributes::new(
+            PduParseInfo::modern(),
+            raw_attr,
+        ),
+    );
+    match afisafi {
+        AfiSafiType::Ipv4FlowSpec => {
+            let n = FlowSpecNlri::parse(&mut parser, Afi::Ipv4).ok()?;
+            Some(RotondaRoute::Ipv4FlowSpec(n.into(), pamap))
+        }
+        AfiSafiType::Ipv6FlowSpec => {
+            let n = FlowSpecNlri::parse(&mut parser, Afi::Ipv6).ok()?;
+            Some(RotondaRoute::Ipv6FlowSpec(n.into(), pamap))
+        }
+        _ => None,
+    }
+}
+
 /// Return a TABLE_DUMP_V2 stream containing only the records understood by
 /// Routecore's legacy `rib_entries()` iterator.
 ///
@@ -798,6 +847,9 @@ fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
                 TableDumpv2SubType::PeerIndexTable
                     | TableDumpv2SubType::RibIpv4Unicast
                     | TableDumpv2SubType::RibIpv6Unicast
+                    // FlowSpec arrives as RIB_GENERIC; the iterator skips
+                    // generic families it cannot frame.
+                    | TableDumpv2SubType::RibGeneric
             )
         ) {
             filtered.extend_from_slice(&raw[offset..end]);

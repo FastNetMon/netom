@@ -301,6 +301,11 @@ name = "Explicit-protocols"
 remote_asn = 100
 protocols = ["Ipv4Unicast", "L2VpnEvpn"]
 addpath = ["Ipv4Unicast", "Ipv6Unicast"]
+
+[peers."2.3.4.8"]
+name = "Flowspec-peer"
+remote_asn = 100
+protocols = ["Ipv4Unicast", "Ipv6Unicast", "Ipv4FlowSpec", "Ipv6FlowSpec"]
 "#;
 
         let Unit::BgpTcpIn(cfg) = toml::from_str::<Unit>(toml).unwrap()
@@ -349,6 +354,24 @@ addpath = ["Ipv4Unicast", "Ipv6Unicast"]
         assert_eq!(
             cfg4.1.addpath,
             vec![AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast]
+        );
+
+        // FlowSpec (SAFI 133) is negotiated purely via the configured
+        // protocols list: routecore's OPEN builder emits an MP capability
+        // per entry, generically over AfiSafiType.
+        let cfg5 = cfg
+            .peer_configs
+            .get(IpAddr::from_str("2.3.4.8").unwrap())
+            .unwrap();
+        assert!(cfg5.1.name == "Flowspec-peer");
+        assert_eq!(
+            cfg5.1.protocols,
+            vec![
+                AfiSafiType::Ipv4Unicast,
+                AfiSafiType::Ipv6Unicast,
+                AfiSafiType::Ipv4FlowSpec,
+                AfiSafiType::Ipv6FlowSpec,
+            ]
         );
     }
 }
