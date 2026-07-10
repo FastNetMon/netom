@@ -773,7 +773,15 @@ pub mod bgp {
             // From: https://datatracker.ietf.org/doc/html/rfc4271#section-4.3
             match announcements {
                 Announcements::None => {
-                    buf.extend_from_slice(&0u16.to_be_bytes()); // 0 path attributes and no NLRI field
+                    // No synthesized attributes or NLRI field; the caller's
+                    // extra attributes (e.g. a hand-built MP_REACH for
+                    // flowspec) still go in.
+                    let num_path_attribute_bytes =
+                        u16::try_from(extra_path_attributes.len()).unwrap();
+                    buf.extend_from_slice(
+                        &num_path_attribute_bytes.to_be_bytes(),
+                    );
+                    buf.extend_from_slice(extra_path_attributes);
                 }
                 Announcements::Some {
                     origin,

@@ -274,13 +274,11 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
     /// Return the prefix for this `RotondaRoute`
     #[roto_method(rt, MutRotondaRoute, prefix)]
     fn route_prefix(rr: Val<MutRotondaRoute>) -> Prefix {
+        // For flowspec routes this is the destination-prefix component if
+        // usable as a key, else the family default route (see
+        // RotondaRoute::index_prefix).
         let rr = rr.borrow_mut();
-        match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        }
+        rr.index_prefix()
     }
 
     /// Check whether the prefix for this `RotondaRoute` matches
@@ -290,12 +288,7 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
         to_match: Val<Prefix>,
     ) -> bool {
         let rr = rr.borrow_mut();
-        let rr_prefix = match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        };
+        let rr_prefix = rr.index_prefix();
         rr_prefix == *to_match
     }
 
@@ -364,16 +357,34 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
     }
 
     /// Return a formatted string for the prefix
+    ///
+    /// For FlowSpec routes this is the rule's destination-prefix component
+    /// when one is usable as a key, else the family default route
+    /// (`0.0.0.0/0` / `::/0`) — the same prefix the rule is keyed on in
+    /// the RIB.
     #[roto_method(rt, MutRotondaRoute, fmt_prefix)]
     fn rr_fmt_prefix(rr: Val<MutRotondaRoute>) -> Arc<str> {
         let rr = rr.borrow();
-        let prefix = match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        };
-        prefix.to_string().into()
+        rr.index_prefix().to_string().into()
+    }
+
+    /// Whether this `RotondaRoute` is a FlowSpec rule (SAFI 133)
+    #[roto_method(rt, MutRotondaRoute, is_flowspec)]
+    fn rr_is_flowspec(rr: Val<MutRotondaRoute>) -> bool {
+        let rr = rr.borrow();
+        rr.is_flowspec()
+    }
+
+    /// Return the human-readable FlowSpec rule, or an empty string for
+    /// non-FlowSpec routes
+    #[roto_method(rt, MutRotondaRoute, fmt_flowspec)]
+    fn rr_fmt_flowspec(rr: Val<MutRotondaRoute>) -> Arc<str> {
+        let rr = rr.borrow();
+        match &*rr {
+            RotondaRoute::Ipv4FlowSpec(n, ..) => n.to_string().into(),
+            RotondaRoute::Ipv6FlowSpec(n, ..) => n.to_string().into(),
+            _ => "".into(),
+        }
     }
 
     /// Return a formatted string for the ROV status

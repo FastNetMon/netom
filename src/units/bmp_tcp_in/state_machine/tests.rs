@@ -8,6 +8,7 @@ use inetnum::{addr::Prefix, asn::Asn};
 //    builtin::{BuiltinTypeValue, NlriStatus, RouteContext},
 //    typevalue::TypeValue,
 //};
+use routecore::bgp::nlri::afisafi::AfiSafiNlri;
 use routecore::bmp::message::{Message as BmpMsg, PerPeerHeader, RibType};
 
 use crate::{
@@ -1578,6 +1579,197 @@ fn route_monitoring_announce_route() {
         } else {
             panic!("Expected a bulk update");
         }
+    }
+}
+
+// FlowSpec test NLRI: length byte + {dst 10.0.1.0/24, proto =17, dport =53}
+const FS_TEST_NLRI: &[u8] = &[
+    0x0b, 0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11, 0x05, 0x81, 0x35,
+];
+
+/// BMP Route Monitoring carrying a FlowSpec (SAFI 133) announce or
+/// withdraw, hand-built as MP_REACH/MP_UNREACH extra path attributes.
+fn mk_flowspec_route_monitoring_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+    announce: bool,
+) -> BmpMsg<Bytes> {
+    let mut attrs: Vec<u8> = vec![];
+    if announce {
+        // ORIGIN igp
+        attrs.extend_from_slice(&[0x40, 1, 1, 0]);
+        // MP_REACH_NLRI: AFI 1, SAFI 133, nh_len 0, reserved, NLRI
+        let val_len = u8::try_from(5 + FS_TEST_NLRI.len()).unwrap();
+        attrs.extend_from_slice(&[0x80, 14, val_len]);
+        attrs.extend_from_slice(&[0x00, 0x01, 133, 0x00, 0x00]);
+        attrs.extend_from_slice(FS_TEST_NLRI);
+        // EXTENDED_COMMUNITIES: traffic-rate 0 (drop)
+        attrs.extend_from_slice(&[
+            0xc0, 16, 8, 0x80, 0x06, 0, 0, 0, 0, 0, 0,
+        ]);
+    } else {
+        // MP_UNREACH_NLRI: AFI 1, SAFI 133, NLRI
+        let val_len = u8::try_from(3 + FS_TEST_NLRI.len()).unwrap();
+        attrs.extend_from_slice(&[0x80, 15, val_len]);
+        attrs.extend_from_slice(&[0x00, 0x01, 133]);
+        attrs.extend_from_slice(FS_TEST_NLRI);
+    }
+    BmpMsg::from_octets(crate::bgp::encode::mk_route_monitoring_msg(
+        pph,
+        &Prefixes::default(),
+        &Announcements::None,
+        &attrs,
+    ))
+    .unwrap()
+}
+
+/// A SAFI-133 End-of-RIB marker: an UPDATE whose only attribute is an
+/// empty MP_UNREACH_NLRI for AFI 1 / SAFI 133.
+fn mk_flowspec_end_of_rib_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+) -> BmpMsg<Bytes> {
+    let attrs: Vec<u8> = vec![0x80, 15, 3, 0x00, 0x01, 133];
+    BmpMsg::from_octets(crate::bgp::encode::mk_route_monitoring_msg(
+        pph,
+        &Prefixes::default(),
+        &Announcements::None,
+        &attrs,
+    ))
+    .unwrap()
+}
+
+#[test]
+fn route_monitoring_flowspec_announce_and_withdraw() {
+    use rotonda_store::prefix_record::RouteStatus;
+
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let (pph, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    // Announce
+    let res = processor.process_msg(
+        Instant::now(),
+        mk_flowspec_route_monitoring_msg(&pph, true),
+        None,
+    );
+    let processor = res.next_state;
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
+        panic!("expected a routing update");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected a bulk update");
+    };
+    assert_eq!(payloads.len(), 1);
+    let payload = &payloads[0];
+    assert_eq!(payload.route_status, RouteStatus::Active);
+    let RotondaRoute::Ipv4FlowSpec(n, pamap) = &payload.rx_value else {
+        panic!("expected an Ipv4FlowSpec route, got {}", payload.rx_value);
+    };
+    // Identity is the raw NLRI bytes (without the length header).
+    assert_eq!(n.nlri().raw().as_ref(), &FS_TEST_NLRI[1..]);
+    assert_eq!(
+        n.nlri().dst_prefix(),
+        Some(Prefix::from_str("10.0.1.0/24").unwrap())
+    );
+    // The action extended community travels in the pamap.
+    use routecore::bgp::communities::FlowSpecEc;
+    use routecore::bgp::path_attributes::PathAttributeType;
+    let owned = pamap.path_attributes();
+    assert!(owned
+        .iter()
+        .any(|pa| pa.map(|pa| pa.type_code()).ok()
+            == Some(PathAttributeType::ExtendedCommunities.into())));
+    let ecs = pamap
+        .path_attributes()
+        .get::<routecore::bgp::path_attributes::ExtendedCommunitiesList>()
+        .expect("ext communities present");
+    let actions: Vec<FlowSpecEc> = ecs
+        .communities()
+        .iter()
+        .filter_map(|ec| ec.flowspec())
+        .collect();
+    assert_eq!(actions.len(), 1);
+    assert_eq!(actions[0].to_string(), "drop");
+
+    // Withdraw
+    let res = processor.process_msg(
+        Instant::now(),
+        mk_flowspec_route_monitoring_msg(&pph, false),
+        None,
+    );
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
+        panic!("expected a routing update");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected a bulk update");
+    };
+    assert_eq!(payloads.len(), 1);
+    let payload = &payloads[0];
+    assert_eq!(payload.route_status, RouteStatus::Withdrawn);
+    let RotondaRoute::Ipv4FlowSpec(n, _) = &payload.rx_value else {
+        panic!("expected an Ipv4FlowSpec route, got {}", payload.rx_value);
+    };
+    assert_eq!(n.nlri().raw().as_ref(), &FS_TEST_NLRI[1..]);
+}
+
+#[test]
+fn flowspec_end_of_rib_clears_pending_eor() {
+    let processor = mk_test_processor();
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    // EoR-capable peer: flowspec announcements register a pending EoR.
+    let (peer_up_msg_buf, _pph) = mk_peer_up_notification_msg(
+        &mk_per_peer_header("127.0.0.1", 12345),
+        true,
+    );
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    let pph_encode = mk_per_peer_header("127.0.0.1", 12345);
+    let processor = processor
+        .process_msg(
+            Instant::now(),
+            mk_flowspec_route_monitoring_msg(&pph_encode, true),
+            None,
+        )
+        .next_state;
+    if let BmpState::Dumping(d) = &processor {
+        assert_eq!(d.details.num_pending_eors(), 1);
+    } else {
+        panic!("expected Dumping state");
+    }
+
+    // The SAFI-133 EoR clears the pending entry; as the only pending EoR
+    // it also transitions the peer table to up-to-date (Updating state).
+    let res = processor.process_msg(
+        Instant::now(),
+        mk_flowspec_end_of_rib_msg(&pph_encode),
+        None,
+    );
+    match &res.next_state {
+        BmpState::Updating(u) => {
+            assert_eq!(u.details.num_pending_eors(), 0);
+        }
+        BmpState::Dumping(d) => {
+            assert_eq!(d.details.num_pending_eors(), 0);
+        }
+        other => panic!("unexpected state {:?}", other),
     }
 }
 

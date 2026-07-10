@@ -2088,7 +2088,7 @@ dependencies = [
  "reqwest",
  "roto",
  "rotonda-store",
- "routecore 0.7.3-dev",
+ "routecore",
  "rpki",
  "rshtml",
  "rumqttc",
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#d9970b574eeb3bcfbf9e0951ba31049f0a135e1c"
+source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#836c6af6af6624c6db30772ff7cce536460fa87d"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2748,7 +2748,7 @@ dependencies = [
  "parking_lot_core",
  "rand 0.9.3",
  "roaring",
- "routecore 0.5.2",
+ "routecore",
  "rustc-hash",
  "serde",
  "serde_derive",
@@ -2758,26 +2758,8 @@ dependencies = [
 
 [[package]]
 name = "routecore"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dfe4daf99c74d8af82cfeab5e764d089fc47c47fcabffca35f9250f3f4a14a7"
-dependencies = [
- "bytes",
- "chrono",
- "const-str",
- "inetnum",
- "log",
- "octseq",
- "paste",
- "rayon",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git#346e9cee77e097edb01a8c0bb8d9f96d4f61b11d"
+source = "git+https://github.com/nuclearcat/routecore.git#899cf130c558058ab025338743317fcaf750b1fc"
 dependencies = [
  "bytes",
  "chrono",
@@ -3323,7 +3305,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.2",
  "once_cell",
  "rustix",
  "windows-sys 0.59.0",

@@ -390,6 +390,14 @@ impl Manager {
                 &crate::roto_runtime::types::unsupported_nlri_metrics(),
             ) as Weak<dyn metrics::Source>,
         );
+        // Global FlowSpec ingest counters and stored-rule gauges; same
+        // LazyLock-owned lifetime pattern as unsupported_nlri above.
+        metrics.register(
+            "flowspec".into(),
+            Arc::downgrade(
+                &crate::units::rib_unit::flowspec::flowspec_metrics(),
+            ) as Weak<dyn metrics::Source>,
+        );
         let http_ng_api = Arc::new(Mutex::new(http_ng::Api::new(
             Vec::with_capacity(1), // interfaces come from config, later on
             ingresses.clone(),

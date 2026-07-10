@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use rotonda_store::prefix_record::{Meta, RouteStatus};
 use routecore::bgp::message::PduParseInfo;
+use routecore::bgp::nlri::afisafi::{AfiSafiNlri, IsPrefix};
 use routecore::bgp::path_attributes::OwnedPathAttributes;
 use routecore::bgp::path_selection::TiebreakerInfo;
 use routecore::bgp::types::AfiSafiType;
@@ -51,6 +52,14 @@ pub enum RotondaRoute {
         routecore::bgp::nlri::afisafi::Ipv6MulticastNlri,
         RotondaPaMap,
     ),
+    Ipv4FlowSpec(
+        routecore::bgp::nlri::afisafi::Ipv4FlowSpecNlri<Bytes>,
+        RotondaPaMap,
+    ),
+    Ipv6FlowSpec(
+        routecore::bgp::nlri::afisafi::Ipv6FlowSpecNlri<Bytes>,
+        RotondaPaMap,
+    ),
     // TODO support all routecore AfiSafiTypes
 }
 
@@ -69,6 +78,14 @@ impl Serialize for RotondaRoute {
             RotondaRoute::Ipv6Multicast(n, _) => {
                 s.serialize_field("prefix", n)
             }
+            // FlowSpec rules have no single prefix; serialize the
+            // human-readable rule instead.
+            RotondaRoute::Ipv4FlowSpec(n, _) => {
+                s.serialize_field("flowspec", &n.to_string())
+            }
+            RotondaRoute::Ipv6FlowSpec(n, _) => {
+                s.serialize_field("flowspec", &n.to_string())
+            }
         }?;
 
         s.serialize_field("attributes", self.rotonda_pamap())?;
@@ -85,6 +102,8 @@ impl RotondaRoute {
             RotondaRoute::Ipv6Unicast(_, p) => p.path_attributes(),
             RotondaRoute::Ipv4Multicast(_, p) => p.path_attributes(),
             RotondaRoute::Ipv6Multicast(_, p) => p.path_attributes(),
+            RotondaRoute::Ipv4FlowSpec(_, p) => p.path_attributes(),
+            RotondaRoute::Ipv6FlowSpec(_, p) => p.path_attributes(),
         }
     }
 
@@ -94,6 +113,8 @@ impl RotondaRoute {
             RotondaRoute::Ipv6Unicast(_, p) => p,
             RotondaRoute::Ipv4Multicast(_, p) => p,
             RotondaRoute::Ipv6Multicast(_, p) => p,
+            RotondaRoute::Ipv4FlowSpec(_, p) => p,
+            RotondaRoute::Ipv6FlowSpec(_, p) => p,
         }
     }
 
@@ -103,7 +124,44 @@ impl RotondaRoute {
             RotondaRoute::Ipv6Unicast(_, ref mut p) => p,
             RotondaRoute::Ipv4Multicast(_, ref mut p) => p,
             RotondaRoute::Ipv6Multicast(_, ref mut p) => p,
+            RotondaRoute::Ipv4FlowSpec(_, ref mut p) => p,
+            RotondaRoute::Ipv6FlowSpec(_, ref mut p) => p,
         }
+    }
+
+    /// The prefix under which this route is keyed in the RIB.
+    ///
+    /// For unicast/multicast this is the NLRI prefix. For FlowSpec it is
+    /// the destination-prefix component when one is usable as a key (always
+    /// for IPv4; for IPv6 only when the pattern offset is 0), otherwise the
+    /// family default route (`0.0.0.0/0` / `::/0`). roto scripts, the HTTP
+    /// API and the store all derive the key through this one helper.
+    pub fn index_prefix(&self) -> inetnum::addr::Prefix {
+        match self {
+            RotondaRoute::Ipv4Unicast(n, _) => n.prefix(),
+            RotondaRoute::Ipv6Unicast(n, _) => n.prefix(),
+            RotondaRoute::Ipv4Multicast(n, _) => n.prefix(),
+            RotondaRoute::Ipv6Multicast(n, _) => n.prefix(),
+            RotondaRoute::Ipv4FlowSpec(n, _) => {
+                n.nlri().dst_prefix().unwrap_or(
+                    inetnum::addr::Prefix::new_v4(0.into(), 0)
+                        .expect("default v4 prefix"),
+                )
+            }
+            RotondaRoute::Ipv6FlowSpec(n, _) => {
+                n.nlri().dst_prefix().unwrap_or(
+                    inetnum::addr::Prefix::new_v6(0.into(), 0)
+                        .expect("default v6 prefix"),
+                )
+            }
+        }
+    }
+
+    pub fn is_flowspec(&self) -> bool {
+        matches!(
+            self,
+            RotondaRoute::Ipv4FlowSpec(..) | RotondaRoute::Ipv6FlowSpec(..)
+        )
     }
 }
 
@@ -121,6 +179,12 @@ impl fmt::Display for RotondaRoute {
             }
             RotondaRoute::Ipv6Multicast(p, ..) => {
                 write!(f, "RR-Ipv6Multicast {}", p)
+            }
+            RotondaRoute::Ipv4FlowSpec(n, ..) => {
+                write!(f, "RR-Ipv4FlowSpec {}", n)
+            }
+            RotondaRoute::Ipv6FlowSpec(n, ..) => {
+                write!(f, "RR-Ipv6FlowSpec {}", n)
             }
         }
     }
@@ -278,6 +342,18 @@ impl RotondaPaMap {
         Self {
             raw: interner.intern(self.raw.as_ref()),
         }
+    }
+
+    /// Reconstruct from backing bytes previously obtained via
+    /// [`raw_arc`](Self::raw_arc) (rpki byte + ppi byte + attribute blob),
+    /// e.g. out of a flowspec rule-set record. Anything shorter than the
+    /// two prefix bytes falls back to an empty attribute map so the
+    /// accessors' `raw[0]`/`raw[1]` reads stay in bounds.
+    pub fn from_raw(raw: Vec<u8>) -> Self {
+        if raw.len() < 2 {
+            return Self::empty_path_attributes();
+        }
+        Self { raw: raw.into() }
     }
 
     pub fn set_rpki_info(&mut self, rpki_info: RpkiInfo) {

@@ -15,7 +15,7 @@ use inetnum::{addr::Prefix, asn::Asn};
 use log::{debug, warn};
 use routecore::bgp::{
     message::UpdateMessage,
-    nlri::afisafi::{Nlri, NlriType},
+    nlri::afisafi::{AfiSafiNlri, Nlri, NlriType},
     types::AfiSafiType,
 };
 use serde::{Deserialize, Serialize};
@@ -668,7 +668,7 @@ fn note_unsupported_nlri(nlri_type: NlriType) {
     UNSUPPORTED_NLRI.note(nlri_type, Instant::now());
 }
 
-impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
+impl<O: AsRef<[u8]>> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
     type Error = ();
     fn try_from(value: (Nlri<O>, RotondaPaMap)) -> Result<Self, Self::Error> {
         let res = match value.0 {
@@ -676,6 +676,16 @@ impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
             Nlri::Ipv4Multicast(n) => RotondaRoute::Ipv4Multicast(n, value.1),
             Nlri::Ipv6Unicast(n) => RotondaRoute::Ipv6Unicast(n, value.1),
             Nlri::Ipv6Multicast(n) => RotondaRoute::Ipv6Multicast(n, value.1),
+            // Copy the flowspec NLRI out of the (possibly borrowed) octets
+            // into owned Bytes; identity is the raw NLRI bytes.
+            Nlri::Ipv4FlowSpec(n) => RotondaRoute::Ipv4FlowSpec(
+                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                value.1,
+            ),
+            Nlri::Ipv6FlowSpec(n) => RotondaRoute::Ipv6FlowSpec(
+                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                value.1,
+            ),
 
             Nlri::Ipv4UnicastAddpath(..)
             | Nlri::Ipv4MulticastAddpath(..)
@@ -685,7 +695,6 @@ impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
             | Nlri::Ipv4MplsVpnUnicastAddpath(..)
             | Nlri::Ipv4RouteTarget(..)
             | Nlri::Ipv4RouteTargetAddpath(..)
-            | Nlri::Ipv4FlowSpec(..)
             | Nlri::Ipv4FlowSpecAddpath(..)
             | Nlri::Ipv6UnicastAddpath(..)
             | Nlri::Ipv6MulticastAddpath(..)
@@ -693,7 +702,6 @@ impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
             | Nlri::Ipv6MplsUnicastAddpath(..)
             | Nlri::Ipv6MplsVpnUnicast(..)
             | Nlri::Ipv6MplsVpnUnicastAddpath(..)
-            | Nlri::Ipv6FlowSpec(..)
             | Nlri::Ipv6FlowSpecAddpath(..)
             | Nlri::L2VpnVpls(..)
             | Nlri::L2VpnVplsAddpath(..)
