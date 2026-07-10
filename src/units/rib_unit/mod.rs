@@ -3,6 +3,7 @@ pub use http_ng::{Include, QueryFilter};
 mod metrics;
 mod status_reporter;
 
+pub(crate) mod flowspec;
 pub(crate) mod rib;
 
 #[cfg(test)]

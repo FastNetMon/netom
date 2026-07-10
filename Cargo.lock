@@ -2737,7 +2737,6 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#d9970b574eeb3bcfbf9e0951ba31049f0a135e1c"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",

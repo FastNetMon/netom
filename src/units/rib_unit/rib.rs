@@ -24,7 +24,7 @@ use rotonda_store::{
 };
 use routecore::bgp::{
     aspath::HopPath,
-    nlri::afisafi::{IsPrefix, Nlri},
+    nlri::afisafi::{AfiSafiNlri, IsPrefix, Nlri},
     path_attributes::PaMap,
     path_selection::{OrdRoute, Rfc4271, TiebreakerInfo},
     types::{AfiSafiType, Otc},
@@ -44,6 +44,9 @@ use crate::{
     roto_runtime::{types::RotoPackage, Ctx},
 };
 
+use super::flowspec::{
+    FlowSpecQueryRow, FlowSpecRuleSet, FlowSpecStore, FlowSpecValidity,
+};
 use super::{http_ng::Include, QueryFilter};
 
 type Store = StarCastRib<RotondaPaMap, MemoryOnlyConfig>;
@@ -147,9 +150,11 @@ type RotoHttpFilter = roto::TypedFunc<
 pub struct Rib {
     unicast: Arc<Option<Store>>,
     multicast: Arc<Option<Store>>,
-    #[allow(dead_code)]
-    other_fams:
-        HashMap<AfiSafiType, HashMap<(IngressId, Nlri<bytes::Bytes>), PaMap>>,
+    /// FlowSpec rules (SAFI 133, v4+v6 in the one dual-family store), keyed
+    /// on `RotondaRoute::index_prefix()` — the destination-prefix component,
+    /// or the family default route for rules without a usable one. The
+    /// record value per `(prefix, mui)` is a whole [`FlowSpecRuleSet`] blob.
+    flowspec: Arc<Option<FlowSpecStore>>,
     pub(crate) ingress_register: Arc<ingress::Register>,
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
@@ -162,6 +167,15 @@ pub struct Rib {
     // loses a CAS race livelocks indefinitely. Holding this mutex around
     // every call guarantees there's only ever one in flight.
     withdraw_lock: Arc<Mutex<()>>,
+    // Serialises the read-modify-write of FlowSpecRuleSet blobs: the store
+    // overwrites whole records per (prefix, mui), so two concurrent
+    // upserts of different rules under the same key would lose one rule
+    // without this. Deliberately NOT withdraw_lock — that one is held
+    // across whole-store compaction walks and would stall flowspec ingest
+    // during peer-down cascades. Lock order is always
+    // flowspec_lock -> withdraw_lock (via mark_ingress_active inside
+    // insert_flowspec); no path acquires them in reverse.
+    flowspec_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -176,7 +190,7 @@ impl Rib {
         Ok(Rib {
             unicast: Arc::new(Some(Store::try_default()?)),
             multicast: Arc::new(Some(Store::try_default()?)),
-            other_fams: HashMap::new(),
+            flowspec: Arc::new(Some(FlowSpecStore::try_default()?)),
             ingress_register,
             roto_package,
             roto_context,
@@ -184,6 +198,7 @@ impl Rib {
                 PathAttributeInterner::default(),
             ),
             withdraw_lock: Arc::new(Mutex::new(())),
+            flowspec_lock: Arc::new(Mutex::new(())),
         })
     }
 
@@ -253,6 +268,18 @@ impl Rib {
             );
         }
 
+        if let Some(store) = self.flowspec.as_ref() {
+            let prefixes = store.prefixes_count().in_memory();
+            let records = store.routes_count().in_memory();
+            info!(
+                "memstat: flowspec keys={} (v4 {} / v6 {}) rule-sets={}",
+                fmt_count(prefixes),
+                fmt_count(store.prefixes_v4_count().in_memory()),
+                fmt_count(store.prefixes_v6_count().in_memory()),
+                fmt_count(records),
+            );
+        }
+
         let (buckets, weak_slots, live_blobs) =
             self.path_attribute_interner.stats();
         info!(
@@ -290,6 +317,26 @@ impl Rib {
         // rib unit's `memstat_status_split` config flag is on (hot-reloadable;
         // off by default). Leave it off for normal operation.
         if status_split {
+            if let Some(store) = self.flowspec.as_ref() {
+                let guard = &epoch::pin();
+                let mut rules = 0usize;
+                let mut rule_bytes = 0usize;
+                let mut per_mui: HashMap<u32, usize> = HashMap::new();
+                for pr in store.prefixes_iter(guard).flatten() {
+                    for r in pr.meta.iter() {
+                        let n = r.meta.rule_count();
+                        rules += n;
+                        rule_bytes += r.meta.byte_size();
+                        *per_mui.entry(r.multi_uniq_id).or_insert(0) += n;
+                    }
+                }
+                info!(
+                    "memstat: flowspec rules={} blob-bytes={} store-muis={}",
+                    fmt_count(rules),
+                    fmt_bytes(rule_bytes),
+                    fmt_count(per_mui.len()),
+                );
+            }
             for (label, store) in [
                 ("unicast", self.unicast.as_ref()),
                 ("multicast", self.multicast.as_ref()),
@@ -411,20 +458,105 @@ impl Rib {
                 retain_withdrawn_attributes,
                 deduplicate_path_attributes,
             ),
-            RotondaRoute::Ipv4FlowSpec(..)
-            | RotondaRoute::Ipv6FlowSpec(..) => {
-                // Stub until the flowspec store lands; counted so a
-                // misconfigured pipeline is visible.
-                debug!("flowspec store not yet wired, dropping {}", val);
-                return Ok(UpsertReport {
-                    cas_count: 0,
-                    prefix_new: false,
-                    mui_new: false,
-                    mui_count: 0,
-                });
-            }
+            RotondaRoute::Ipv4FlowSpec(n, pamap) => self.insert_flowspec(
+                n.nlri().raw().as_ref(),
+                pamap,
+                val.index_prefix(),
+                route_status,
+                ltime,
+                ingress_id,
+            ),
+            RotondaRoute::Ipv6FlowSpec(n, pamap) => self.insert_flowspec(
+                n.nlri().raw().as_ref(),
+                pamap,
+                val.index_prefix(),
+                route_status,
+                ltime,
+                ingress_id,
+            ),
         };
         res.map_err(|e| e.to_string())
+    }
+
+    /// Upsert or withdraw one FlowSpec rule in the flowspec store.
+    ///
+    /// The store overwrites the whole record per `(prefix, mui)`, so this
+    /// is a read-modify-write of the [`FlowSpecRuleSet`] blob, serialised
+    /// by `flowspec_lock` (see the field comment). Identity within the set
+    /// is the full raw NLRI: announcements replace-by-NLRI, withdrawals
+    /// remove-by-NLRI, and a set that empties is written back as a
+    /// `Withdrawn` record so the store's per-mui GC reclaims it.
+    fn insert_flowspec(
+        &self,
+        nlri_raw: &[u8],
+        pamap: &RotondaPaMap,
+        key: Prefix,
+        route_status: RouteStatus,
+        ltime: u64,
+        ingress_id: IngressId,
+    ) -> Result<UpsertReport, PrefixStoreError> {
+        let store = (*self.flowspec)
+            .as_ref()
+            .ok_or(PrefixStoreError::StoreNotReadyError)?;
+        let mui = ingress_id;
+
+        let no_op = UpsertReport {
+            cas_count: 0,
+            prefix_new: false,
+            mui_new: false,
+            mui_count: 0,
+        };
+
+        let _guard = self
+            .flowspec_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let mut ruleset = store
+            .get_records_for_prefix(&key, Some(mui), true)
+            .map_err(|_| PrefixStoreError::StoreNotReadyError)?
+            .and_then(|records| {
+                records
+                    .into_iter()
+                    .find(|r| r.multi_uniq_id == mui)
+                    .map(|r| r.meta)
+            })
+            .unwrap_or_default();
+
+        if route_status == RouteStatus::Withdrawn {
+            if !ruleset.remove(nlri_raw) {
+                // Unknown rule (or peer) — nothing to withdraw.
+                return Ok(no_op);
+            }
+            let (status, ltime) = if ruleset.is_empty() {
+                (RouteStatus::Withdrawn, ltime)
+            } else {
+                (RouteStatus::Active, ltime)
+            };
+            let pubrec = Record::new(mui, ltime, status, ruleset);
+            return store.insert(&key, pubrec, None);
+        }
+
+        // Mirror insert_prefix's reactivation of a mui flagged withdrawn in
+        // the store-global bitmap (e.g. a peer that reconnected): without
+        // this the fresh rules would be masked as withdrawn.
+        if route_status == RouteStatus::Active
+            && (store.mui_is_withdrawn_v4(mui)
+                || store.mui_is_withdrawn_v6(mui))
+        {
+            // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
+            self.mark_ingress_active(mui);
+            self.ingress_register.update_info(
+                mui,
+                ingress::IngressInfo::new().with_state(
+                    ingress::register::IngressState::Connected,
+                ),
+            );
+        }
+
+        ruleset.upsert(nlri_raw, pamap, FlowSpecValidity::NotValidated);
+        let pubrec = Record::new(mui, ltime, route_status, ruleset);
+        store.insert(&key, pubrec, None)
     }
 
     fn insert_prefix(
@@ -605,7 +737,13 @@ impl Rib {
                         error!("failed to mark MUI as withdrawn in multicast rib: {}", e)
                     }
 
-                    // TODO withdraw all other afisafis as well!
+                    if let Err(e) = (*self.flowspec)
+                        .as_ref()
+                        .unwrap()
+                        .mark_mui_as_withdrawn(*ingress_id)
+                    {
+                        error!("failed to mark MUI as withdrawn in flowspec rib: {}", e)
+                    }
                 }
                 Some(AfiSafiType::Ipv4Unicast) => {
                     if let Err(e) = (*self.unicast)
@@ -655,9 +793,36 @@ impl Rib {
                         )
                     }
                 }
+                Some(AfiSafiType::Ipv4FlowSpec) => {
+                    if let Err(e) = (*self.flowspec)
+                        .as_ref()
+                        .unwrap()
+                        .mark_mui_as_withdrawn_v4(*ingress_id)
+                    {
+                        error!(
+                            "failed to mark MUI as withdrawn for v4 flowspec: {}",
+                            e
+                        )
+                    }
+                }
+                Some(AfiSafiType::Ipv6FlowSpec) => {
+                    if let Err(e) = (*self.flowspec)
+                        .as_ref()
+                        .unwrap()
+                        .mark_mui_as_withdrawn_v6(*ingress_id)
+                    {
+                        error!(
+                            "failed to mark MUI as withdrawn for v6 flowspec: {}",
+                            e
+                        )
+                    }
+                }
 
                 afisafi => {
-                    panic!("no support to withdraw {:?} yet", afisafi)
+                    // Reachable for families we never store (they are
+                    // dropped at the TryFrom chokepoint), so log instead
+                    // of taking the process down.
+                    error!("no support to withdraw {:?} yet", afisafi)
                 }
             }
         }
@@ -709,6 +874,17 @@ impl Rib {
                     ),
                 }
             }
+            if let Some(store) = (*self.flowspec).as_ref() {
+                match store.remove_mui(id) {
+                    Ok((records, emptied)) => debug!(
+                        "removed MUI {id} from flowspec rib: \
+                         {records} records, {emptied} prefixes emptied"
+                    ),
+                    Err(e) => error!(
+                        "failed to remove MUI {id} from flowspec rib: {e}"
+                    ),
+                }
+            }
         }
     }
 
@@ -736,6 +912,8 @@ impl Rib {
         let mut v6u_uc: HashSet<IngressId> = HashSet::new();
         let mut v4u_mc: HashSet<IngressId> = HashSet::new();
         let mut v6u_mc: HashSet<IngressId> = HashSet::new();
+        let mut v4_fs: HashSet<IngressId> = HashSet::new();
+        let mut v6_fs: HashSet<IngressId> = HashSet::new();
 
         for (id, specific_afisafi) in ids {
             match specific_afisafi {
@@ -753,6 +931,12 @@ impl Rib {
                 }
                 Some(AfiSafiType::Ipv6Multicast) => {
                     v6u_mc.insert(*id);
+                }
+                Some(AfiSafiType::Ipv4FlowSpec) => {
+                    v4_fs.insert(*id);
+                }
+                Some(AfiSafiType::Ipv6FlowSpec) => {
+                    v6_fs.insert(*id);
                 }
                 afisafi => {
                     warn!(
@@ -774,6 +958,13 @@ impl Rib {
                 &all_afis,
                 None,
             );
+            self.compact_flowspec_for_ingresses(&all_afis, None);
+        }
+        if !v4_fs.is_empty() {
+            self.compact_flowspec_for_ingresses(&v4_fs, Some(true));
+        }
+        if !v6_fs.is_empty() {
+            self.compact_flowspec_for_ingresses(&v6_fs, Some(false));
         }
         if !v4u_uc.is_empty() {
             self.compact_withdrawn_attributes_in_store_batch(
@@ -802,6 +993,63 @@ impl Rib {
                 &v6u_mc,
                 Some(AfiSafiType::Ipv6Multicast),
             );
+        }
+    }
+
+    /// FlowSpec analogue of withdrawn-attribute compaction: rewrite every
+    /// record these muis hold in the flowspec store to an empty rule-set
+    /// blob, freeing the rule bytes while the (small) record slot stays
+    /// until whole-mui removal. `family`: `Some(true)` = v4 keys only,
+    /// `Some(false)` = v6 only, `None` = both.
+    ///
+    /// Runs under `withdraw_lock` (caller) but deliberately NOT under
+    /// `flowspec_lock` — taking it here would invert the
+    /// flowspec_lock -> withdraw_lock order used by `insert_flowspec`. The
+    /// resulting race (an in-flight insert for a mui that is being torn
+    /// down) is last-writer-wins on a record that is about to be marked
+    /// withdrawn mui-wide, same exposure as the unicast compaction.
+    fn compact_flowspec_for_ingresses(
+        &self,
+        ingress_ids: &HashSet<IngressId>,
+        family: Option<bool>,
+    ) {
+        let Some(store) = (*self.flowspec).as_ref() else {
+            return;
+        };
+        if ingress_ids.is_empty() {
+            return;
+        }
+
+        let mut pending: Vec<(Prefix, IngressId)> = Vec::new();
+        {
+            let guard = &epoch::pin();
+            for pr in store.prefixes_iter(guard).flatten() {
+                if let Some(want_v4) = family {
+                    if pr.prefix.is_v4() != want_v4 {
+                        continue;
+                    }
+                }
+                for r in pr.meta.iter() {
+                    if ingress_ids.contains(&r.multi_uniq_id) {
+                        pending.push((pr.prefix, r.multi_uniq_id));
+                    }
+                }
+            }
+        }
+
+        for (prefix, mui) in pending {
+            let pubrec = Record::new(
+                mui,
+                0,
+                RouteStatus::Withdrawn,
+                FlowSpecRuleSet::default(),
+            );
+            if let Err(err) = store.insert(&prefix, pubrec, None) {
+                warn!(
+                    "failed to compact flowspec rules for {prefix} and \
+                     ingress {mui}: {err}"
+                );
+            }
         }
     }
 
@@ -973,6 +1221,20 @@ impl Rib {
             .mark_mui_as_active_v6(ingress_id)
         {
             error!("failed to mark MUI as active in multicast v6 rib: {e}")
+        }
+        if let Err(e) = (*self.flowspec)
+            .as_ref()
+            .unwrap()
+            .mark_mui_as_active_v4(ingress_id)
+        {
+            error!("failed to mark MUI as active in flowspec v4 rib: {e}")
+        }
+        if let Err(e) = (*self.flowspec)
+            .as_ref()
+            .unwrap()
+            .mark_mui_as_active_v6(ingress_id)
+        {
+            error!("failed to mark MUI as active in flowspec v6 rib: {e}")
         }
     }
 
@@ -1277,6 +1539,152 @@ impl Rib {
         }
         debug!("rib::stream_prefix_records: {count} prefix records");
         Ok(count)
+    }
+
+    /// FlowSpec twin of [`stream_prefix_records`](Self::stream_prefix_records):
+    /// stream the flowspec store's records (whole rule-sets per
+    /// `(key-prefix, mui)`) to `f`, guard-free and chunked, Withdrawn
+    /// filtered. Same deadline budget; volumes are tiny compared to the
+    /// unicast table so this walk adds negligible dump time.
+    pub fn stream_flowspec_records<F>(
+        &self,
+        mut f: F,
+    ) -> Result<usize, String>
+    where
+        F: FnMut(PrefixRecord<FlowSpecRuleSet>) -> bool,
+    {
+        let store = (*self.flowspec)
+            .as_ref()
+            .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?;
+
+        let keys: Vec<Prefix> = store.prefixes_keys_iter().collect();
+
+        let deadline = Instant::now() + DUMP_MAX_DURATION;
+        let mut count = 0usize;
+        'outer: for chunk in keys.chunks(DUMP_KEY_CHUNK) {
+            let mut batch: Vec<PrefixRecord<FlowSpecRuleSet>> =
+                Vec::with_capacity(chunk.len());
+            for &prefix in chunk {
+                if let Ok(Some(mut meta)) =
+                    store.get_records_for_prefix(&prefix, None, true)
+                {
+                    meta.retain(|r| {
+                        r.status != RouteStatus::Withdrawn
+                            && !r.meta.is_empty()
+                    });
+                    if !meta.is_empty() {
+                        batch.push(PrefixRecord::new(prefix, meta));
+                    }
+                }
+            }
+
+            for pr in batch {
+                count += 1;
+                if !f(pr) {
+                    break 'outer;
+                }
+            }
+
+            if Instant::now() >= deadline {
+                warn!(
+                    "rib::stream_flowspec_records: dump deadline reached \
+                     after {count} records; emitting partial table"
+                );
+                break;
+            }
+        }
+        debug!("rib::stream_flowspec_records: {count} records");
+        Ok(count)
+    }
+
+    /// Decoded flowspec rows for the HTTP API. `prefix == None` lists the
+    /// whole table of the given family; `Some(prefix)` returns the rules
+    /// keyed at that prefix, plus less- and/or more-specific keys when
+    /// requested (a rule keyed at the family default route — no usable
+    /// dst-prefix — is a less-specific of everything).
+    pub fn query_flowspec(
+        &self,
+        family_v4: bool,
+        prefix: Option<Prefix>,
+        include_less_specifics: bool,
+        include_more_specifics: bool,
+        ingress_id: Option<IngressId>,
+    ) -> Result<Vec<FlowSpecQueryRow>, String> {
+        let store = (*self.flowspec)
+            .as_ref()
+            .ok_or(PrefixStoreError::StoreNotReadyError.to_string())?;
+
+        let mut rows: Vec<FlowSpecQueryRow> = Vec::new();
+        let push_records =
+            |rows: &mut Vec<FlowSpecQueryRow>,
+             key: Prefix,
+             records: Vec<Record<FlowSpecRuleSet>>| {
+                for r in records {
+                    if r.status == RouteStatus::Withdrawn {
+                        continue;
+                    }
+                    if let Some(want) = ingress_id {
+                        if r.multi_uniq_id != want {
+                            continue;
+                        }
+                    }
+                    for rule in r.meta.iter() {
+                        rows.push(FlowSpecQueryRow {
+                            key_prefix: key,
+                            ingress_id: r.multi_uniq_id,
+                            rule: rule.clone(),
+                        });
+                    }
+                }
+            };
+
+        match prefix {
+            None => {
+                let keys: Vec<Prefix> = if family_v4 {
+                    store.prefixes_keys_iter_v4().collect()
+                } else {
+                    store.prefixes_keys_iter_v6().collect()
+                };
+                for key in keys {
+                    if let Ok(Some(records)) =
+                        store.get_records_for_prefix(&key, None, false)
+                    {
+                        push_records(&mut rows, key, records);
+                    }
+                }
+            }
+            Some(prefix) => {
+                let guard = &epoch::pin();
+                let match_options = MatchOptions {
+                    match_type: rotonda_store::match_options::MatchType::ExactMatch,
+                    include_withdrawn: false,
+                    include_less_specifics,
+                    include_more_specifics,
+                    mui: ingress_id,
+                    include_history:
+                        rotonda_store::match_options::IncludeHistory::None,
+                };
+                let res = store
+                    .match_prefix(&prefix, &match_options, guard)
+                    .map_err(|e| e.to_string())?;
+                if let Some(key) = res.prefix {
+                    push_records(&mut rows, key, res.records);
+                }
+                for set in [res.less_specifics, res.more_specifics]
+                    .into_iter()
+                    .flatten()
+                {
+                    for pr in set.iter() {
+                        push_records(
+                            &mut rows,
+                            pr.prefix,
+                            pr.meta.clone(),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(rows)
     }
 
     pub fn match_ingress_id(
@@ -2701,4 +3109,208 @@ mod tests {
             route
         }
     */
+
+    // ------------ FlowSpec store ------------------------------------------
+
+    fn test_rib() -> Rib {
+        Rib::new(
+            Default::default(),
+            None,
+            Arc::new(Mutex::new(Ctx::empty())),
+        )
+        .unwrap()
+    }
+
+    /// Wrap raw v4 flowspec component bytes into a RotondaRoute.
+    fn mk_flowspec_v4(raw_components: &[u8]) -> RotondaRoute {
+        let mut wire = Vec::with_capacity(raw_components.len() + 1);
+        wire.push(u8::try_from(raw_components.len()).unwrap());
+        wire.extend_from_slice(raw_components);
+        let bytes = bytes::Bytes::from(wire);
+        let mut parser = octseq::Parser::from_ref(&bytes);
+        let nlri = routecore::bgp::nlri::flowspec::FlowSpecNlri::parse(
+            &mut parser,
+            routecore::bgp::types::Afi::Ipv4,
+        )
+        .unwrap();
+        RotondaRoute::Ipv4FlowSpec(
+            nlri.into(),
+            RotondaPaMap::empty_path_attributes(),
+        )
+    }
+
+    // {dst 10.0.1.0/24, proto =17}
+    const FS_DST_PROTO: &[u8] =
+        &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+    // {dst 10.0.1.0/24, dport =53}
+    const FS_DST_DPORT: &[u8] =
+        &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
+    // {proto =17, sport =53} — no destination prefix component
+    const FS_NO_DST: &[u8] = &[0x03, 0x81, 0x11, 0x06, 0x81, 0x35];
+
+    fn flowspec_rows(rib: &Rib) -> Vec<FlowSpecQueryRow> {
+        rib.query_flowspec(true, None, false, false, None).unwrap()
+    }
+
+    /// Guard test for the design's central storage assumption: a rule with
+    /// no destination-prefix component is keyed at the family default route
+    /// (0.0.0.0/0), shows up in walks/queries there, and is reclaimed by
+    /// whole-mui removal like any other record.
+    #[test]
+    fn flowspec_no_dst_rule_keyed_at_default_route() {
+        let rib = test_rib();
+        let mui: IngressId = 42;
+        let route = mk_flowspec_v4(FS_NO_DST);
+        assert_eq!(
+            route.index_prefix(),
+            Prefix::new_v4(0.into(), 0).unwrap()
+        );
+
+        rib.insert(&route, RouteStatus::Active, 1, mui, false, false)
+            .unwrap();
+
+        let rows = flowspec_rows(&rib);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].key_prefix,
+            Prefix::new_v4(0.into(), 0).unwrap()
+        );
+        assert_eq!(rows[0].ingress_id, mui);
+        assert_eq!(rows[0].rule.nlri, FS_NO_DST);
+
+        let mut streamed = 0;
+        rib.stream_flowspec_records(|_pr| {
+            streamed += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(streamed, 1);
+
+        // Physical whole-mui reclaim covers the default-route record.
+        rib.remove_for_ingresses(&[mui]);
+        assert!(flowspec_rows(&rib).is_empty());
+        let mut streamed = 0;
+        rib.stream_flowspec_records(|_pr| {
+            streamed += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(streamed, 0);
+    }
+
+    #[test]
+    fn flowspec_rules_share_dst_key_and_withdraw_independently() {
+        let rib = test_rib();
+        let mui: IngressId = 7;
+        let key = Prefix::from_str("10.0.1.0/24").unwrap();
+        let rule_a = mk_flowspec_v4(FS_DST_PROTO);
+        let rule_b = mk_flowspec_v4(FS_DST_DPORT);
+        assert_eq!(rule_a.index_prefix(), key);
+
+        rib.insert(&rule_a, RouteStatus::Active, 1, mui, false, false)
+            .unwrap();
+        rib.insert(&rule_b, RouteStatus::Active, 2, mui, false, false)
+            .unwrap();
+
+        let rows = flowspec_rows(&rib);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.key_prefix == key));
+
+        // Re-announcing an existing rule replaces, not duplicates.
+        rib.insert(&rule_a, RouteStatus::Active, 3, mui, false, false)
+            .unwrap();
+        assert_eq!(flowspec_rows(&rib).len(), 2);
+
+        // Withdrawing one rule leaves the other.
+        rib.insert(&rule_a, RouteStatus::Withdrawn, 4, mui, false, false)
+            .unwrap();
+        let rows = flowspec_rows(&rib);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].rule.nlri, FS_DST_DPORT);
+
+        // Withdrawing an unknown rule is a no-op.
+        rib.insert(&rule_a, RouteStatus::Withdrawn, 5, mui, false, false)
+            .unwrap();
+        assert_eq!(flowspec_rows(&rib).len(), 1);
+
+        // Withdrawing the last rule empties the record; nothing remains
+        // visible in queries or the dump walk.
+        rib.insert(&rule_b, RouteStatus::Withdrawn, 6, mui, false, false)
+            .unwrap();
+        assert!(flowspec_rows(&rib).is_empty());
+        let mut streamed = 0;
+        rib.stream_flowspec_records(|_pr| {
+            streamed += 1;
+            true
+        })
+        .unwrap();
+        assert_eq!(streamed, 0);
+    }
+
+    #[test]
+    fn flowspec_two_peers_and_prefix_query() {
+        let rib = test_rib();
+        let key = Prefix::from_str("10.0.1.0/24").unwrap();
+        let rule = mk_flowspec_v4(FS_DST_PROTO);
+        rib.insert(&rule, RouteStatus::Active, 1, 1, false, false)
+            .unwrap();
+        rib.insert(&rule, RouteStatus::Active, 1, 2, false, false)
+            .unwrap();
+        // no-dst rule from peer 1 sits at 0/0
+        let nodst = mk_flowspec_v4(FS_NO_DST);
+        rib.insert(&nodst, RouteStatus::Active, 1, 1, false, false)
+            .unwrap();
+
+        assert_eq!(flowspec_rows(&rib).len(), 3);
+
+        // Exact-match query on the dst prefix
+        let rows = rib
+            .query_flowspec(true, Some(key), false, false, None)
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter().map(|r| r.ingress_id).collect::<HashSet<_>>(),
+            HashSet::from([1, 2])
+        );
+
+        // ... filtered by peer
+        let rows = rib
+            .query_flowspec(true, Some(key), false, false, Some(2))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+
+        // Less-specifics of the dst prefix include the 0/0 no-dst rule.
+        let rows = rib
+            .query_flowspec(true, Some(key), true, false, None)
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn flowspec_mark_withdrawn_and_reactivate() {
+        let rib = test_rib();
+        let mui: IngressId = 9;
+        let rule = mk_flowspec_v4(FS_DST_PROTO);
+        rib.insert(&rule, RouteStatus::Active, 1, mui, false, false)
+            .unwrap();
+        assert_eq!(flowspec_rows(&rib).len(), 1);
+
+        // Peer-down: mark the whole mui withdrawn for the flowspec family.
+        rib.withdraw_for_ingress(
+            mui,
+            Some(AfiSafiType::Ipv4FlowSpec),
+            true,
+        );
+        assert!(flowspec_rows(&rib).is_empty());
+
+        // Re-announcement reactivates the mui (withdrawn-mui bitmap
+        // cleared on the insert path) and the rule is visible again.
+        rib.insert(&rule, RouteStatus::Active, 2, mui, false, false)
+            .unwrap();
+        assert_eq!(flowspec_rows(&rib).len(), 1);
+
+        // Family-agnostic peer-down (None) also covers flowspec.
+        rib.withdraw_for_ingress(mui, None, true);
+        assert!(flowspec_rows(&rib).is_empty());
+    }
 }

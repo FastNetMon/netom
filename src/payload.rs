@@ -344,6 +344,18 @@ impl RotondaPaMap {
         }
     }
 
+    /// Reconstruct from backing bytes previously obtained via
+    /// [`raw_arc`](Self::raw_arc) (rpki byte + ppi byte + attribute blob),
+    /// e.g. out of a flowspec rule-set record. Anything shorter than the
+    /// two prefix bytes falls back to an empty attribute map so the
+    /// accessors' `raw[0]`/`raw[1]` reads stay in bounds.
+    pub fn from_raw(raw: Vec<u8>) -> Self {
+        if raw.len() < 2 {
+            return Self::empty_path_attributes();
+        }
+        Self { raw: raw.into() }
+    }
+
     pub fn set_rpki_info(&mut self, rpki_info: RpkiInfo) {
         Arc::make_mut(&mut self.raw)[0] = rpki_info.into();
     }

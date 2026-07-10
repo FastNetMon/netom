@@ -206,3 +206,5 @@ shadow-utils = "*"
 # flowspec-full branch is pushed and the git dependency repinned.
 [patch."https://github.com/nuclearcat/routecore.git"]
 routecore = { path = "../routecore" }
+[patch."https://github.com/nuclearcat/rotonda-store"]
+rotonda-store = { path = "../rotonda-store" }
