@@ -411,6 +411,18 @@ impl Rib {
                 retain_withdrawn_attributes,
                 deduplicate_path_attributes,
             ),
+            RotondaRoute::Ipv4FlowSpec(..)
+            | RotondaRoute::Ipv6FlowSpec(..) => {
+                // Stub until the flowspec store lands; counted so a
+                // misconfigured pipeline is visible.
+                debug!("flowspec store not yet wired, dropping {}", val);
+                return Ok(UpsertReport {
+                    cas_count: 0,
+                    prefix_new: false,
+                    mui_new: false,
+                    mui_count: 0,
+                });
+            }
         };
         res.map_err(|e| e.to_string())
     }

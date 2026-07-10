@@ -201,3 +201,8 @@ assets = [
 # ensure that the useradd tools are present by installing their respective packages
 [package.metadata.generate-rpm.requires]
 shadow-utils = "*"
+
+# Local development override for the FlowSpec work; removed when the
+# flowspec-full branch is pushed and the git dependency repinned.
+[patch."https://github.com/nuclearcat/routecore.git"]
+routecore = { path = "../routecore" }

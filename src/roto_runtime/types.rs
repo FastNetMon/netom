@@ -668,7 +668,7 @@ fn note_unsupported_nlri(nlri_type: NlriType) {
     UNSUPPORTED_NLRI.note(nlri_type, Instant::now());
 }
 
-impl<O> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
+impl<O: AsRef<[u8]>> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
     type Error = ();
     fn try_from(value: (Nlri<O>, RotondaPaMap)) -> Result<Self, Self::Error> {
         let res = match value.0 {

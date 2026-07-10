@@ -114,6 +114,8 @@ fn rotonda_route_afi_safi(rr: &RotondaRoute) -> AfiSafiKey {
         RotondaRoute::Ipv6Unicast(..) => (2, 1),
         RotondaRoute::Ipv4Multicast(..) => (1, 2),
         RotondaRoute::Ipv6Multicast(..) => (2, 2),
+        RotondaRoute::Ipv4FlowSpec(..) => (1, 133),
+        RotondaRoute::Ipv6FlowSpec(..) => (2, 133),
     }
 }
 

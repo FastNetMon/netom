@@ -274,13 +274,11 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
     /// Return the prefix for this `RotondaRoute`
     #[roto_method(rt, MutRotondaRoute, prefix)]
     fn route_prefix(rr: Val<MutRotondaRoute>) -> Prefix {
+        // For flowspec routes this is the destination-prefix component if
+        // usable as a key, else the family default route (see
+        // RotondaRoute::index_prefix).
         let rr = rr.borrow_mut();
-        match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        }
+        rr.index_prefix()
     }
 
     /// Check whether the prefix for this `RotondaRoute` matches
@@ -290,12 +288,7 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
         to_match: Val<Prefix>,
     ) -> bool {
         let rr = rr.borrow_mut();
-        let rr_prefix = match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        };
+        let rr_prefix = rr.index_prefix();
         rr_prefix == *to_match
     }
 
@@ -367,13 +360,7 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
     #[roto_method(rt, MutRotondaRoute, fmt_prefix)]
     fn rr_fmt_prefix(rr: Val<MutRotondaRoute>) -> Arc<str> {
         let rr = rr.borrow();
-        let prefix = match *rr {
-            RotondaRoute::Ipv4Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Unicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv4Multicast(n, ..) => n.prefix(),
-            RotondaRoute::Ipv6Multicast(n, ..) => n.prefix(),
-        };
-        prefix.to_string().into()
+        rr.index_prefix().to_string().into()
     }
 
     /// Return a formatted string for the ROV status

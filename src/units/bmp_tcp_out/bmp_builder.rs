@@ -700,6 +700,11 @@ pub fn build_route_monitoring_from_route(
                     .ok()?;
             (prefix, pamap)
         }
+        // FlowSpec re-emission lands with the bmp-out flowspec builder;
+        // until then flowspec routes are not emitted to bmp-out clients.
+        RotondaRoute::Ipv4FlowSpec(..) | RotondaRoute::Ipv6FlowSpec(..) => {
+            return None;
+        }
     };
 
     build_route_monitoring(peer, prefix, pamap, is_withdrawal)
