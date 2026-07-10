@@ -372,6 +372,20 @@ impl Register {
         self.info.read().unwrap().get(&id).cloned()
     }
 
+    /// Return the small identity subset used by route validation without
+    /// cloning the complete ingress record (capabilities and strings).
+    pub fn bgp_id_and_remote_asn(
+        &self,
+        id: IngressId,
+    ) -> (Option<[u8; 4]>, Option<Asn>) {
+        self.info
+            .read()
+            .unwrap()
+            .get(&id)
+            .map(|info| (info.bgp_id, info.remote_asn))
+            .unwrap_or((None, None))
+    }
+
     /// Retrieve the information for the given [`IngressId`]
     pub fn get_tuple(&self, id: IngressId) -> Option<OwnedIdAndInfo> {
         self.info

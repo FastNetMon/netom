@@ -50,6 +50,12 @@ use super::flowspec::{
 };
 use super::{http_ng::Include, QueryFilter};
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum FlowSpecOriginator {
+    BgpId([u8; 4]),
+    Ingress(IngressId),
+}
+
 type Store = StarCastRib<RotondaPaMap, MemoryOnlyConfig>;
 
 // ---------------------------------------------------------------------------
@@ -574,7 +580,12 @@ impl Rib {
         }
         metrics.note_update(is_v4, false);
 
-        let validity = self.validate_flowspec(nlri_raw, is_v4, mui);
+        let flow_originator = self.flowspec_identity(pamap, mui).0;
+        let validity = self.validate_flowspec(
+            nlri_raw,
+            flow_originator,
+            is_v4,
+        );
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         let report = store.insert(&key, pubrec, None);
@@ -635,21 +646,17 @@ impl Rib {
     /// current unicast RIB before exposing it. Never rejects: a monitor wants
     /// to SEE invalid rules.
     ///
-    /// Collector semantics: per-peer mui identity stands in for
-    /// "originator", and the peer's remote ASN (ingress register) stands
-    /// in for the neighboring AS.
-    ///
     /// * no usable destination prefix (absent component, or RFC 8956
     ///   offset != 0) -> `Unvalidatable`;
     /// * (a) the best-match unicast route for the destination prefix must
-    ///   have an Active record from the same peer;
-    /// * (b) no more-specific unicast route may come from a peer with a
-    ///   different remote ASN (only checked when both ASNs are known).
+    ///   have the same BGP originator;
+    /// * (b) no more-specific unicast route may have a different neighboring
+    ///   AS in its AS_PATH (only checked when both ASNs are known).
     fn validate_flowspec(
         &self,
         nlri_raw: &[u8],
+        flow_originator: FlowSpecOriginator,
         is_v4: bool,
-        ingress_id: IngressId,
     ) -> FlowSpecValidity {
         let Some(nlri) = super::flowspec::parse_raw_nlri(nlri_raw, is_v4)
         else {
@@ -676,34 +683,41 @@ impl Rib {
             return FlowSpecValidity::NotValidated;
         };
 
-        // (a) originator check on the best-match unicast route.
-        let best_match_ok = res.prefix.is_some()
-            && res.records.iter().any(|r| {
-                r.multi_uniq_id == ingress_id
-                    && r.status != RouteStatus::Withdrawn
-            });
-        if !best_match_ok {
+        // (a) Compare BGP originators, using ORIGINATOR_ID when present and
+        // the advertising peer's BGP Identifier otherwise. Falling back to
+        // the ingress id preserves validation for inputs (notably MRT) that
+        // carry neither. This also handles route-reflector feeds where the
+        // same originator legitimately arrives through different sessions.
+        let best_match = res.records.iter().find_map(|r| {
+            if r.status == RouteStatus::Withdrawn {
+                return None;
+            }
+            let (originator, neighbor) =
+                self.flowspec_identity(&r.meta, r.multi_uniq_id);
+            (originator == flow_originator).then_some((r, neighbor))
+        });
+        let Some(best_match) = best_match.filter(|_| res.prefix.is_some())
+        else {
             return FlowSpecValidity::Invalid;
-        }
+        };
 
-        // (b) more-specifics from a different neighboring AS.
-        let our_asn = self
-            .ingress_register
-            .get(ingress_id)
-            .and_then(|info| info.remote_asn);
-        if let (Some(our_asn), Some(more_specifics)) =
-            (our_asn, res.more_specifics.as_ref())
+        // (b) Compare the neighboring AS encoded in AS_PATH. The session's
+        // remote ASN is only a fallback for empty/missing paths, which is
+        // important for iBGP and route-reflector collectors: every session
+        // there has the same remote ASN while the routes can originate in
+        // different neighboring ASes.
+        if let (Some(best_neighbor), Some(more_specifics)) =
+            (best_match.1, res.more_specifics.as_ref())
         {
             for pr in more_specifics.iter() {
                 for r in pr.meta.iter() {
                     if r.status == RouteStatus::Withdrawn {
                         continue;
                     }
-                    let other_asn = self
-                        .ingress_register
-                        .get(r.multi_uniq_id)
-                        .and_then(|info| info.remote_asn);
-                    if matches!(other_asn, Some(asn) if asn != our_asn) {
+                    let other_asn =
+                        self.flowspec_identity(&r.meta, r.multi_uniq_id).1;
+                    if matches!(other_asn, Some(asn) if asn != best_neighbor)
+                    {
                         return FlowSpecValidity::Invalid;
                     }
                 }
@@ -711,6 +725,90 @@ impl Rib {
         }
 
         FlowSpecValidity::Valid
+    }
+
+    /// Extract only the two attributes needed by RFC 8955 validation.
+    /// Scanning the shared raw attribute bytes avoids allocating a full
+    /// `OwnedPathAttributes`/`PaMap` on every validation.
+    fn flowspec_validation_attrs(
+        &self,
+        pamap: &RotondaPaMap,
+    ) -> (Option<[u8; 4]>, Option<Asn>) {
+        let raw = pamap.as_ref();
+        if raw.len() < 2 {
+            return (None, None);
+        }
+        let asn_len = if raw[1] == 1 { 4 } else { 2 };
+        let attrs = &raw[2..];
+        let mut originator = None;
+        let mut neighbor = None;
+        let mut pos = 0usize;
+
+        while pos < attrs.len() {
+            if attrs.len() - pos < 3 {
+                break;
+            }
+            let flags = attrs[pos];
+            let type_code = attrs[pos + 1];
+            let (header_len, value_len) = if flags & 0x10 != 0 {
+                if attrs.len() - pos < 4 {
+                    break;
+                }
+                (
+                    4,
+                    u16::from_be_bytes([attrs[pos + 2], attrs[pos + 3]])
+                        as usize,
+                )
+            } else {
+                (3, attrs[pos + 2] as usize)
+            };
+            let Some(end) = pos
+                .checked_add(header_len)
+                .and_then(|start| start.checked_add(value_len))
+                .filter(|end| *end <= attrs.len())
+            else {
+                break;
+            };
+            let value = &attrs[pos + header_len..end];
+
+            if type_code == 9 && value.len() == 4 {
+                originator = Some(value.try_into().expect("length checked"));
+            } else if type_code == 2
+                && neighbor.is_none()
+                && value.len() >= 2 + asn_len
+                && value[0] == 2
+                && value[1] != 0
+            {
+                neighbor = Some(if asn_len == 4 {
+                    Asn::from_u32(u32::from_be_bytes(
+                        value[2..6].try_into().expect("length checked"),
+                    ))
+                } else {
+                    Asn::from_u32(u16::from_be_bytes(
+                        value[2..4].try_into().expect("length checked"),
+                    ) as u32)
+                });
+            }
+            pos = end;
+        }
+        (originator, neighbor)
+    }
+
+    fn flowspec_identity(
+        &self,
+        pamap: &RotondaPaMap,
+        ingress_id: IngressId,
+    ) -> (FlowSpecOriginator, Option<Asn>) {
+        let (attr_id, path_neighbor) =
+            self.flowspec_validation_attrs(pamap);
+        let (peer_id, remote_asn) = self
+            .ingress_register
+            .bgp_id_and_remote_asn(ingress_id);
+        let originator = attr_id
+            .or(peer_id)
+            .map(FlowSpecOriginator::BgpId)
+            .unwrap_or(FlowSpecOriginator::Ingress(ingress_id));
+        (originator, path_neighbor.or(remote_asn))
     }
 
     /// Recount the stored-rule gauges by walking the (small) flowspec
@@ -1825,20 +1923,25 @@ impl Rib {
             }
         }
 
-        // Validation depends on destination prefix and origin peer, not on
+        // Validation depends on destination prefix and BGP originator, not on
         // the rule's remaining traffic-match components. Refresh only the
         // rows being returned and share the result among rules with the same
-        // (key, peer). This keeps all revalidation off the unicast ingest hot
-        // path and bounds work to one lookup per distinct pair in the query.
-        let mut validity_cache:
-            HashMap<(Prefix, IngressId), FlowSpecValidity> = HashMap::new();
+        // (key, originator). This keeps all revalidation off the unicast
+        // ingest hot path and bounds work to one lookup per distinct pair in
+        // the query.
+        let mut validity_cache: HashMap<
+            (Prefix, FlowSpecOriginator),
+            FlowSpecValidity,
+        > = HashMap::new();
         for row in &mut rows {
-            let cache_key = (row.key_prefix, row.ingress_id);
+            let flow_originator =
+                self.flowspec_identity(&row.rule.pamap, row.ingress_id).0;
+            let cache_key = (row.key_prefix, flow_originator);
             let validity = *validity_cache.entry(cache_key).or_insert_with(|| {
                 self.validate_flowspec(
                     &row.rule.nlri,
+                    flow_originator,
                     family_v4,
-                    row.ingress_id,
                 )
             });
             row.rule.validity = validity;
@@ -3282,6 +3385,16 @@ mod tests {
 
     /// Wrap raw v4 flowspec component bytes into a RotondaRoute.
     fn mk_flowspec_v4(raw_components: &[u8]) -> RotondaRoute {
+        mk_flowspec_v4_with_pamap(
+            raw_components,
+            RotondaPaMap::empty_path_attributes(),
+        )
+    }
+
+    fn mk_flowspec_v4_with_pamap(
+        raw_components: &[u8],
+        pamap: RotondaPaMap,
+    ) -> RotondaRoute {
         let mut wire = Vec::with_capacity(raw_components.len() + 1);
         wire.push(u8::try_from(raw_components.len()).unwrap());
         wire.extend_from_slice(raw_components);
@@ -3292,10 +3405,19 @@ mod tests {
             routecore::bgp::types::Afi::Ipv4,
         )
         .unwrap();
-        RotondaRoute::Ipv4FlowSpec(
-            nlri.into(),
-            RotondaPaMap::empty_path_attributes(),
-        )
+        RotondaRoute::Ipv4FlowSpec(nlri.into(), pamap)
+    }
+
+    fn validation_pamap(originator: [u8; 4], neighbor_asn: u32) -> RotondaPaMap {
+        RotondaPaMap::from(vec![
+            0x80, 9, 4, originator[0], originator[1], originator[2],
+            originator[3], // ORIGINATOR_ID
+            0x40, 2, 6, 2, 1, // AS_PATH, one AS_SEQUENCE entry
+            (neighbor_asn >> 24) as u8,
+            (neighbor_asn >> 16) as u8,
+            (neighbor_asn >> 8) as u8,
+            neighbor_asn as u8,
+        ])
     }
 
     // {dst 10.0.1.0/24, proto =17}
@@ -3557,6 +3679,78 @@ mod tests {
             .find(|r| r.ingress_id == peer_a && r.key_prefix.len() == 24)
             .expect("rule from peer A stored");
         assert_eq!(a_row.rule.validity, FlowSpecValidity::Invalid);
+    }
+
+    #[test]
+    fn flowspec_validation_uses_route_origin_and_as_path() {
+        let rib = test_rib();
+        let reg = rib.ingress_register.clone();
+        let flow_peer = reg.register();
+        let route_peer = reg.register();
+        let more_specific_peer = reg.register();
+        for (peer, bgp_id) in [
+            (flow_peer, [192, 0, 2, 1]),
+            (route_peer, [192, 0, 2, 2]),
+            (more_specific_peer, [192, 0, 2, 3]),
+        ] {
+            reg.update_info(
+                peer,
+                IngressInfo::new()
+                    .with_bgp_id(bgp_id)
+                    .with_remote_asn(Asn::from_u32(65000)),
+            );
+        }
+
+        let originator = [198, 51, 100, 9];
+        let rule = mk_flowspec_v4_with_pamap(
+            FS_DST_PROTO,
+            validation_pamap(originator, 65001),
+        );
+        let covering = RotondaRoute::Ipv4Unicast(
+            Prefix::from_str("10.0.0.0/16").unwrap().try_into().unwrap(),
+            validation_pamap(originator, 65001),
+        );
+        rib.insert(&rule, RouteStatus::Active, 1, flow_peer, false, false)
+            .unwrap();
+        rib.insert(
+            &covering,
+            RouteStatus::Active,
+            2,
+            route_peer,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // Different collector sessions are valid when ORIGINATOR_ID agrees.
+        assert_eq!(
+            flowspec_rows(&rib)[0].rule.validity,
+            FlowSpecValidity::Valid
+        );
+
+        let more_specific = RotondaRoute::Ipv4Unicast(
+            Prefix::from_str("10.0.1.128/25")
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            validation_pamap([203, 0, 113, 7], 65002),
+        );
+        rib.insert(
+            &more_specific,
+            RouteStatus::Active,
+            3,
+            more_specific_peer,
+            false,
+            false,
+        )
+        .unwrap();
+
+        // All three sessions have remote_asn=65000; only AS_PATH exposes the
+        // different neighboring AS that invalidates the rule.
+        assert_eq!(
+            flowspec_rows(&rib)[0].rule.validity,
+            FlowSpecValidity::Invalid
+        );
     }
 
     #[test]
