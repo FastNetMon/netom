@@ -29,7 +29,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 #members = []
 
 [workspace.dependencies]
-routecore          = { git = "https://github.com/nuclearcat/routecore.git", branch = "flowspec-full", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
+routecore          = { git = "https://github.com/nuclearcat/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { version = "0.1.1", features = ["arbitrary", "serde"] }
 rotonda-store      = { git = "https://github.com/nuclearcat/rotonda-store", branch = "fnm-gc" }   # fork: Layer A remove_mui
 log                = "0.4"

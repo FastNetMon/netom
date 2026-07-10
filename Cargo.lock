@@ -1062,7 +1062,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2088,7 +2088,7 @@ dependencies = [
  "reqwest",
  "roto",
  "rotonda-store",
- "routecore 0.7.3-dev",
+ "routecore",
  "rpki",
  "rshtml",
  "rumqttc",
@@ -2138,7 +2138,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#b89ba17792cf6194e995a12bf9757dbbb510375f"
+source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#836c6af6af6624c6db30772ff7cce536460fa87d"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2748,7 +2748,7 @@ dependencies = [
  "parking_lot_core",
  "rand 0.9.3",
  "roaring",
- "routecore 0.5.2",
+ "routecore",
  "rustc-hash",
  "serde",
  "serde_derive",
@@ -2758,26 +2758,8 @@ dependencies = [
 
 [[package]]
 name = "routecore"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1dfe4daf99c74d8af82cfeab5e764d089fc47c47fcabffca35f9250f3f4a14a7"
-dependencies = [
- "bytes",
- "chrono",
- "const-str",
- "inetnum",
- "log",
- "octseq",
- "paste",
- "rayon",
- "serde",
- "tokio",
-]
-
-[[package]]
-name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git?branch=flowspec-full#ed9ae2a349afbc70fff266f602bce54151b2aae8"
+source = "git+https://github.com/nuclearcat/routecore.git#899cf130c558058ab025338743317fcaf750b1fc"
 dependencies = [
  "bytes",
  "chrono",
@@ -2921,7 +2903,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3326,7 +3308,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
