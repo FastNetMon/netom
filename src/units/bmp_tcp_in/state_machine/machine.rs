@@ -68,7 +68,9 @@ use std::{
 use crate::ingress::IngressId;
 use crate::{
     common::{
-        routecore_extra::generate_alternate_config,
+        routecore_extra::{
+            encode_addpath_families, generate_alternate_config,
+        },
         status_reporter::AnyStatusReporter,
     },
     ingress,
@@ -1744,22 +1746,6 @@ impl UndecodedCapThrottle {
             UndecodedCapLog::Suppressed
         }
     }
-}
-
-/// Encode the ADD-PATH families a session actually parses with path ids as
-/// BGP capability-69 *value* bytes: per family AFI (u16 BE) + SAFI (u8) +
-/// direction (u8). Empty when the session has no ADD-PATH family. Stored on
-/// the session's ingress entry (`addpath_families`) so bmp-out can advertise
-/// a matching capability downstream.
-fn encode_addpath_families(session_config: &SessionConfig) -> Vec<u8> {
-    let mut out = Vec::new();
-    for (fam, dir) in session_config.enabled_addpaths() {
-        let (afi, safi): (u16, u8) = fam.into();
-        out.extend_from_slice(&afi.to_be_bytes());
-        out.push(safi);
-        out.push(u8::from(dir));
-    }
-    out
 }
 
 #[derive(Debug, Default)]

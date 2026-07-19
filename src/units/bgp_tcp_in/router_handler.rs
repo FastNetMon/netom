@@ -12,7 +12,9 @@ use chrono::{DateTime, Utc};
 use inetnum::asn::Asn;
 use log::{debug, error, warn};
 use rotonda_store::prefix_record::RouteStatus;
-use routecore::bgp::message::{Message as BgpMsg, UpdateMessage};
+use routecore::bgp::message::{
+    Message as BgpMsg, SessionConfig, UpdateMessage,
+};
 use smallvec::{smallvec, SmallVec};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -28,6 +30,9 @@ use routecore::bgp::fsm::session::{
     Session,
 };
 
+use routecore::bgp::nlri::common::PathId;
+
+use crate::common::routecore_extra::encode_addpath_families;
 use crate::comms::{Gate, GateStatus, Terminated};
 use crate::ingress::peer_stats::{
     AfiSafiKey, BgpPeerStats, BgpPeerStatsRegistry,
@@ -96,6 +101,13 @@ struct Processor {
     /// The 'overall' IngressId for the BGP-IN unit.
     ingress_id: ingress::IngressId,
 
+    /// ADD-PATH (RFC 7911) path-children of this connection's session: one
+    /// child IngressId per distinct path id seen announced, lazily minted
+    /// (`IngressType::BgpPath`, `parent_ingress` = the session's ingress).
+    /// Reset on SessionNegotiated; torn down with the session.
+    path_children:
+        std::collections::HashMap<PathId, ingress::IngressId>,
+
     /// Handle to abort this connection's task during collision resolution.
     /// Populated after the task is spawned.
     abort_handle: Arc<Mutex<Option<AbortHandle>>>,
@@ -146,6 +158,7 @@ impl Processor {
             ingresses,
             peer_stats,
             ingress_id,
+            path_children: Default::default(),
             abort_handle,
             rtr_cache: Default::default(),
         }
@@ -170,6 +183,7 @@ impl Processor {
             ingresses: Arc::new(ingress::Register::default()),
             peer_stats: Arc::new(BgpPeerStatsRegistry::default()),
             ingress_id: 0,
+            path_children: Default::default(),
             abort_handle: Arc::new(Mutex::new(None)),
             rtr_cache: Default::default(),
         };
@@ -467,6 +481,10 @@ impl Processor {
                             let key = (negotiated.remote_addr(), negotiated.remote_asn());
                             let sid = SESSION_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             my_session_id = Some(sid);
+                            // A fresh negotiation invalidates any path
+                            // children of a previous session on this
+                            // connection.
+                            self.path_children.clear();
 
                             // --- Ingress reuse ---
                             // Check if there's an existing ingress entry for this
@@ -490,9 +508,33 @@ impl Processor {
                                 // Withdraw stale routes from the previous session.
                                 // This also triggers PeerDown in BMP-out, cleaning
                                 // known_peers. Fresh routes will follow.
-                                self.gate
-                                    .update_data(Update::Withdraw(existing_id, None))
-                                    .await;
+                                // The previous session's ADD-PATH path-children
+                                // (register entries with parent_ingress =
+                                // existing_id) hold RIB records of their own;
+                                // withdraw and disconnect them along, so they
+                                // become claimable by this session.
+                                let stale_children =
+                                    self.ingresses.ids_for_parent(existing_id);
+                                if stale_children.is_empty() {
+                                    self.gate
+                                        .update_data(Update::Withdraw(existing_id, None))
+                                        .await;
+                                } else {
+                                    let mut entries: SmallVec<
+                                        [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
+                                    > = smallvec![(existing_id, None)];
+                                    for child in stale_children {
+                                        self.ingresses.update_info(
+                                            child,
+                                            ingress::IngressInfo::new()
+                                                .with_state(IngressState::Disconnected),
+                                        );
+                                        entries.push((child, None));
+                                    }
+                                    self.gate
+                                        .update_data(Update::WithdrawBulk(Box::new(entries)))
+                                        .await;
+                                }
                             }
 
                             // --- BGP Session Collision Resolution ---
@@ -527,12 +569,24 @@ impl Processor {
                                 old_abort.abort();
 
                                 // If the old session had a different ingress ID
-                                // (rare, but possible), withdraw and remove it.
+                                // (rare, but possible), withdraw and remove it,
+                                // along with any of its ADD-PATH path-children.
                                 if old_ingress_id != session_ingress_id {
+                                    let old_children =
+                                        self.ingresses.ids_for_parent(old_ingress_id);
+                                    let mut entries: SmallVec<
+                                        [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
+                                    > = smallvec![(old_ingress_id, None)];
+                                    entries.extend(
+                                        old_children.iter().map(|id| (*id, None)),
+                                    );
                                     self.gate
-                                        .update_data(Update::Withdraw(old_ingress_id, None))
+                                        .update_data(Update::WithdrawBulk(Box::new(entries)))
                                         .await;
                                     self.ingresses.remove(old_ingress_id);
+                                    for child in old_children {
+                                        self.ingresses.remove(child);
+                                    }
                                 }
                             }
 
@@ -578,6 +632,18 @@ impl Processor {
                                         negotiated.remote_capabilities()
                                         .to_vec()
                                     )
+                                    // Negotiated ADD-PATH families (cap-69
+                                    // value bytes) from the SessionConfig
+                                    // that will parse this session's
+                                    // UPDATEs. Always set so a reused
+                                    // ingress of a formerly-ADD-PATH
+                                    // session gets its stale families
+                                    // overwritten.
+                                    .with_addpath_families(
+                                        encode_addpath_families(
+                                            &SessionConfig::from(&negotiated)
+                                        )
+                                    )
                                 );
 
                             // Acquire the per-peer stats entry now
@@ -616,6 +682,15 @@ impl Processor {
                     ingress::IngressInfo::new()
                         .with_state(IngressState::Disconnected),
                 );
+                // The session's ADD-PATH path-children disconnect and
+                // withdraw together with it.
+                for child in self.path_children.values() {
+                    self.ingresses.update_info(
+                        *child,
+                        ingress::IngressInfo::new()
+                            .with_state(IngressState::Disconnected),
+                    );
+                }
                 true
             } else {
                 false
@@ -625,9 +700,21 @@ impl Processor {
         };
 
         if should_withdraw {
-            self.gate
-                .update_data(Update::Withdraw(session_ingress_id, None))
-                .await;
+            if self.path_children.is_empty() {
+                self.gate
+                    .update_data(Update::Withdraw(session_ingress_id, None))
+                    .await;
+            } else {
+                let mut entries: SmallVec<
+                    [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
+                > = smallvec![(session_ingress_id, None)];
+                entries.extend(
+                    self.path_children.values().map(|id| (*id, None)),
+                );
+                self.gate
+                    .update_data(Update::WithdrawBulk(Box::new(entries)))
+                    .await;
+            }
             // A reconnecting session for the same (remote_addr, remote_asn)
             // may have reused this ingress id (the reuse / collision-
             // resolution paths above match on the peer tuple and ignore
@@ -646,6 +733,11 @@ impl Processor {
             if !reclaimed_by_new_session {
                 // Clean up the ingress register entry so it doesn't leak.
                 self.ingresses.remove(session_ingress_id);
+                // Its ADD-PATH path-children reference the removed session
+                // as parent and can never be claimed again; drop them too.
+                for child in self.path_children.values() {
+                    self.ingresses.remove(*child);
+                }
                 // And the per-peer stats — the periodic emitter would
                 // otherwise keep publishing a stale Stats Report for a
                 // peer that's gone.
@@ -711,19 +803,8 @@ impl Processor {
         let mut payloads = SmallVec::new();
 
         //  RotondaRoute announcements:
-        // TODO(addpath): resolve per-(session, path_id) child ingresses for
-        // the Some(path_id) entries instead of dropping them; until then this
-        // preserves the previous behavior of not storing ADD-PATH routes.
-        let rr_reach: Vec<_> = explode_announcements(&bgp_msg)?
-            .into_iter()
-            .filter(|(_, pid)| pid.is_none())
-            .map(|(rr, _)| rr)
-            .collect();
-        let rr_unreach: Vec<_> = explode_withdrawals(&bgp_msg)?
-            .into_iter()
-            .filter(|(_, pid)| pid.is_none())
-            .map(|(rr, _)| rr)
-            .collect();
+        let rr_reach = explode_announcements(&bgp_msg)?;
+        let rr_unreach = explode_withdrawals(&bgp_msg)?;
 
         // Update per-AFI/SAFI Adj-RIB-In counters before consuming
         // the route lists. Bucket by AFI/SAFI so we take the
@@ -732,7 +813,7 @@ impl Processor {
         if let Some(ps) = peer_stats {
             use std::collections::HashMap;
             let mut adds: HashMap<AfiSafiKey, u64> = HashMap::new();
-            for rr in &rr_reach {
+            for (rr, _) in &rr_reach {
                 *adds.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
             }
             for (k, v) in adds {
@@ -740,7 +821,7 @@ impl Processor {
             }
 
             let mut subs: HashMap<AfiSafiKey, u64> = HashMap::new();
-            for rr in &rr_unreach {
+            for (rr, _) in &rr_unreach {
                 *subs.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
             }
             for (k, v) in subs {
@@ -748,27 +829,92 @@ impl Processor {
             }
         }
 
-        payloads.extend(rr_reach.into_iter().map(|rr| {
-            Payload::with_received(
+        for (rr, path_id) in rr_reach {
+            // Plain NLRI store under the session's mui; ADD-PATH NLRI under
+            // the per-(session, path_id) child mui so several paths for one
+            // prefix from one peer coexist in the RIB.
+            let effective_id = match path_id {
+                None => ingress_id,
+                Some(pid) => self.get_or_create_path_child(ingress_id, pid),
+            };
+            payloads.push(Payload::with_received(
                 rr,
                 None,
                 received,
-                ingress_id,
+                effective_id,
                 RouteStatus::Active,
-            )
-        }));
+            ));
+        }
 
-        payloads.extend(rr_unreach.into_iter().map(|rr| {
-            Payload::with_received(
+        for (rr, path_id) in rr_unreach {
+            let effective_id = match path_id {
+                None => ingress_id,
+                Some(pid) => match self.path_children.get(&pid) {
+                    Some(child_id) => *child_id,
+                    None => {
+                        // Withdrawal for a path id this session never
+                        // announced: nothing is stored under any mui for
+                        // it, and minting a child from a withdrawal would
+                        // leak an empty ingress.
+                        debug!(
+                            "bgp-in: dropping withdrawal for unknown \
+                             ADD-PATH path id {} on ingress {}",
+                            pid.0, ingress_id
+                        );
+                        continue;
+                    }
+                },
+            };
+            payloads.push(Payload::with_received(
                 rr,
                 None,
                 received,
-                ingress_id,
+                effective_id,
                 RouteStatus::Withdrawn,
-            )
-        }));
+            ));
+        }
 
         Ok(payloads.into())
+    }
+
+    /// Resolve — lazily minting if needed — the ADD-PATH path-child ingress
+    /// for `(session, path_id)`. Prefers rebinding the Disconnected child a
+    /// previous session with this peer left behind, so re-announced paths
+    /// re-activate their RIB records under the same mui.
+    fn get_or_create_path_child(
+        &mut self,
+        session_id: ingress::IngressId,
+        path_id: PathId,
+    ) -> ingress::IngressId {
+        if let Some(child_id) = self.path_children.get(&path_id) {
+            return *child_id;
+        }
+
+        let child_id = match self
+            .ingresses
+            .find_existing_path_child_and_claim(session_id, path_id.0)
+        {
+            Some(id) => id,
+            None => self.ingresses.register(),
+        };
+        // Copy the session's peer identity onto the child for display in
+        // the HTTP /ingresses output; one register lookup per mint only.
+        let mut info = ingress::IngressInfo::new()
+            .with_ingress_type(ingress::IngressType::BgpPath)
+            .with_parent_ingress(session_id)
+            .with_path_id(path_id.0)
+            .with_state(IngressState::Connected);
+        if let Some(session_info) = self.ingresses.get(session_id) {
+            if let Some(addr) = session_info.remote_addr {
+                info = info.with_remote_addr(addr);
+            }
+            if let Some(asn) = session_info.remote_asn {
+                info = info.with_remote_asn(asn);
+            }
+        }
+        self.ingresses.update_info(child_id, info);
+        self.path_children.insert(path_id, child_id);
+        child_id
     }
 }
 
