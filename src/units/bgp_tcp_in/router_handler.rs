@@ -17,6 +17,7 @@ use routecore::bgp::message::{
 };
 use smallvec::{smallvec, SmallVec};
 use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -953,7 +954,7 @@ pub async fn handle_connection(
     // we do:
     let _ = tcp_stream.writable().await;
 
-    let (tcp_in, tcp_out) = tcp_stream.into_split();
+    let (tcp_in, mut tcp_out) = tcp_stream.into_split();
     let (sess_tx, sess_rx) = mpsc::channel::<Message>(100);
 
     let (pdu_out_tx, mut pdu_out_rx) = mpsc::channel(10);
@@ -1003,24 +1004,13 @@ pub async fn handle_connection(
 
     tokio::spawn(async move {
         while let Some(pdu) = pdu_out_rx.recv().await {
-            if let Err(e) = tcp_out.writable().await {
-                warn!("error while awaiting tcp_out.writable(): {}", e);
-            }
-            match tcp_out.try_write(pdu.as_ref()) {
-                Ok(_) => {}
-                Err(ref e)
-                    if e.kind() == tokio::io::ErrorKind::WouldBlock =>
-                {
-                    debug!("WouldBlock after writable().await");
-                }
-                Err(e) => {
-                    warn!(
-                        "error sending pdu ({:?}): {}",
-                        tcp_out.peer_addr(),
-                        e
-                    );
-                    break;
-                }
+            if let Err(e) = tcp_out.write_all(pdu.as_ref()).await {
+                warn!(
+                    "error sending pdu ({:?}): {}",
+                    tcp_out.peer_addr(),
+                    e
+                );
+                break;
             }
         }
         // Make sure we get rid of the other half of the TcpStream:
