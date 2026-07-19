@@ -22,6 +22,10 @@ use routecore::bgp::fsm::session::BgpConfig;
 use routecore::bgp::types::AfiSafiType;
 use serde::Deserialize;
 
+const fn default_extended_messages() -> bool {
+    true
+}
+
 /// Enum carrying either a exact IP address, or a `Prefix`.
 #[derive(
     Clone, Copy, Debug, Deserialize, Hash, Eq, PartialEq, Ord, PartialOrd,
@@ -124,6 +128,8 @@ pub struct PeerConfig {
     protocols: Vec<AfiSafiType>,
     #[serde(default)]
     addpath: Vec<AfiSafiType>,
+    #[serde(default = "default_extended_messages")]
+    extended_messages: bool,
 }
 
 impl fmt::Debug for PeerConfig {
@@ -134,6 +140,7 @@ impl fmt::Debug for PeerConfig {
             .field("hold_time", &self.hold_time)
             .field("protocols", &self.protocols)
             .field("addpath", &self.addpath)
+            .field("extended_messages", &self.extended_messages)
             .field("md5_key", &self.md5_key.as_ref().map(|_| "<redacted>"))
             .finish()
     }
@@ -149,6 +156,7 @@ impl PeerConfig {
             md5_key: None,
             protocols: vec![],
             addpath: vec![],
+            extended_messages: true,
         }
     }
 
@@ -179,6 +187,7 @@ impl PartialEq for PeerConfig {
         self.remote_asn == other.remote_asn
             && self.hold_time == other.hold_time
             && self.md5_key == other.md5_key
+            && self.extended_messages == other.extended_messages
     }
 }
 
@@ -246,6 +255,10 @@ impl BgpConfig for CombinedConfig {
     fn addpath(&self) -> Vec<AfiSafiType> {
         self.peer_config.addpath.clone()
     }
+
+    fn extended_messages(&self) -> bool {
+        self.peer_config.extended_messages
+    }
 }
 
 pub trait ConfigExt {
@@ -306,6 +319,7 @@ addpath = ["Ipv4Unicast", "Ipv6Unicast"]
 name = "Flowspec-peer"
 remote_asn = 100
 protocols = ["Ipv4Unicast", "Ipv6Unicast", "Ipv4FlowSpec", "Ipv6FlowSpec"]
+extended_messages = false
 "#;
 
         let Unit::BgpTcpIn(cfg) = toml::from_str::<Unit>(toml).unwrap()
@@ -355,6 +369,7 @@ protocols = ["Ipv4Unicast", "Ipv6Unicast", "Ipv4FlowSpec", "Ipv6FlowSpec"]
             cfg4.1.addpath,
             vec![AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast]
         );
+        assert!(cfg4.1.extended_messages);
 
         // FlowSpec (SAFI 133) is negotiated purely via the configured
         // protocols list: routecore's OPEN builder emits an MP capability
@@ -373,5 +388,14 @@ protocols = ["Ipv4Unicast", "Ipv6Unicast", "Ipv4FlowSpec", "Ipv6FlowSpec"]
                 AfiSafiType::Ipv6FlowSpec,
             ]
         );
+        assert!(!cfg5.1.extended_messages);
+
+        let combined = CombinedConfig {
+            my_asn: cfg.my_asn,
+            my_bgp_id: cfg.my_bgp_id,
+            remote_prefix_or_exact: cfg5.0,
+            peer_config: cfg5.1.clone(),
+        };
+        assert!(!combined.extended_messages());
     }
 }
