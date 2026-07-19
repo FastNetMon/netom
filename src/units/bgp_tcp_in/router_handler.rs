@@ -557,28 +557,21 @@ impl Processor {
                             // We replace the old (likely stale) session rather than
                             // rejecting the new one.
                             //
-                            // The old session receives a Cease NOTIFICATION. Ideally
-                            // this would use subcode 7 (Connection Collision Resolution,
-                            // RFC 4486 Section 4), but routecore's DisconnectReason
-                            // lacks that variant, so we use ConnectionRejected
-                            // (subcode 5) as the closest match.
+                            // The old session receives the RFC 4486 collision
+                            // resolution Cease notification before shutting down.
                             let old_entry = {
                                 let mut ls = live_sessions.lock().unwrap();
                                 ls.remove(&key)
                             };
-                            if let Some((_id, old_abort, old_tx, _pdu, old_ingress_id)) = old_entry {
+                            if let Some((_id, _old_abort, old_tx, _pdu, old_ingress_id)) = old_entry {
                                 warn!(
                                     "Replacing existing session for {:?} — \
                                      peer likely restarted (RFC 4271 §6.8)",
                                     key
                                 );
-                                // Try a graceful disconnect first, then force-abort
-                                // the old task to ensure the zombie TCP connection
-                                // is closed even if routecore's FSM is stuck.
                                 let _ = old_tx.send(Command::Disconnect(
-                                    DisconnectReason::ConnectionRejected
+                                    DisconnectReason::ConnectionCollisionResolution
                                 )).await;
-                                old_abort.abort();
 
                                 // If the old session had a different ingress ID
                                 // (rare, but possible), withdraw and remove it,
