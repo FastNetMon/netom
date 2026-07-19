@@ -2759,7 +2759,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git#05562277031b7fbc5ddc123999853afd387b5232"
+source = "git+https://github.com/nuclearcat/routecore.git#ae622051b36bf233cea1f2c5463e939b69cae679"
 dependencies = [
  "bytes",
  "chrono",

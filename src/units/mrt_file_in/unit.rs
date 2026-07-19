@@ -359,9 +359,8 @@ impl MrtInRunner {
             }
 
             let rib_entries = rib_file.rib_entries()?;
-            for (afisafi, peer_id, _peer_entry, nlri, raw_attr) in
-                rib_entries
-            {
+            for entry in rib_entries {
+                let (afisafi, peer_id, _peer_entry, nlri, raw_attr) = entry?;
                 let rr = match (afisafi, nlri) {
                     (AfiSafiType::Ipv4Unicast, RibEntryNlri::Prefix(prefix)) => {
                         RotondaRoute::Ipv4Unicast(
