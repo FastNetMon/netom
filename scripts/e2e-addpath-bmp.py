@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""ADD-PATH (RFC 7911) end-to-end driver/assertor for netom's BMP pipeline.
+"""ADD-PATH (RFC 7911) end-to-end driver/assertor for netom's BMP pipeline,
+covering v4 unicast and v4 flowspec (RFC 8955) ADD-PATH.
 
 Run via scripts/e2e-addpath-bmp.sh, which starts netom and passes the
 endpoints in HTTP_ADDR / BMP_IN_ADDR / BMP_OUT_ADDR.
@@ -21,7 +22,19 @@ BMP_OUT_REBUILD_ADDR = os.environ["BMP_OUT_REBUILD_ADDR"]
 PEER_IP = "10.99.0.1"
 PEER_AS = 65001
 PREFIX_WIRE = bytes([24, 10, 0, 0])  # 10.0.0.0/24
-ADDPATH_CAP = bytes([69, 4, 0, 1, 1, 3])  # v4 unicast, SendReceive
+
+# ADD-PATH (cap 69) families the feeder negotiates: v4 unicast and v4
+# flowspec, both SendReceive. The synthesized downstream Peer Up must
+# advertise exactly these quads (any order).
+ADDPATH_QUAD_UNICAST = bytes([0, 1, 1, 3])
+ADDPATH_QUAD_FLOWSPEC = bytes([0, 1, 133, 3])
+ADDPATH_CAP = bytes([69, 8]) + ADDPATH_QUAD_UNICAST + ADDPATH_QUAD_FLOWSPEC
+# MP-BGP capabilities so the flowspec family is negotiated at all.
+MP_CAPS = bytes([1, 4, 0, 1, 0, 1]) + bytes([1, 4, 0, 1, 0, 133])
+
+# RFC 8955 raw flowspec NLRI (no length header):
+FS_RULE_A = bytes([0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11])  # dst+proto=17
+FS_RULE_B = bytes([0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35])  # dst+dport=53
 
 DEADLINE = time.monotonic() + 60.0
 
@@ -77,8 +90,9 @@ def pph():
 
 
 def bgp_open():
-    # Capabilities: ADD-PATH (69) + 4-octet ASN (65), one type-2 parameter.
-    caps = ADDPATH_CAP + bytes([65, 4]) + struct.pack("!I", PEER_AS)
+    # Capabilities: MP families + ADD-PATH (69) + 4-octet ASN (65), one
+    # type-2 parameter.
+    caps = MP_CAPS + ADDPATH_CAP + bytes([65, 4]) + struct.pack("!I", PEER_AS)
     opt = bytes([2, len(caps)]) + caps
     body = struct.pack("!BHH", 4, PEER_AS, 0)
     body += socket.inet_aton(PEER_IP)
@@ -115,6 +129,25 @@ def announce(path_id, nexthop):
 def withdraw(path_id):
     wd = struct.pack("!I", path_id) + PREFIX_WIRE
     return bmp_msg(0, pph() + bgp_update(b"", b"", withdrawn=wd))
+
+
+def fs_announce(path_id, rule):
+    # MP_REACH_NLRI: AFI 1, SAFI 133, next hop length 0, reserved, then the
+    # RFC 7911 path id + RFC 8955 length header + raw rule bytes.
+    mp = struct.pack("!HBBB", 1, 133, 0, 0)
+    mp += struct.pack("!I", path_id) + bytes([len(rule)]) + rule
+    pas = pa(0x40, 1, b"\x00")  # ORIGIN IGP
+    pas += pa(0x40, 2, bytes([2, 1]) + struct.pack("!I", PEER_AS))  # AS_PATH
+    pas += pa(0x80, 14, mp)
+    return bmp_msg(0, pph() + bgp_update(pas, b""))
+
+
+def fs_withdraw(path_id, rule):
+    # MP_UNREACH_NLRI: AFI 1, SAFI 133, then path id + length header + rule.
+    mp = struct.pack("!HB", 1, 133)
+    mp += struct.pack("!I", path_id) + bytes([len(rule)]) + rule
+    pas = pa(0x80, 15, mp)
+    return bmp_msg(0, pph() + bgp_update(pas, b""))
 
 
 def peer_down():
@@ -171,20 +204,46 @@ def addpath_entries(field):
     return out
 
 
+def open_cap69_quads(open_msg):
+    """Return the set of 4-byte family quads of cap 69 in one BGP OPEN."""
+    opt_len = open_msg[28]
+    opts = open_msg[29 : 29 + opt_len]
+    quads = set()
+    i = 0
+    while i < len(opts):
+        ptype, plen = opts[i], opts[i + 1]
+        pval = opts[i + 2 : i + 2 + plen]
+        if ptype == 2:
+            j = 0
+            while j < len(pval):
+                code, clen = pval[j], pval[j + 1]
+                if code == 69:
+                    val = pval[j + 2 : j + 2 + clen]
+                    for k in range(0, len(val), 4):
+                        quads.add(bytes(val[k : k + 4]))
+                j += 2 + clen
+        i += 2 + plen
+    return quads
+
+
 def expect_peer_up_with_cap69(reader, context):
-    """Skip to the next Peer Up; assert cap 69 appears in both OPENs."""
+    """Skip to the next Peer Up; assert cap 69 in both OPENs advertises
+    exactly the negotiated unicast + flowspec quads."""
+    want = {ADDPATH_QUAD_UNICAST, ADDPATH_QUAD_FLOWSPEC}
     while True:
         msg_type, msg = reader.read_msg()
         if msg_type != 3:
             continue
-        count = 0
-        for i in range(len(msg) - len(ADDPATH_CAP) + 1):
-            if msg[i : i + len(ADDPATH_CAP)] == ADDPATH_CAP:
-                count += 1
-        assert count == 2, (
-            f"FAIL ({context}): expected cap 69 in both OPENs of the "
-            f"synthesized Peer Up, found {count} occurrence(s)"
-        )
+        off = 6 + 42 + 16 + 2 + 2  # headers, local addr, ports
+        for which in ("sent", "received"):
+            olen = struct.unpack("!H", msg[off + 16 : off + 18])[0]
+            quads = open_cap69_quads(msg[off : off + olen])
+            assert quads == want, (
+                f"FAIL ({context}): {which} OPEN of the synthesized Peer "
+                f"Up advertises cap-69 quads {sorted(quads)}, "
+                f"expected {sorted(want)}"
+            )
+            off += olen
         return
 
 
@@ -197,13 +256,69 @@ def collect_announced_pids(reader, want, context):
             continue
         wd, nlri = parse_route_monitoring(msg)
         if not nlri:
-            continue  # EoR or withdraw-only
+            continue  # EoR, withdraw-only, or MP-only (flowspec)
         for pid, wire in addpath_entries(nlri):
             assert wire == PREFIX_WIRE, (
                 f"FAIL ({context}): unexpected NLRI {wire.hex()}"
             )
             pids.append(pid)
     return pids
+
+
+def parse_path_attrs(msg):
+    """Return {type_code: value} of the encapsulated UPDATE's attributes."""
+    bgp = msg[6 + 42 :]
+    wd_len = struct.unpack("!H", bgp[19:21])[0]
+    pa_len = struct.unpack("!H", bgp[21 + wd_len : 23 + wd_len])[0]
+    pas = bgp[23 + wd_len : 23 + wd_len + pa_len]
+    attrs = {}
+    i = 0
+    while i < len(pas):
+        flags, code = pas[i], pas[i + 1]
+        if flags & 0x10:  # extended length
+            alen = struct.unpack("!H", pas[i + 2 : i + 4])[0]
+            i += 4
+        else:
+            alen = pas[i + 2]
+            i += 3
+        attrs[code] = pas[i : i + alen]
+        i += alen
+    return attrs
+
+
+def fs_addpath_entries(value, reach):
+    """Split an MP_REACH (reach=True) or MP_UNREACH flowspec attribute value
+    into (path_id, raw_rule) pairs."""
+    afi, safi = struct.unpack("!HB", value[:3])
+    assert (afi, safi) == (1, 133), f"unexpected family {afi}/{safi}"
+    if reach:
+        nhlen = value[3]
+        field = value[3 + 1 + nhlen + 1 :]
+    else:
+        field = value[3:]
+    out = []
+    while field:
+        pid = struct.unpack("!I", field[:4])[0]
+        ln = field[4]
+        assert ln < 240, "long flowspec NLRI unexpected in this test"
+        out.append((pid, bytes(field[5 : 5 + ln])))
+        field = field[5 + ln :]
+    return out
+
+
+def collect_fs_announced(reader, want, context):
+    """Read Route Monitoring messages until `want` flowspec (pid, rule)
+    announcements are seen."""
+    entries = []
+    while len(entries) < want:
+        msg_type, msg = reader.read_msg()
+        if msg_type != 0:
+            continue
+        attrs = parse_path_attrs(msg)
+        if 14 not in attrs:
+            continue
+        entries.extend(fs_addpath_entries(attrs[14], reach=True))
+    return entries
 
 
 # --- test sequence ---------------------------------------------------------------
@@ -237,6 +352,17 @@ def main():
             "with path ids: OK"
         )
 
+    # FlowSpec ADD-PATH: two rules under distinct path ids; both consumers
+    # must see them restreamed with their path ids inside MP_REACH.
+    feeder.sendall(fs_announce(1, FS_RULE_A))
+    feeder.sendall(fs_announce(2, FS_RULE_B))
+    for context, reader in consumers:
+        entries = collect_fs_announced(reader, want=2, context=context)
+        assert sorted(entries) == [(1, FS_RULE_A), (2, FS_RULE_B)], (
+            f"FAIL ({context} flowspec): {entries}"
+        )
+        print(f"{context} live flowspec restream with path ids: OK")
+
     # Withdraw path 1; both consumers must see a withdrawal carrying path
     # id 1 — and NO duplicate announcements of pids 1/2 in between (the
     # fastpath duplicate-suppression check would otherwise deliver every
@@ -261,13 +387,42 @@ def main():
             break
         print(f"{context} withdraw of path 1 carries its path id: OK")
 
+    # FlowSpec withdrawal of path 1's rule: MP_UNREACH carrying the path id
+    # — and no duplicate flowspec announcements in between (the fastpath
+    # duplicate-suppression must cover flowspec child payloads too).
+    feeder.sendall(fs_withdraw(1, FS_RULE_A))
+    for context, reader in consumers:
+        while True:
+            msg_type, msg = reader.read_msg()
+            if msg_type != 0:
+                continue
+            attrs = parse_path_attrs(msg)
+            if 15 in attrs:
+                entries = fs_addpath_entries(attrs[15], reach=False)
+                assert entries == [(1, FS_RULE_A)], (
+                    f"FAIL ({context} flowspec withdraw): {entries}"
+                )
+                break
+            assert 14 not in attrs, (
+                f"FAIL ({context}): duplicate flowspec announcement "
+                f"{fs_addpath_entries(attrs[14], reach=True)}"
+            )
+        print(f"{context} flowspec withdraw of path 1 carries its id: OK")
+
     # Consumer B2 connects now: its initial dump must advertise cap 69 and
-    # replay ONLY the still-active path 2, with its path id.
+    # replay ONLY the still-active path 2 — unicast prefix and flowspec
+    # rule alike, each with its path id (the flowspec table walk follows
+    # the unicast walk).
     b2 = BmpReader(connect(BMP_OUT_ADDR))
     expect_peer_up_with_cap69(b2, "dump")
     pids = collect_announced_pids(b2, want=1, context="dump")
     assert pids == [2], f"FAIL (dump): pids {pids}"
-    print("reconnect dump replays only path 2, with its path id: OK")
+    entries = collect_fs_announced(b2, want=1, context="dump")
+    assert entries == [(2, FS_RULE_B)], f"FAIL (dump flowspec): {entries}"
+    print(
+        "reconnect dump replays only path 2 (unicast + flowspec), "
+        "with path ids: OK"
+    )
 
     # HTTP: the register shows both bgpPath children with pathId and a
     # shared parentIngress (the session).

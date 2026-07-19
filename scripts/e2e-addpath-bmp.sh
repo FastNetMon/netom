@@ -2,16 +2,19 @@
 # End-to-end ADD-PATH (RFC 7911) test via BMP.
 #
 # Feeds a real netom process (bmp-tcp-in -> rib -> bmp-tcp-out) a crafted
-# BMP session whose PeerUp negotiates ADD-PATH (capability 69, IPv4 unicast,
-# SendReceive in both OPENs), announces one prefix twice with distinct path
-# ids, withdraws one path, and tears the peer down. Asserts on the bmp-out
-# side that:
+# BMP session whose PeerUp negotiates ADD-PATH (capability 69, IPv4 unicast
+# + IPv4 flowspec, SendReceive in both OPENs), announces one prefix twice
+# and two flowspec rules with distinct path ids, withdraws one path of
+# each, and tears the peer down. Asserts on the bmp-out side that:
 #
-#   * the synthesized downstream Peer Up advertises cap 69 in BOTH OPENs,
-#   * both paths are restreamed live with their 4-byte path ids in the NLRI,
-#   * a path-specific withdrawal carries its path id,
+#   * the synthesized downstream Peer Up advertises cap 69 with exactly the
+#     negotiated unicast + flowspec quads in BOTH OPENs,
+#   * both unicast paths and both flowspec rules are restreamed live with
+#     their 4-byte path ids in the NLRI,
+#   * path-specific withdrawals carry their path id (classic withdrawn
+#     field for unicast, MP_UNREACH for flowspec),
 #   * a reconnecting consumer's initial dump replays only the still-active
-#     path (with its path id),
+#     path of each family (with its path id),
 #   * the /ingresses HTTP API shows the two bgpPath children with pathId and
 #     parentIngress,
 #   * PeerDown is emitted exactly once (for the session, not per child).

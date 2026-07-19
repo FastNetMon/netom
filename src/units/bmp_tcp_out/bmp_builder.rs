@@ -3478,6 +3478,153 @@ mod tests {
         assert_eq!(messages.len(), 2);
     }
 
+    /// FlowSpec path ids round-trip through routecore's ADD-PATH parser:
+    /// announce (MP_REACH) and withdraw (MP_UNREACH) for both families,
+    /// with the RFC 7911 path id preceding the RFC 8955 length header.
+    #[test]
+    fn flowspec_path_id_roundtrips_through_routecore() {
+        use bytes::Bytes;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        use routecore::bgp::nlri::afisafi::{Addpath, Nlri};
+
+        // {dst 2001:db8::/32} raw v6 NLRI (RFC 8956: type, prefix-length,
+        // prefix-offset, prefix bytes).
+        const FS_NLRI_V6: &[u8] = &[0x01, 0x20, 0x00, 0x20, 0x01, 0x0d, 0xb8];
+
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let mut sc = SessionConfig::modern();
+        sc.add_addpath_rxtx(AfiSafiType::Ipv4FlowSpec);
+        sc.add_addpath_rxtx(AfiSafiType::Ipv6FlowSpec);
+
+        for (is_v4, raw, pid, withdraw) in [
+            (true, FS_NLRI_A, 7u32, false),
+            (true, FS_NLRI_A, 7, true),
+            (false, FS_NLRI_V6, 9, false),
+            (false, FS_NLRI_V6, 9, true),
+        ] {
+            let msg = build_flowspec_route_monitoring(
+                &peer,
+                is_v4,
+                raw,
+                &pamap,
+                withdraw,
+                Some(pid),
+            )
+            .expect("message must build");
+            let bgp = Bytes::copy_from_slice(
+                &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..],
+            );
+            let upd = UpdateMessage::from_octets(bgp, &sc)
+                .expect("re-encoded UPDATE must parse");
+            let nlri: Vec<Nlri<Bytes>> = if withdraw {
+                upd.withdrawals().unwrap().map(|n| n.unwrap()).collect()
+            } else {
+                upd.announcements().unwrap().map(|n| n.unwrap()).collect()
+            };
+            assert_eq!(nlri.len(), 1, "v4={is_v4} withdraw={withdraw}");
+            match &nlri[0] {
+                Nlri::Ipv4FlowSpecAddpath(n) => {
+                    assert_eq!(n.path_id().0, pid);
+                    assert_eq!(n.nlri().raw().as_ref(), raw);
+                }
+                Nlri::Ipv6FlowSpecAddpath(n) => {
+                    assert_eq!(n.path_id().0, pid);
+                    assert_eq!(n.nlri().raw().as_ref(), raw);
+                }
+                other => panic!(
+                    "expected FlowSpec ADD-PATH NLRI \
+                     (v4={is_v4} withdraw={withdraw}), got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The flowspec aggregator packs multiple ADD-PATH rules into one
+    /// UPDATE with per-rule path ids, and never mixes path-id and plain
+    /// rules in one group (the wire format would be unparseable).
+    #[test]
+    fn flowspec_aggregator_separates_and_encodes_path_ids() {
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let mut agg = RouteAggregator::new(
+            1024 * 1024,
+            HashMap::from([(1u32, peer)]),
+        );
+        let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
+        {
+            let mut sink = |msg: Vec<u8>, n: usize| {
+                messages.push((msg, n));
+                true
+            };
+            // Two ADD-PATH rules and one plain rule, all sharing one
+            // (peer, family, attribute-set).
+            assert!(agg.add_flowspec(
+                1,
+                Some(1),
+                true,
+                FS_NLRI_A,
+                &pamap,
+                &mut sink
+            ));
+            assert!(agg.add_flowspec(
+                1,
+                Some(2),
+                true,
+                FS_NLRI_B,
+                &pamap,
+                &mut sink
+            ));
+            assert!(agg
+                .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
+            assert!(agg.flush_all(&mut sink));
+        }
+        assert_eq!(
+            messages.len(),
+            2,
+            "path-id and plain rules must flush as separate UPDATEs"
+        );
+
+        // Locate each message's MP_REACH NLRI field.
+        let nlri_field = |msg: &[u8]| -> Vec<u8> {
+            let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+            let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+            let pas = &bgp[23..23 + pa_len];
+            let mp = &pas[15..]; // shared ORIGIN + ext-comms first
+            assert_eq!(mp[0], 0x90);
+            assert_eq!(mp[1], 14);
+            let value_len = u16::from_be_bytes([mp[2], mp[3]]) as usize;
+            let value = &mp[4..4 + value_len];
+            assert_eq!(value[2], 133);
+            value[5..].to_vec() // strip AFI/SAFI/nh_len/reserved
+        };
+
+        let mut seen_addpath = false;
+        let mut seen_plain = false;
+        for (msg, n) in &messages {
+            let nlri = nlri_field(msg);
+            if *n == 2 {
+                // ADD-PATH group: pid 1 + header + A, then pid 2 + header
+                // + B, in insertion order.
+                let mut want = 1u32.to_be_bytes().to_vec();
+                want.push(FS_NLRI_A.len() as u8);
+                want.extend_from_slice(FS_NLRI_A);
+                want.extend_from_slice(&2u32.to_be_bytes());
+                want.push(FS_NLRI_B.len() as u8);
+                want.extend_from_slice(FS_NLRI_B);
+                assert_eq!(nlri, want);
+                seen_addpath = true;
+            } else {
+                // Plain group: length header + A only, no path id.
+                let mut want = vec![FS_NLRI_A.len() as u8];
+                want.extend_from_slice(FS_NLRI_A);
+                assert_eq!(nlri, want);
+                seen_plain = true;
+            }
+        }
+        assert!(seen_addpath && seen_plain);
+    }
+
     /// NLRI of 240 bytes or more get the two-byte 0xFnnn length encoding.
     #[test]
     fn flowspec_long_nlri_two_byte_length() {

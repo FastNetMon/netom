@@ -110,11 +110,15 @@ verbatim (duplicate suppression maps child payloads back to the session).
 End-to-end coverage: `scripts/e2e-addpath-bmp.sh` (fastpath and rebuild
 consumers). Remaining work:
 
-- [ ] FlowSpec ADD-PATH: `Ipv4FlowSpecAddpath` / `Ipv6FlowSpecAddpath` NLRI
-      are still dropped at the `convert_nlri` chokepoint (counted in
-      `netom_unsupported_nlri_dropped_total`). Storing them would reuse the
-      per-(prefix, mui) rule-set blob under child muis; the bmp-out FlowSpec
-      encoder and cap-69 family filtering would need to learn path ids.
+- [x] FlowSpec ADD-PATH (done 2026-07-19): `convert_nlri` stores the two
+      FlowSpec ADD-PATH variants under per-path child muis, the bmp-out
+      FlowSpec encoder threads path ids through MP_REACH/MP_UNREACH and the
+      dump aggregator, and the synthesized Peer Up advertises cap 69 for
+      negotiated flowspec families. Along the way: RFC 8955 §6 validation
+      now resolves child muis to their session (child entries carried no
+      bgp_id, so rules under child muis were falsely Invalid), closing a
+      pre-existing hole for unicast ADD-PATH too. Covered by unit tests and
+      a flowspec leg in `scripts/e2e-addpath-bmp.sh`.
 - [ ] MRT ADD-PATH (RFC 8050): blocked on routecore — its MRT layer has no
       `RIB_*_ADDPATH` subtypes (8–11) and `RibEntry::parse` reads no path
       id. Once added there: extend `supported_rib_records` and the RIB-entry

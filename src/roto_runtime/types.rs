@@ -950,6 +950,72 @@ mod tests {
         assert_eq!(announced[0].1, None);
     }
 
+    /// FlowSpec ADD-PATH NLRI convert like unicast: the plain RotondaRoute
+    /// form with the stripped path id alongside, for both announcements
+    /// (MP_REACH) and withdrawals (MP_UNREACH).
+    #[test]
+    fn explode_surfaces_flowspec_addpath_path_ids() {
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+
+        // {dst 10.0.1.0/24, proto =17} raw flowspec NLRI (RFC 8955).
+        const FS_NLRI: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+        let pid = 5u32;
+
+        // Hand-crafted UPDATE: ORIGIN, then MP_REACH_NLRI (attr 14) or
+        // MP_UNREACH_NLRI (attr 15) for AFI 1 / SAFI 133 whose NLRI is the
+        // RFC 7911 path id followed by the length header and raw bytes.
+        let mk_update = |withdraw: bool| {
+            let mut mp = vec![0x80, if withdraw { 15 } else { 14 }, 0];
+            mp.extend_from_slice(&1u16.to_be_bytes());
+            mp.push(133);
+            if !withdraw {
+                mp.push(0); // next hop length
+                mp.push(0); // reserved
+            }
+            mp.extend_from_slice(&pid.to_be_bytes());
+            mp.push(FS_NLRI.len() as u8);
+            mp.extend_from_slice(FS_NLRI);
+            mp[2] = (mp.len() - 3) as u8;
+
+            let mut pas = vec![0x40, 1, 1, 0]; // ORIGIN=IGP
+            pas.extend_from_slice(&mp);
+            let mut upd = vec![0xffu8; 16];
+            upd.extend_from_slice(&0u16.to_be_bytes()); // length, fixed up
+            upd.push(2); // UPDATE
+            upd.extend_from_slice(&0u16.to_be_bytes()); // withdrawn len
+            upd.extend_from_slice(&(pas.len() as u16).to_be_bytes());
+            upd.extend_from_slice(&pas);
+            let len = (upd.len() as u16).to_be_bytes();
+            upd[16..18].copy_from_slice(&len);
+            bytes::Bytes::from(upd)
+        };
+
+        let mut sc = SessionConfig::modern();
+        sc.add_addpath_rxtx(AfiSafiType::Ipv4FlowSpec);
+
+        let upd = UpdateMessage::from_octets(mk_update(false), &sc).unwrap();
+        let announced = explode_announcements(&upd).unwrap();
+        assert_eq!(announced.len(), 1);
+        match &announced[0] {
+            (RotondaRoute::Ipv4FlowSpec(n, _), got_pid) => {
+                assert_eq!(n.nlri().raw().as_ref(), FS_NLRI);
+                assert_eq!(*got_pid, Some(PathId(pid)));
+            }
+            other => panic!("unexpected explode result {other:?}"),
+        }
+
+        let upd = UpdateMessage::from_octets(mk_update(true), &sc).unwrap();
+        let withdrawn = explode_withdrawals(&upd).unwrap();
+        assert_eq!(withdrawn.len(), 1);
+        match &withdrawn[0] {
+            (RotondaRoute::Ipv4FlowSpec(n, _), got_pid) => {
+                assert_eq!(n.nlri().raw().as_ref(), FS_NLRI);
+                assert_eq!(*got_pid, Some(PathId(pid)));
+            }
+            other => panic!("unexpected explode result {other:?}"),
+        }
+    }
+
     #[test]
     fn unsupported_nlri_metric_absent_until_first_drop() {
         let m = UnsupportedNlriMetrics::default();
