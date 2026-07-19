@@ -56,13 +56,12 @@ const BGP_MARKER: [u8; 16] = [0xFF; 16];
 const BGP_MSG_OPEN: u8 = 1;
 const BGP_MSG_UPDATE: u8 = 2;
 
-/// Maximum size of a BGP UPDATE message (RFC 4271 §4: the BGP message length
-/// field caps a non-extended message at 4096 bytes). The aggregating dump
-/// builder packs as many same-attribute NLRI into one UPDATE as will fit
-/// under this, then starts a new message. We stay within the classic 4096
-/// limit (rather than the 2-byte field's 65535) so the synthetic feed is
-/// accepted by consumers that did not negotiate BGP extended messages.
-const MAX_BGP_UPDATE_LEN: usize = 4096;
+/// Maximum size of a BGP UPDATE after negotiating the Extended Message
+/// capability (RFC 8654). Synthetic Peer Up OPENs advertise capability 6 in
+/// both directions, so downstream consumers can accept the full two-byte BGP
+/// message-length range. OPEN and KEEPALIVE messages retain their RFC 4271
+/// limits; only UPDATEs are built against this value here.
+const MAX_BGP_UPDATE_LEN: usize = u16::MAX as usize;
 
 /// Information about a peer extracted from IngressInfo, used to construct
 /// BMP Per-Peer Headers and Peer Up messages.
@@ -110,8 +109,8 @@ pub struct PeerInfo {
 /// Capability codes NOT passed through verbatim into the received OPEN,
 /// because bmp-out either synthesizes them itself (so passing through would
 /// duplicate) or re-encodes routes incompatibly with them:
-///   1=MultiProtocol 65=FourOctetAsn 64=GracefulRestart  — synthesized to
-///       match our actual output encoding
+///   1=MultiProtocol 6=ExtendedMessage 65=FourOctetAsn
+///   64=GracefulRestart — synthesized to match our actual output encoding
 ///   9=BgpRole 73=FQDN 75=SoftwareVersion                — synthesized from
 ///       parsed `OpenCapExtras` fields
 ///   69=AddPath — synthesized from the session's *negotiated* families
@@ -121,7 +120,7 @@ pub struct PeerInfo {
 ///   5=ExtendedNextHop — would change how downstream parses our re-encoded
 ///       UPDATEs (next hops are rebuilt). Kept in sync with
 ///       `machine::DROPPED_CAP_CODES`.
-const PASSTHROUGH_EXCLUDE: &[u8] = &[1, 5, 9, 64, 65, 69, 73, 75];
+const PASSTHROUGH_EXCLUDE: &[u8] = &[1, 5, 6, 9, 64, 65, 69, 73, 75];
 
 /// Best-effort optional capabilities recovered from an upstream session and
 /// re-emitted in the (received) Peer Up OPEN so downstream consumers recover
@@ -422,10 +421,10 @@ pub fn build_termination_message() -> Vec<u8> {
 ///
 /// This is a normalized OPEN, not a copy of what the monitored router
 /// actually exchanged: we advertise 4-octet ASN, the peer's MP-BGP families,
-/// optional Graceful Restart, and selected compatible upstream capabilities.
-/// Downstream UPDATE size remains capped at the classic 4096 limit. For the
-/// received OPEN, `bgp_id` is the peer's real BGP Identifier; the monitored
-/// router's identifier is not carried by BMP, so the sent OPEN uses zero.
+/// optional Graceful Restart, Extended Message, and selected compatible
+/// upstream capabilities. For the received OPEN, `bgp_id` is the peer's real
+/// BGP Identifier; the monitored router's identifier is not carried by BMP,
+/// so the sent OPEN uses zero.
 ///
 /// FUTURE (under consideration): replay the received OPEN verbatim instead
 /// of synthesizing one. That would faithfully preserve the real BGP
@@ -447,6 +446,12 @@ fn build_bgp_open(
     caps.push(65);
     caps.push(4);
     caps.extend_from_slice(&u32::from(asn).to_be_bytes());
+
+    // Capability: Extended Message (code 6, RFC 8654). The same normalized
+    // capability is emitted in both OPENs, allowing rebuilt and verbatim
+    // UPDATEs up to the 65,535-byte BGP length-field limit.
+    caps.push(6);
+    caps.push(0);
 
     for afisafi in afisafis {
         let (afi, safi) = match afisafi {
@@ -1679,8 +1684,8 @@ const BGP_UPDATE_MIN_LEN: usize = 23;
 ///     so the flag must travel with them;
 ///   * the timestamp — the original export time, not our re-send time.
 ///
-/// Returns `None` for a `body` too short to contain a per-peer header and
-/// a minimal UPDATE; such a message should be dropped, not sent.
+/// Returns `None` for a truncated, inconsistently framed, non-UPDATE, or
+/// over-limit payload; such a message should be dropped, not sent.
 pub fn build_route_monitoring_raw(
     peer: &PeerInfo,
     body: &[u8],
@@ -1689,6 +1694,14 @@ pub fn build_route_monitoring_raw(
         return None;
     }
     let (orig_pph, bgp_update) = body.split_at(BMP_PER_PEER_HEADER_LEN);
+    let declared_len =
+        u16::from_be_bytes([bgp_update[16], bgp_update[17]]) as usize;
+    if bgp_update[18] != BGP_MSG_UPDATE
+        || declared_len != bgp_update.len()
+        || declared_len > MAX_BGP_UPDATE_LEN
+    {
+        return None;
+    }
 
     let total_len =
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
@@ -1809,7 +1822,7 @@ fn bgp_update_too_long(prefix: Prefix, total_len: usize) -> Option<Vec<u8>> {
          {total_len} exceeds the 2-byte BGP length field; emitting it would \
          corrupt the BMP stream framing"
     );
-    debug_assert!(total_len <= u16::MAX as usize);
+    debug_assert!(total_len > u16::MAX as usize);
     None
 }
 
@@ -2263,6 +2276,26 @@ mod tests {
         )
         .is_none());
         assert!(build_route_monitoring_raw(&peer, &[]).is_none());
+
+        // RFC 8654-sized UPDATEs pass through after capability 6 is
+        // synthesized in both Peer Up OPENs.
+        let mut extended = vec![0xFFu8; 16];
+        extended.extend_from_slice(&5000u16.to_be_bytes());
+        extended.push(BGP_MSG_UPDATE);
+        extended.resize(5000, 0);
+        let mut extended_body = orig_pph.to_vec();
+        extended_body.extend_from_slice(&extended);
+        let msg = build_route_monitoring_raw(&peer, &extended_body).unwrap();
+        assert_eq!(
+            &msg[body_offset..],
+            &extended,
+            "extended UPDATE must remain verbatim"
+        );
+
+        // The raw fastpath must not forward inconsistent BGP framing.
+        let mut bad_body = extended_body;
+        bad_body[BMP_PER_PEER_HEADER_LEN + 17] ^= 1;
+        assert!(build_route_monitoring_raw(&peer, &bad_body).is_none());
     }
 
     #[test]
@@ -2391,6 +2424,34 @@ mod tests {
             }
             pos += 2 + cap_len;
         }
+    }
+
+    #[test]
+    fn bgp_open_advertises_extended_message() {
+        let open = build_bgp_open(
+            Asn::from_u32(65000),
+            [0u8; 4],
+            &OpenCapExtras::default(),
+            &[AfiSafiType::Ipv4FlowSpec],
+            false,
+            None,
+        );
+        let bgp_body = &open[19..];
+        let opt_params_len = bgp_body[9] as usize;
+        let opt_params = &bgp_body[10..10 + opt_params_len];
+        let caps = &opt_params[2..];
+        let mut pos = 0;
+        let mut found = false;
+        while pos < caps.len() {
+            let code = caps[pos];
+            let len = caps[pos + 1] as usize;
+            if code == 6 {
+                assert_eq!(len, 0);
+                found = true;
+            }
+            pos += 2 + len;
+        }
+        assert!(found, "Extended Message capability not found");
     }
 
     #[test]
@@ -2717,6 +2778,37 @@ mod tests {
             occurrences, 2,
             "cap 69 must appear in both the sent and received OPEN"
         );
+    }
+
+    #[test]
+    fn peer_up_negotiates_extended_message_in_both_opens() {
+        let mut peer = make_peer([0u8; 8]);
+        // An upstream copy must not create a third passthrough instance.
+        peer.peer_capabilities = vec![6, 0];
+        let msg = build_peer_up(&peer, true);
+        let sent_start =
+            BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + 16 + 2 + 2;
+        let sent_len = u16::from_be_bytes([
+            msg[sent_start + 16],
+            msg[sent_start + 17],
+        ]) as usize;
+        let received_start = sent_start + sent_len;
+
+        let count_cap6 = |open: &[u8]| {
+            let opt_len = open[28] as usize;
+            let params = &open[29..29 + opt_len];
+            let caps = &params[2..];
+            let mut pos = 0;
+            let mut count = 0;
+            while pos < caps.len() {
+                let len = caps[pos + 1] as usize;
+                count += usize::from(caps[pos] == 6);
+                pos += 2 + len;
+            }
+            count
+        };
+        assert_eq!(count_cap6(&msg[sent_start..received_start]), 1);
+        assert_eq!(count_cap6(&msg[received_start..]), 1);
     }
 
     /// `from_ingress_info` keeps only the ADD-PATH families bmp-out actually
@@ -3156,14 +3248,17 @@ mod tests {
         }
 
         let mut total_routes = 0usize;
+        let mut saw_extended = false;
         for (m, n) in &messages {
             total_routes += n;
             let bgp = &m[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
             let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
             assert_eq!(bgp_len, bgp.len());
             assert!(bgp_len <= MAX_BGP_UPDATE_LEN);
+            saw_extended |= bgp_len > 4096;
         }
         assert_eq!(total_routes, 5000);
+        assert!(saw_extended, "aggregator never used extended messages");
         assert!(messages.len() < 100, "expected heavy aggregation");
     }
 
@@ -3294,13 +3389,33 @@ mod tests {
     }
 
     #[test]
-    fn oversized_flowspec_update_is_dropped() {
-        // The synthetic Peer Up OPEN does not negotiate Extended Messages,
-        // so even though the BGP length field is two bytes, UPDATEs remain
-        // capped at the classic 4096-byte limit.
+    fn oversized_flowspec_update_uses_extended_message() {
         let mut attrs = vec![0xd0, 99]; // optional, transitive, ext-length
         attrs.extend_from_slice(&4070u16.to_be_bytes());
         attrs.extend(std::iter::repeat_n(0u8, 4070));
+        let pamap = RotondaPaMap::from(attrs);
+
+        let msg = build_flowspec_route_monitoring(
+            &agg_test_peer(),
+            true,
+            FS_NLRI_A,
+            &pamap,
+            false,
+            None,
+        )
+        .expect("extended FlowSpec UPDATE must be emitted");
+        let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+        assert_eq!(bgp_len, bgp.len());
+        assert!(bgp_len > 4096);
+        assert!(bgp_len <= MAX_BGP_UPDATE_LEN);
+    }
+
+    #[test]
+    fn flowspec_update_above_extended_limit_is_dropped() {
+        let mut attrs = vec![0xd0, 99];
+        attrs.extend_from_slice(&u16::MAX.to_be_bytes());
+        attrs.extend(std::iter::repeat_n(0u8, u16::MAX as usize));
         let pamap = RotondaPaMap::from(attrs);
 
         assert!(build_flowspec_route_monitoring(
@@ -3451,6 +3566,38 @@ mod tests {
         let second = &nlri[1 + FS_NLRI_A.len()..];
         assert_eq!(second[0] as usize, FS_NLRI_B.len());
         assert_eq!(&second[1..], FS_NLRI_B);
+    }
+
+    #[test]
+    fn flowspec_aggregation_uses_extended_messages() {
+        let peer = agg_test_peer();
+        let pamap = fs_pamap();
+        let mut agg = RouteAggregator::new(
+            1024 * 1024,
+            HashMap::from([(1u32, peer)]),
+        );
+        let nlri_a = vec![1u8; 3000];
+        let nlri_b = vec![2u8; 3000];
+        let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut sink = |msg: Vec<u8>, n: usize| {
+            messages.push((msg, n));
+            true
+        };
+        assert!(agg.add_flowspec(
+            1, None, true, &nlri_a, &pamap, &mut sink,
+        ));
+        assert!(agg.add_flowspec(
+            1, None, true, &nlri_b, &pamap, &mut sink,
+        ));
+        assert!(agg.flush_all(&mut sink));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].1, 2);
+        let bgp = &messages[0].0
+            [BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
+        assert_eq!(bgp_len, bgp.len());
+        assert!(bgp_len > 4096);
+        assert!(bgp_len <= MAX_BGP_UPDATE_LEN);
     }
 
     /// A unicast route and a flowspec rule with the SAME peer and the SAME
