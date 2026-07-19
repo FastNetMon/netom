@@ -205,21 +205,10 @@ impl MrtInRunner {
             BgpMsg::Update(upd) => {
                 let received = std::time::Instant::now();
                 let mut payloads = SmallVec::new();
-                // ADD-PATH entries (Some(path_id)) are dropped here for
-                // good: routecore's MRT layer has no RFC 8050 (ADD-PATH)
-                // subtype support at all, so a BGP4MP stream yielding
-                // path-id NLRI cannot occur today — this filter is
-                // dead-code insurance, not a TODO.
                 let rr_reach: Vec<_> = explode_announcements(&upd)?
-                    .into_iter()
-                    .filter(|(_, pid)| pid.is_none())
-                    .map(|(rr, _)| rr)
-                    .collect();
+                    .into_iter().collect();
                 let rr_unreach: Vec<_> = explode_withdrawals(&upd)?
-                    .into_iter()
-                    .filter(|(_, pid)| pid.is_none())
-                    .map(|(rr, _)| rr)
-                    .collect();
+                    .into_iter().collect();
 
                 announcements_sent += rr_reach.len();
                 withdrawals_sent += rr_unreach.len();
@@ -241,25 +230,52 @@ impl MrtInRunner {
                     new_id
                 };
 
-                payloads.extend(rr_reach.into_iter().map(|rr| {
-                    Payload::with_received(
+                for (rr, path_id) in rr_reach {
+                    let effective_id = match path_id {
+                        None => ingress_id,
+                        Some(path_id) => {
+                            let existing = ingresses.ids_for_parent(ingress_id)
+                                .into_iter()
+                                .find(|id| ingresses.get(*id)
+                                    .is_some_and(|info| info.path_id == Some(path_id.0)));
+                            existing.unwrap_or_else(|| {
+                                let id = ingresses.register();
+                                ingresses.update_info(id, IngressInfo::new()
+                                    .with_parent_ingress(ingress_id)
+                                    .with_ingress_type(IngressType::BgpPath)
+                                    .with_path_id(path_id.0));
+                                id
+                            })
+                        }
+                    };
+                    payloads.push(Payload::with_received(
                         rr,
                         None,
                         received,
-                        ingress_id,
+                        effective_id,
                         RouteStatus::Active,
-                    )
-                }));
+                    ));
+                }
 
-                payloads.extend(rr_unreach.into_iter().map(|rr| {
-                    Payload::with_received(
+                for (rr, path_id) in rr_unreach {
+                    let effective_id = match path_id {
+                        None => ingress_id,
+                        Some(path_id) => match ingresses.ids_for_parent(ingress_id)
+                            .into_iter()
+                            .find(|id| ingresses.get(*id)
+                                .is_some_and(|info| info.path_id == Some(path_id.0))) {
+                                Some(id) => id,
+                                None => continue,
+                            }
+                    };
+                    payloads.push(Payload::with_received(
                         rr,
                         None,
                         received,
-                        ingress_id,
+                        effective_id,
                         RouteStatus::Withdrawn,
-                    )
-                }));
+                    ));
+                }
                 let update = payloads.into();
                 gate.update_data(update).await;
             }
@@ -860,16 +876,12 @@ fn mk_flowspec_route(
     }
 }
 
-/// Return a TABLE_DUMP_V2 stream containing only the records understood by
-/// Routecore's legacy `rib_entries()` iterator.
+/// Return a TABLE_DUMP_V2 stream containing the RIB record families decoded
+/// by routecore's `rib_entries()` iterator.
 ///
 /// A real MRT file can mix the peer-index table and IPv4/IPv6 unicast RIBs
-/// with multicast, generic, ADD-PATH, or unrelated MRT record types. The
-/// fallible `records()` iterator safely frames all of them, while
-/// `rib_entries()` still assumes every record after the peer-index table is a
-/// plain unicast RIB and panics for other valid subtypes. Filtering by framed
-/// record boundaries lets Rotonda retain the supported routes and skip the
-/// rest without panicking.
+/// with unrelated MRT record types. Filtering by framed record boundaries
+/// retains all supported unicast, multicast, generic, and ADD-PATH RIBs.
 fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
     let file = MrtFile::new(raw);
     let mut offset = 0usize;
@@ -890,10 +902,17 @@ fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
             MessageSubType::TableDumpv2SubType(
                 TableDumpv2SubType::PeerIndexTable
                     | TableDumpv2SubType::RibIpv4Unicast
+                    | TableDumpv2SubType::RibIpv4Multicast
                     | TableDumpv2SubType::RibIpv6Unicast
+                    | TableDumpv2SubType::RibIpv6Multicast
                     // FlowSpec arrives as RIB_GENERIC; the iterator skips
                     // generic families it cannot frame.
                     | TableDumpv2SubType::RibGeneric
+                    | TableDumpv2SubType::RibIpv4UnicastAddpath
+                    | TableDumpv2SubType::RibIpv4MulticastAddpath
+                    | TableDumpv2SubType::RibIpv6UnicastAddpath
+                    | TableDumpv2SubType::RibIpv6MulticastAddpath
+                    | TableDumpv2SubType::RibGenericAddpath
             )
         ) {
             filtered.extend_from_slice(&raw[offset..end]);
