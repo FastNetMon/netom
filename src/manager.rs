@@ -380,15 +380,22 @@ impl Manager {
                 as Weak<dyn metrics::Source>,
         );
         // Global counter for routes dropped because their NLRI type has no
-        // RotondaRoute representation (unsupported AFI/SAFI, or ADD-PATH
-        // encodings of supported ones). The source's strong reference is held
-        // for the process lifetime by a LazyLock inside roto_runtime::types,
-        // so this Weak never dangles.
+        // RotondaRoute representation (unsupported AFI/SAFI, or FlowSpec
+        // ADD-PATH encodings — ADD-PATH unicast/multicast are stored). The
+        // source's strong reference is held for the process lifetime by a
+        // LazyLock inside roto_runtime::types, so this Weak never dangles.
         metrics.register(
             "unsupported_nlri".into(),
             Arc::downgrade(
                 &crate::roto_runtime::types::unsupported_nlri_metrics(),
             ) as Weak<dyn metrics::Source>,
+        );
+        // Register-population gauges (incl. the ADD-PATH path-child count).
+        // `ingresses` lives for the manager's lifetime, so the Weak stays
+        // valid while metrics are being collected.
+        metrics.register(
+            "ingress_register".into(),
+            Arc::downgrade(&ingresses) as Weak<dyn metrics::Source>,
         );
         // Global FlowSpec ingest counters and stored-rule gauges; same
         // LazyLock-owned lifetime pattern as unsupported_nlri above.

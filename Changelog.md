@@ -27,6 +27,22 @@ Released yyyy-mm-dd.
 
 ### New
 
+* ADD-PATH (RFC 7911) support. Routes from ADD-PATH sessions (BMP-monitored
+  and direct BGP) are no longer dropped: each `(session, path_id)` is stored
+  under its own path-child ingress (`bgpPath` in the `/ingresses` output,
+  with `pathId` and `parentIngress`), so multiple paths for one prefix from
+  one peer coexist in the RIB. `bmp-tcp-out` restreams them with full path
+  fidelity — the synthesized Peer Up advertises the ADD-PATH capability for
+  the session's negotiated v4/v6 unicast families and the re-encoded NLRI
+  carry the path id, in the initial dump and live. Path-children disconnect,
+  withdraw, and garbage-collect together with their session. FlowSpec
+  ADD-PATH NLRI are still dropped (counted in
+  `netom_unsupported_nlri_dropped_total`); MRT ADD-PATH subtypes (RFC 8050)
+  remain unsupported. New metrics:
+  `netom_bmp_state_num_addpath_path_children_minted`,
+  `netom_bmp_state_num_addpath_unknown_path_id_withdrawals`, and
+  register-population gauges including
+  `netom_ingress_register_addpath_path_children`.
 
 ### Bug fixes
 

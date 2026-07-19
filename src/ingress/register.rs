@@ -41,6 +41,8 @@ pub struct RegisterMemSummary {
     pub non_network: usize,
     pub state_unset: usize,
     pub bgp_via_bmp: usize,
+    /// ADD-PATH path-child entries (`IngressType::BgpPath`).
+    pub bgp_path: usize,
 }
 
 #[derive(serde::Serialize)]
@@ -298,6 +300,9 @@ impl Register {
             }
             if info.ingress_type == Some(IngressType::BgpViaBmp) {
                 s.bgp_via_bmp += 1;
+            }
+            if info.ingress_type == Some(IngressType::BgpPath) {
+                s.bgp_path += 1;
             }
         }
         s
@@ -802,6 +807,52 @@ where
         seq.serialize_element(name)?;
     }
     seq.end()
+}
+
+impl crate::metrics::Source for Register {
+    /// Register-population gauges, one per lifecycle/type bucket that
+    /// matters operationally: total entries, connected/disconnected split
+    /// (a runaway disconnected count means GC is not keeping up), and the
+    /// ADD-PATH path-child population (each holds RIB records under its
+    /// own mui, so this scales route memory).
+    fn append(
+        &self,
+        unit_name: &str,
+        target: &mut crate::metrics::Target,
+    ) {
+        use crate::metrics::{Metric, MetricType, MetricUnit};
+
+        const TOTAL: Metric = Metric::new(
+            "ingress_register_entries",
+            "the number of entries in the global ingress register",
+            MetricType::Gauge,
+            MetricUnit::Total,
+        );
+        const CONNECTED: Metric = Metric::new(
+            "ingress_register_connected",
+            "ingress register entries in the Connected state",
+            MetricType::Gauge,
+            MetricUnit::Total,
+        );
+        const DISCONNECTED: Metric = Metric::new(
+            "ingress_register_disconnected",
+            "ingress register entries in the Disconnected state (kept for mui reuse until GC reclaims them)",
+            MetricType::Gauge,
+            MetricUnit::Total,
+        );
+        const BGP_PATH: Metric = Metric::new(
+            "ingress_register_addpath_path_children",
+            "ADD-PATH (RFC 7911) path-child ingresses currently in the register",
+            MetricType::Gauge,
+            MetricUnit::Total,
+        );
+
+        let s = self.memory_summary();
+        target.append_simple(&TOTAL, Some(unit_name), s.total);
+        target.append_simple(&CONNECTED, Some(unit_name), s.connected);
+        target.append_simple(&DISCONNECTED, Some(unit_name), s.disconnected);
+        target.append_simple(&BGP_PATH, Some(unit_name), s.bgp_path);
+    }
 }
 
 /// Serialize ADD-PATH capability value bytes (per family: AFI u16 BE, SAFI

@@ -304,13 +304,14 @@ impl Rib {
         let reg = self.ingress_register.memory_summary();
         info!(
             "memstat: ingress total={} connected={} disconnected={} \
-             non_network={} unset={} (BgpViaBmp {})",
+             non_network={} unset={} (BgpViaBmp {}, BgpPath {})",
             reg.total,
             reg.connected,
             reg.disconnected,
             reg.non_network,
             reg.state_unset,
             reg.bgp_via_bmp,
+            reg.bgp_path,
         );
 
         // Optional Active/Withdrawn split of the per-(prefix, mui) route
