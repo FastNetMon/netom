@@ -911,6 +911,9 @@ impl Processor {
             if let Some(asn) = session_info.remote_asn {
                 info = info.with_remote_asn(asn);
             }
+            if let Some(bgp_id) = session_info.bgp_id {
+                info = info.with_bgp_id(bgp_id);
+            }
         }
         self.ingresses.update_info(child_id, info);
         self.path_children.insert(path_id, child_id);

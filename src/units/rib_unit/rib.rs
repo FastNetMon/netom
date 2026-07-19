@@ -801,15 +801,19 @@ impl Rib {
         pamap: &RotondaPaMap,
         ingress_id: IngressId,
     ) -> (FlowSpecOriginator, Option<Asn>) {
+        // ADD-PATH path-child muis are display-only entries without a
+        // bgp_id of their own; resolve to the parent session so every
+        // path of one peer yields the same identity.
+        let session_id = self.ingress_register.session_for(ingress_id);
         let (attr_id, path_neighbor) =
             self.flowspec_validation_attrs(pamap);
         let (peer_id, remote_asn) = self
             .ingress_register
-            .bgp_id_and_remote_asn(ingress_id);
+            .bgp_id_and_remote_asn(session_id);
         let originator = attr_id
             .or(peer_id)
             .map(FlowSpecOriginator::BgpId)
-            .unwrap_or(FlowSpecOriginator::Ingress(ingress_id));
+            .unwrap_or(FlowSpecOriginator::Ingress(session_id));
         (originator, path_neighbor.or(remote_asn))
     }
 

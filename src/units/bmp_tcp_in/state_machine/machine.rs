@@ -2059,7 +2059,8 @@ impl PeerAware for PeerStates {
                 .with_path_id(path_id.0)
                 .with_state(ingress::register::IngressState::Connected)
                 .with_remote_addr(pph.address())
-                .with_remote_asn(pph.asn()),
+                .with_remote_asn(pph.asn())
+                .with_bgp_id(pph.bgp_id()),
         );
         peer_state.path_children.insert(path_id, child_id);
         Some((child_id, minted))

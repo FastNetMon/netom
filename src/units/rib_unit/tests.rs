@@ -398,6 +398,84 @@ async fn ingests_mrtgen_flowspec_rules() {
     }
 }
 
+/// RFC 8955 §6 validation must treat routes stored under ADD-PATH
+/// path-child muis (`IngressType::BgpPath`) as coming from the same peer as
+/// their parent session: the child register entries carry no bgp_id of
+/// their own, so without resolving children to their session a flowspec
+/// rule under a child mui and its covering unicast route under the session
+/// mui compare as different originators and the rule is falsely Invalid.
+#[tokio::test(flavor = "multi_thread")]
+async fn flowspec_validation_spans_addpath_child_muis() {
+    use super::flowspec::FlowSpecValidity;
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::RotondaRoute;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let session = register.register();
+    register.update_info(
+        session,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bmp)
+            .with_remote_addr(IpAddr::from_str("10.0.0.1").unwrap())
+            .with_remote_asn(Asn::from_u32(64500))
+            .with_bgp_id([192, 0, 2, 1]),
+    );
+    // A path child the way the mint sites created them before bgp_id was
+    // added there: display fields only.
+    let child = register.register();
+    register.update_info(
+        child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(1u32)
+            .with_remote_addr(IpAddr::from_str("10.0.0.1").unwrap())
+            .with_remote_asn(Asn::from_u32(64500)),
+    );
+
+    // Covering unicast route under the SESSION mui.
+    let ann =
+        Announcements::from_str("e [64500] 10.0.0.1 none 192.0.2.0/24")
+            .unwrap();
+    let bgp_update_bytes = mk_bgp_update(&Prefixes::default(), &ann, &[]);
+    let update_msg = UpdateMessage::from_octets(
+        bgp_update_bytes,
+        &SessionConfig::modern(),
+    )
+    .unwrap();
+    let (unicast, _) =
+        explode_announcements(&update_msg).unwrap().pop().unwrap();
+    let pamap = match &unicast {
+        RotondaRoute::Ipv4Unicast(_, pamap) => pamap.clone(),
+        other => panic!("unexpected route {other:?}"),
+    };
+    rib.insert(&unicast, RouteStatus::Active, 1, session, true, false)
+        .unwrap();
+
+    // FlowSpec rule "dst 192.0.2.0/24" under the CHILD mui, carrying the
+    // same path attributes (notably: no ORIGINATOR_ID, so identity falls
+    // back to the register's bgp_id).
+    let raw_nlri = [0x01u8, 24, 192, 0, 2];
+    let nlri = super::flowspec::parse_raw_nlri(&raw_nlri, true).unwrap();
+    let rr = RotondaRoute::Ipv4FlowSpec(nlri.into(), pamap);
+    rib.insert(&rr, RouteStatus::Active, 2, child, true, false)
+        .unwrap();
+
+    let rows = rib
+        .query_flowspec(true, None, false, false, None, None)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].rule.validity,
+        FlowSpecValidity::Valid,
+        "flowspec rule under a path-child mui must validate against the \
+         session's unicast route"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn ingests_compressed_mrtgen_files() {
     for extension in ["gz", "bz2"] {

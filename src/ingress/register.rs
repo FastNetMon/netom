@@ -391,6 +391,24 @@ impl Register {
             .unwrap_or((None, None))
     }
 
+    /// Resolve an ADD-PATH path-child mui (`IngressType::BgpPath`) to its
+    /// parent session's ingress id; any other id is returned unchanged.
+    ///
+    /// All paths of one ADD-PATH session belong to the same peer, but the
+    /// child entries carry only display fields — anything comparing peer
+    /// identity across muis (RFC 8955 §6 flowspec validation) must resolve
+    /// children to their session first or two paths of one peer look like
+    /// two different peers.
+    pub fn session_for(&self, id: IngressId) -> IngressId {
+        self.info
+            .read()
+            .unwrap()
+            .get(&id)
+            .filter(|info| info.ingress_type == Some(IngressType::BgpPath))
+            .and_then(|info| info.parent_ingress)
+            .unwrap_or(id)
+    }
+
     /// Retrieve the information for the given [`IngressId`]
     pub fn get_tuple(&self, id: IngressId) -> Option<OwnedIdAndInfo> {
         self.info
@@ -1121,6 +1139,20 @@ mod tests {
             res.find_existing_path_child_and_claim(other_session, 8),
             None
         );
+    }
+
+    #[test]
+    fn session_for_resolves_path_children_only() {
+        let res = Register::new();
+        let session = res.register();
+        let child = mk_path_child(&res, session, 7, IngressState::Connected);
+
+        // A BgpPath child resolves to its parent session.
+        assert_eq!(res.session_for(child), session);
+        // A session resolves to itself.
+        assert_eq!(res.session_for(session), session);
+        // An unknown id resolves to itself.
+        assert_eq!(res.session_for(9999), 9999);
     }
 
     #[test]
