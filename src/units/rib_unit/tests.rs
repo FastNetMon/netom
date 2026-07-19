@@ -150,14 +150,20 @@ async fn ingest_mrtgen_routes_json(
     use mrtgen::{generate_from_routes, routes_from_json};
     use std::io::Write;
 
+    // Every call gets a distinct file: the tests share one process, and
+    // e.g. the TableDumpV2 and BGP4MP tests over the same corpus run in
+    // parallel — any name derived from (pid, corpus, extension) alone
+    // collides and one test deletes the file under the other.
+    static TMP_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
     let routes = routes_from_json(routes_json).unwrap();
     let corpus =
         generate_from_routes(&routes, format, 1_700_000_000).unwrap();
     let path = std::env::temp_dir().join(format!(
-        "netom-mrtgen-e2e-{}-{:x}.{}",
+        "netom-mrtgen-e2e-{}-{}.{}",
         std::process::id(),
-        // distinct corpora must not collide on the same pid
-        routes_json.len(),
+        TMP_SEQ.fetch_add(1, SeqCst),
         extension
     ));
     match extension {

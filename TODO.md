@@ -139,10 +139,12 @@ consumers). Remaining work:
       multicast paths are emitted with path ids inside the unicast family).
       A proper MP_REACH SAFI-2 encoder would remove the collapse; document
       or fix.
-- [ ] Flaky `ingests_mrtgen_*` tests under full parallel `cargo test --lib`
-      runs (temp-file race; fails ~1 in 2–3 full-suite runs, passes in
-      isolation). Verified pre-existing on the pre-ADD-PATH tree — not a
-      regression, but it muddies CI signal and should be fixed.
+- [x] Flaky `ingests_mrtgen_*` tests (fixed 2026-07-19): the temp-file name
+      was derived from (pid, corpus length, extension), so the TableDumpV2
+      and BGP4MP tests over the same corpus collided on one path in the
+      shared test process and raced create/read/delete. A process-global
+      sequence number in the name makes every call's file distinct; six
+      consecutive full-suite runs pass where ~1 in 2–3 failed before.
 
 ## 9. Operational completeness
 
