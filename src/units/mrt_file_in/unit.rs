@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::{Future, IntoFuture};
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -359,8 +359,9 @@ impl MrtInRunner {
             }
 
             let rib_entries = rib_file.rib_entries()?;
+            let mut path_ingresses = HashMap::new();
             for entry in rib_entries {
-                let (afisafi, peer_id, _peer_entry, nlri, raw_attr) = entry?;
+                let (afisafi, peer_id, peer_entry, nlri, path_id, raw_attr) = entry?;
                 let rr = match (afisafi, nlri) {
                     (AfiSafiType::Ipv4Unicast, RibEntryNlri::Prefix(prefix)) => {
                         RotondaRoute::Ipv4Unicast(
@@ -371,6 +372,19 @@ impl MrtInRunner {
                     (AfiSafiType::Ipv6Unicast, RibEntryNlri::Prefix(prefix)) => {
                         let raw_attr = normalize_mrt_mp_reach(raw_attr, 2, 1, &prefix);
                         RotondaRoute::Ipv6Unicast(
+                            prefix.try_into().map_err(MrtError::other)?,
+                            RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
+                        )
+                    }
+                    (AfiSafiType::Ipv4Multicast, RibEntryNlri::Prefix(prefix)) => {
+                        RotondaRoute::Ipv4Multicast(
+                            prefix.try_into().map_err(MrtError::other)?,
+                            RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
+                        )
+                    }
+                    (AfiSafiType::Ipv6Multicast, RibEntryNlri::Prefix(prefix)) => {
+                        let raw_attr = normalize_mrt_mp_reach(raw_attr, 2, 2, &prefix);
+                        RotondaRoute::Ipv6Multicast(
                             prefix.try_into().map_err(MrtError::other)?,
                             RotondaPaMap::new(routecore::bgp::path_attributes::OwnedPathAttributes::new(PduParseInfo::modern(), raw_attr))
                         )
@@ -395,7 +409,25 @@ impl MrtInRunner {
                         continue
                     }
                 };
-                let ingress_id = ingress_map[usize::from(peer_id)];
+                let peer_ingress_id = ingress_map[usize::from(peer_id)];
+                let ingress_id = if let Some(path_id) = path_id {
+                    *path_ingresses.entry((peer_id, path_id)).or_insert_with(|| {
+                        let id = ingresses.register();
+                        ingresses.update_info(
+                            id,
+                            IngressInfo::new()
+                                .with_parent_ingress(peer_ingress_id)
+                                .with_remote_addr(peer_entry.addr)
+                                .with_remote_asn(peer_entry.asn)
+                                .with_filename(filename.clone())
+                                .with_ingress_type(IngressType::Mrt)
+                                .with_path_id(path_id),
+                        );
+                        id
+                    })
+                } else {
+                    peer_ingress_id
+                };
                 let update = Update::Single(Payload::new(
                     rr,
                     None,
