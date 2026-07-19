@@ -494,17 +494,16 @@ const UNSUPPORTED_NLRI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Process-global accounting for NLRI dropped because their [`NlriType`] has no
 /// [`RotondaRoute`] representation: genuinely unsupported families (MPLS-VPN,
-/// EVPN, RouteTarget, ...) and the ADD-PATH encodings of families whose plain
-/// form we store but whose ADD-PATH form we don't (`Ipv4FlowSpecAddpath`,
-/// `Ipv6FlowSpecAddpath`). ADD-PATH unicast/multicast NLRI are *not* counted
-/// here — [`convert_nlri`] strips their path id into a per-path child ingress
-/// and stores them. Such NLRI parse fine in routecore but are dropped before
-/// any RIB in the [`convert_nlri`] chokepoint.
+/// EVPN, RouteTarget, ...). ADD-PATH NLRI of the stored families
+/// (unicast/multicast/flowspec) are *not* counted here — [`convert_nlri`]
+/// strips their path id into a per-path child ingress and stores them. Such
+/// NLRI parse fine in routecore but are dropped before any RIB in the
+/// [`convert_nlri`] chokepoint.
 ///
-/// Keyed on [`NlriType`] rather than `AfiSafiType` precisely so the ADD-PATH
-/// variants stay distinct: `AfiSafiType` collapses e.g. `Ipv4FlowSpecAddpath`
-/// down to `Ipv4FlowSpec`, which would mislabel dropped ADD-PATH routes as the
-/// plain family that *is* stored.
+/// Keyed on [`NlriType`] rather than `AfiSafiType` so the ADD-PATH variants
+/// of the remaining unsupported families stay distinct: `AfiSafiType` would
+/// collapse e.g. `Ipv4MplsUnicastAddpath` down to `Ipv4MplsUnicast` and hide
+/// which encoding actually arrived.
 ///
 /// This serves two purposes:
 ///
@@ -591,9 +590,7 @@ impl UnsupportedNlriMetrics {
         if first_sight {
             warn!(
                 "Dropping route(s) with unsupported NLRI type {nlri_type:?}: \
-                 no RotondaRoute representation, not stored in any RIB (note: \
-                 FlowSpec ADD-PATH encodings land here too; unicast/multicast \
-                 ADD-PATH routes are stored under per-path child ingresses). \
+                 no RotondaRoute representation, not stored in any RIB. \
                  Further drops are summarized at most once per {}s and counted \
                  in netom_unsupported_nlri_dropped_total.",
                 UNSUPPORTED_NLRI_SUMMARY_INTERVAL.as_secs(),
@@ -675,13 +672,12 @@ fn note_unsupported_nlri(nlri_type: NlriType) {
 /// Convert one parsed NLRI plus its path attributes into the stored
 /// [`RotondaRoute`] form.
 ///
-/// ADD-PATH (RFC 7911) unicast/multicast variants convert to the same
-/// plain variants — the store key has no path-id representation — and the
-/// stripped [`PathId`] is returned alongside so the caller can resolve a
+/// ADD-PATH (RFC 7911) unicast/multicast/flowspec variants convert to the
+/// same plain variants — the store key has no path-id representation — and
+/// the stripped [`PathId`] is returned alongside so the caller can resolve a
 /// per-(session, path_id) child ingress to store the route under. Plain
 /// variants return `None`. NLRI types with no `RotondaRoute` representation
-/// (MPLS/VPN/EVPN/VPLS/RouteTarget, and FlowSpec-ADD-PATH) are counted and
-/// dropped as before.
+/// (MPLS/VPN/EVPN/VPLS/RouteTarget) are counted and dropped as before.
 pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
     nlri: Nlri<O>,
     pamap: RotondaPaMap,
@@ -714,7 +710,8 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
             (RotondaRoute::Ipv6Multicast(n.into(), pamap), Some(pid))
         }
         // Copy the flowspec NLRI out of the (possibly borrowed) octets
-        // into owned Bytes; identity is the raw NLRI bytes.
+        // into owned Bytes; identity is the raw NLRI bytes. The ADD-PATH
+        // variants strip their path id like unicast/multicast above.
         Nlri::Ipv4FlowSpec(n) => (
             RotondaRoute::Ipv4FlowSpec(
                 n.nlri().to_owned_octets::<bytes::Bytes>().into(),
@@ -729,6 +726,26 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
             ),
             None,
         ),
+        Nlri::Ipv4FlowSpecAddpath(n) => {
+            let pid = n.path_id();
+            (
+                RotondaRoute::Ipv4FlowSpec(
+                    n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                    pamap,
+                ),
+                Some(pid),
+            )
+        }
+        Nlri::Ipv6FlowSpecAddpath(n) => {
+            let pid = n.path_id();
+            (
+                RotondaRoute::Ipv6FlowSpec(
+                    n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                    pamap,
+                ),
+                Some(pid),
+            )
+        }
 
         Nlri::Ipv4MplsUnicast(..)
         | Nlri::Ipv4MplsUnicastAddpath(..)
@@ -736,12 +753,10 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
         | Nlri::Ipv4MplsVpnUnicastAddpath(..)
         | Nlri::Ipv4RouteTarget(..)
         | Nlri::Ipv4RouteTargetAddpath(..)
-        | Nlri::Ipv4FlowSpecAddpath(..)
         | Nlri::Ipv6MplsUnicast(..)
         | Nlri::Ipv6MplsUnicastAddpath(..)
         | Nlri::Ipv6MplsVpnUnicast(..)
         | Nlri::Ipv6MplsVpnUnicastAddpath(..)
-        | Nlri::Ipv6FlowSpecAddpath(..)
         | Nlri::L2VpnVpls(..)
         | Nlri::L2VpnVplsAddpath(..)
         | Nlri::L2VpnEvpn(..)
@@ -835,12 +850,11 @@ mod tests {
     fn unsupported_nlri_counter_increments_and_renders() {
         let m = UnsupportedNlriMetrics::default();
         let now = Instant::now();
-        // Two FlowSpec ADD-PATH drops (still unsupported — unlike ADD-PATH
-        // unicast/multicast, which convert_nlri now stores; AfiSafiType
-        // would collapse these to plain Ipv4FlowSpec) and one FlowSpec drop.
-        m.note(NlriType::Ipv4FlowSpecAddpath, now);
-        m.note(NlriType::Ipv4FlowSpecAddpath, now);
-        m.note(NlriType::Ipv6FlowSpec, now);
+        // Two ADD-PATH MPLS drops (unsupported — AfiSafiType would collapse
+        // these to plain Ipv4MplsUnicast) and one plain MPLS drop.
+        m.note(NlriType::Ipv4MplsUnicastAddpath, now);
+        m.note(NlriType::Ipv4MplsUnicastAddpath, now);
+        m.note(NlriType::Ipv6MplsUnicast, now);
 
         let mut target =
             metrics::Target::new(metrics::OutputFormat::Prometheus);
@@ -850,16 +864,16 @@ mod tests {
         assert!(
             out.contains(
                 "netom_unsupported_nlri_dropped_total\
-                 {nlri_type=\"Ipv4FlowSpecAddpath\"} 2"
+                 {nlri_type=\"Ipv4MplsUnicastAddpath\"} 2"
             ),
-            "missing FlowSpec ADD-PATH total in:\n{out}"
+            "missing MPLS ADD-PATH total in:\n{out}"
         );
         assert!(
             out.contains(
                 "netom_unsupported_nlri_dropped_total\
-                 {nlri_type=\"Ipv6FlowSpec\"} 1"
+                 {nlri_type=\"Ipv6MplsUnicast\"} 1"
             ),
-            "missing FlowSpec total in:\n{out}"
+            "missing MPLS total in:\n{out}"
         );
     }
 

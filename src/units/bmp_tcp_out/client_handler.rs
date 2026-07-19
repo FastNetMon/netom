@@ -386,7 +386,35 @@ pub async fn perform_initial_dump(
             rib_for_walk.stream_flowspec_records(|pr| {
                 let key_prefix = pr.prefix;
                 for record in pr.meta {
-                    let ingress_id = record.multi_uniq_id;
+                    let record_mui = record.multi_uniq_id;
+                    // Same mui -> (emit ingress, path id) resolution as the
+                    // unicast walk above: rules under ADD-PATH path-children
+                    // emit under their parent session's per-peer header with
+                    // the path id re-attached to the NLRI.
+                    let (ingress_id, path_id) = match emit_targets
+                        .get(&record_mui)
+                    {
+                        Some(t) => *t,
+                        None => {
+                            let t = match ingress_register_for_walk
+                                .get(record_mui)
+                            {
+                                Some(info)
+                                    if info.ingress_type
+                                        == Some(IngressType::BgpPath) =>
+                                {
+                                    (
+                                        info.parent_ingress
+                                            .unwrap_or(record_mui),
+                                        info.path_id,
+                                    )
+                                }
+                                _ => (record_mui, None),
+                            };
+                            emit_targets.insert(record_mui, t);
+                            t
+                        }
+                    };
                     let mut sink = |msg: Vec<u8>, n: usize| {
                         msg_tx.blocking_send((msg, n)).is_ok()
                     };
@@ -434,6 +462,7 @@ pub async fn perform_initial_dump(
                             .or_insert(0) += 1;
                         if !aggregator.add_flowspec(
                             ingress_id,
+                            path_id,
                             is_v4,
                             &rule.nlri,
                             &rule.pamap,

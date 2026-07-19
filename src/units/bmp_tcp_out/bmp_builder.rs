@@ -193,20 +193,19 @@ impl PeerInfo {
 
         // ADD-PATH families to advertise downstream: the session's
         // negotiated set, filtered to the families whose NLRI bmp-out
-        // re-encodes with path ids. Multicast is folded into unicast NLRI
-        // by the re-encoder (a pre-existing family collapse — see
-        // `supported_afisafis`), so its routes carry path ids inside the
-        // unicast family and no separate multicast triple is advertised.
-        // FlowSpec-ADD-PATH routes are dropped at ingest, so none will be
-        // emitted. Direction is forced to SendReceive so the two OPENs
-        // negotiate cleanly downstream.
+        // re-encodes with path ids (v4/v6 unicast and flowspec). Multicast
+        // is folded into unicast NLRI by the re-encoder (a pre-existing
+        // family collapse — see `supported_afisafis`), so its routes carry
+        // path ids inside the unicast family and no separate multicast
+        // triple is advertised. Direction is forced to SendReceive so the
+        // two OPENs negotiate cleanly downstream.
         let mut addpath_cap_value = Vec::new();
         for quad in
             info.addpath_families.as_deref().unwrap_or(&[]).chunks(4)
         {
             if let [afi_hi, afi_lo, safi, _dir] = *quad {
                 if (afi_hi, afi_lo) == (0, 1) || (afi_hi, afi_lo) == (0, 2) {
-                    if safi == 1 {
+                    if safi == 1 || safi == 133 {
                         addpath_cap_value
                             .extend_from_slice(&[afi_hi, afi_lo, safi, 3]);
                     }
@@ -774,8 +773,8 @@ pub fn build_route_monitoring(
 
 /// Build a BMP Route Monitoring message from a RotondaRoute.
 ///
-/// `path_id`: see [`build_route_monitoring`]. Ignored for FlowSpec routes
-/// (FlowSpec-ADD-PATH is dropped at ingest, so none reach this builder).
+/// `path_id`: see [`build_route_monitoring`]. For FlowSpec routes the path
+/// id is prepended to the NLRI inside MP_REACH/MP_UNREACH (RFC 7911 §3).
 pub fn build_route_monitoring_from_route(
     peer: &PeerInfo,
     route: &RotondaRoute,
@@ -814,6 +813,7 @@ pub fn build_route_monitoring_from_route(
                 nlri.nlri().raw().as_ref(),
                 pamap,
                 is_withdrawal,
+                path_id,
             );
         }
         RotondaRoute::Ipv6FlowSpec(nlri, pamap) => {
@@ -823,6 +823,7 @@ pub fn build_route_monitoring_from_route(
                 nlri.nlri().raw().as_ref(),
                 pamap,
                 is_withdrawal,
+                path_id,
             );
         }
     };
@@ -831,8 +832,12 @@ pub fn build_route_monitoring_from_route(
 }
 
 /// Append raw FlowSpec NLRI bytes with their RFC 8955 §4.1 length header:
-/// one byte for lengths < 240, else two bytes `0xFnnn` (max 4095).
-fn append_flowspec_nlri(buf: &mut Vec<u8>, raw: &[u8]) {
+/// one byte for lengths < 240, else two bytes `0xFnnn` (max 4095). An
+/// RFC 7911 path id, when present, precedes the length header.
+fn append_flowspec_nlri(buf: &mut Vec<u8>, raw: &[u8], path_id: Option<u32>) {
+    if let Some(pid) = path_id {
+        buf.extend_from_slice(&pid.to_be_bytes());
+    }
     let len = raw.len().min(4095);
     if len >= 240 {
         buf.extend_from_slice(&(0xf000u16 | len as u16).to_be_bytes());
@@ -842,27 +847,32 @@ fn append_flowspec_nlri(buf: &mut Vec<u8>, raw: &[u8]) {
     buf.extend_from_slice(&raw[..len]);
 }
 
-/// Wire length of a FlowSpec NLRI (length header + raw bytes).
-fn flowspec_nlri_encoded_len(raw: &[u8]) -> usize {
-    raw.len() + if raw.len() >= 240 { 2 } else { 1 }
+/// Wire length of a FlowSpec NLRI (optional path id + length header + raw
+/// bytes).
+fn flowspec_nlri_encoded_len(raw: &[u8], has_path_id: bool) -> usize {
+    let pid_len = if has_path_id { 4 } else { 0 };
+    pid_len + raw.len() + if raw.len() >= 240 { 2 } else { 1 }
 }
 
 /// Build the BGP UPDATE for one FlowSpec rule: the original path attributes
 /// minus MP_REACH/MP_UNREACH, plus a synthesized MP_REACH_NLRI (announce;
 /// SAFI 133, zero-length next hop per RFC 8955) or MP_UNREACH_NLRI
-/// (withdraw) carrying the raw NLRI verbatim.
+/// (withdraw) carrying the raw NLRI verbatim, prefixed with the RFC 7911
+/// path id when the rule came from an ADD-PATH session.
 fn build_flowspec_bgp_update(
     is_v4: bool,
     nlri_raw: &[u8],
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
+    path_id: Option<u32>,
 ) -> Option<Vec<u8>> {
     let afi: u16 = if is_v4 { 1 } else { 2 };
     const SAFI_FLOWSPEC: u8 = 133;
 
+    let nlri_len = flowspec_nlri_encoded_len(nlri_raw, path_id.is_some());
     let mp_attr = if is_withdrawal {
         // MP_UNREACH_NLRI: AFI(2) + SAFI(1) + NLRI
-        let value_len = 3 + flowspec_nlri_encoded_len(nlri_raw);
+        let value_len = 3 + nlri_len;
         let mut buf = Vec::with_capacity(4 + value_len);
         if value_len > 255 {
             buf.push(0x90);
@@ -875,11 +885,11 @@ fn build_flowspec_bgp_update(
         }
         buf.extend_from_slice(&afi.to_be_bytes());
         buf.push(SAFI_FLOWSPEC);
-        append_flowspec_nlri(&mut buf, nlri_raw);
+        append_flowspec_nlri(&mut buf, nlri_raw, path_id);
         buf
     } else {
         // MP_REACH_NLRI: AFI(2) + SAFI(1) + NHLEN(1)=0 + Reserved(1) + NLRI
-        let value_len = 5 + flowspec_nlri_encoded_len(nlri_raw);
+        let value_len = 5 + nlri_len;
         let mut buf = Vec::with_capacity(4 + value_len);
         if value_len > 255 {
             buf.push(0x90);
@@ -894,7 +904,7 @@ fn build_flowspec_bgp_update(
         buf.push(SAFI_FLOWSPEC);
         buf.push(0); // next hop length 0 — flowspec carries no next hop
         buf.push(0); // reserved
-        append_flowspec_nlri(&mut buf, nlri_raw);
+        append_flowspec_nlri(&mut buf, nlri_raw, path_id);
         buf
     };
 
@@ -937,9 +947,15 @@ fn build_flowspec_route_monitoring(
     nlri_raw: &[u8],
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
+    path_id: Option<u32>,
 ) -> Option<Vec<u8>> {
-    let bgp_update =
-        build_flowspec_bgp_update(is_v4, nlri_raw, pamap, is_withdrawal)?;
+    let bgp_update = build_flowspec_bgp_update(
+        is_v4,
+        nlri_raw,
+        pamap,
+        is_withdrawal,
+        path_id,
+    )?;
     let total_len =
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
     let mut buf = Vec::with_capacity(total_len);
@@ -1161,9 +1177,12 @@ impl AggGroup {
 struct FsAggGroup {
     raw: Arc<[u8]>,
     is_v4: bool,
-    /// Raw NLRI bytes per rule (without length headers).
-    nlris: Vec<Vec<u8>>,
-    /// Running encoded NLRI length (with length headers).
+    /// Per rule: RFC 7911 path id (for rules stored under an ADD-PATH
+    /// path-child ingress) and raw NLRI bytes (without length headers).
+    /// The group key separates ADD-PATH from plain rules, so within one
+    /// group either every path id is `Some` or every one is `None`.
+    nlris: Vec<(Option<u32>, Vec<u8>)>,
+    /// Running encoded NLRI length (with path ids and length headers).
     nlri_total: usize,
     /// Encoded BGP UPDATE length with zero NLRI.
     base_len: usize,
@@ -1201,13 +1220,14 @@ impl FsAggGroup {
             + self
                 .nlris
                 .iter()
-                .map(|n| AGG_MEM_PER_PREFIX + n.len())
+                .map(|(_, n)| AGG_MEM_PER_PREFIX + n.len())
                 .sum::<usize>()
     }
 
-    fn push(&mut self, nlri_raw: Vec<u8>) {
-        self.nlri_total += flowspec_nlri_encoded_len(&nlri_raw);
-        self.nlris.push(nlri_raw);
+    fn push(&mut self, path_id: Option<u32>, nlri_raw: Vec<u8>) {
+        self.nlri_total +=
+            flowspec_nlri_encoded_len(&nlri_raw, path_id.is_some());
+        self.nlris.push((path_id, nlri_raw));
     }
 
     fn reset_nlris(&mut self) {
@@ -1228,8 +1248,8 @@ impl FsAggGroup {
         let afi: u16 = if self.is_v4 { 1 } else { 2 };
 
         let mut nlri = Vec::with_capacity(self.nlri_total);
-        for raw in &self.nlris {
-            append_flowspec_nlri(&mut nlri, raw);
+        for (pid, raw) in &self.nlris {
+            append_flowspec_nlri(&mut nlri, raw, *pid);
         }
 
         // Single MP_REACH_NLRI (always extended-length, like the unicast
@@ -1291,8 +1311,9 @@ pub struct RouteAggregator {
     groups: HashMap<(IngressId, bool, bool, u64), AggGroup>,
     // FlowSpec groups live in their own map so flowspec and unicast NLRI
     // structurally cannot share an UPDATE; they draw on the same byte
-    // budget as the unicast groups.
-    fs_groups: HashMap<(IngressId, bool, u64), FsAggGroup>,
+    // budget as the unicast groups. Same key shape as `groups` — the
+    // third component keeps ADD-PATH and plain rules apart.
+    fs_groups: HashMap<(IngressId, bool, bool, u64), FsAggGroup>,
     peer_info: HashMap<IngressId, PeerInfo>,
     buffered_bytes: usize,
     max_bytes: usize,
@@ -1434,10 +1455,13 @@ impl RouteAggregator {
 
     /// FlowSpec twin of [`add`](Self::add): accumulate one stored rule
     /// (raw NLRI bytes) into the flowspec groups. Same peer contract,
-    /// size-limit handling and shared byte budget.
+    /// size-limit handling, shared byte budget and ADD-PATH group
+    /// separation; `path_id` is the rule's RFC 7911 path id when it was
+    /// stored under an ADD-PATH path-child ingress.
     pub fn add_flowspec(
         &mut self,
         ingress_id: IngressId,
+        path_id: Option<u32>,
         is_v4: bool,
         nlri_raw: &[u8],
         pamap: &RotondaPaMap,
@@ -1450,8 +1474,9 @@ impl RouteAggregator {
         let peer = &peer;
         let raw = pamap.as_ref();
         let blob = raw.get(2..).unwrap_or(&[]);
-        let key = (ingress_id, is_v4, hash_pa_blob(blob));
-        let nlri_len = flowspec_nlri_encoded_len(nlri_raw);
+        let key =
+            (ingress_id, is_v4, path_id.is_some(), hash_pa_blob(blob));
+        let nlri_len = flowspec_nlri_encoded_len(nlri_raw, path_id.is_some());
 
         let mut group = match self.fs_groups.remove(&key) {
             Some(g) if g.blob() == blob => {
@@ -1486,7 +1511,7 @@ impl RouteAggregator {
             // Attribute set alone overflows the limit: emit single (the
             // builder drops the truly oversized case with a warning).
             if let Some(msg) = build_flowspec_route_monitoring(
-                peer, is_v4, nlri_raw, pamap, false,
+                peer, is_v4, nlri_raw, pamap, false, path_id,
             ) {
                 if !sink(msg, 1) {
                     return false;
@@ -1495,7 +1520,7 @@ impl RouteAggregator {
             return true;
         }
 
-        group.push(nlri_raw.to_vec());
+        group.push(path_id, nlri_raw.to_vec());
         self.buffered_bytes += group.cost();
         self.fs_groups.insert(key, group);
 
@@ -1548,7 +1573,7 @@ impl RouteAggregator {
         // Still over target after draining unicast groups (or flowspec
         // dominates the buffer): evict flowspec groups, fullest-first.
         if self.buffered_bytes > target {
-            let mut fs_keys: Vec<(IngressId, bool, u64)> =
+            let mut fs_keys: Vec<(IngressId, bool, bool, u64)> =
                 self.fs_groups.keys().copied().collect();
             fs_keys.sort_unstable_by_key(|k| {
                 std::cmp::Reverse(
@@ -1594,7 +1619,7 @@ impl RouteAggregator {
                 }
             }
         }
-        let fs_groups: Vec<((IngressId, bool, u64), FsAggGroup)> =
+        let fs_groups: Vec<((IngressId, bool, bool, u64), FsAggGroup)> =
             self.fs_groups.drain().collect();
         for (key, group) in fs_groups {
             if let Some(peer) = self.peer_info.get(&key.0) {
@@ -2695,9 +2720,9 @@ mod tests {
     }
 
     /// `from_ingress_info` keeps only the ADD-PATH families bmp-out actually
-    /// re-encodes with path ids (v4/v6 unicast), forcing SendReceive:
-    /// multicast is folded into unicast NLRI and FlowSpec-ADD-PATH is
-    /// dropped at ingest, so advertising them would be wrong.
+    /// re-encodes with path ids (v4/v6 unicast and flowspec), forcing
+    /// SendReceive: multicast is folded into unicast NLRI, so advertising
+    /// it would be wrong.
     #[test]
     fn from_ingress_info_filters_addpath_families() {
         let info = IngressInfo::new()
@@ -2707,10 +2732,15 @@ mod tests {
                 0, 1, 1, 1, // v4 unicast, Receive -> kept, forced to 3
                 0, 1, 2, 3, // v4 multicast -> dropped (family collapse)
                 0, 2, 1, 3, // v6 unicast -> kept
-                0, 1, 133, 3, // v4 flowspec -> dropped
+                0, 1, 133, 3, // v4 flowspec -> kept
+                0, 2, 133, 1, // v6 flowspec, Receive -> kept, forced to 3
+                0, 1, 128, 3, // v4 MPLS-VPN -> dropped (not re-encoded)
             ]);
         let peer = PeerInfo::from_ingress_info(&info);
-        assert_eq!(peer.addpath_cap_value, vec![0, 1, 1, 3, 0, 2, 1, 3]);
+        assert_eq!(
+            peer.addpath_cap_value,
+            vec![0, 1, 1, 3, 0, 2, 1, 3, 0, 1, 133, 3, 0, 2, 133, 3]
+        );
 
         // No addpath_families at all -> empty value, no cap 69 emitted.
         let info = IngressInfo::new()
@@ -3208,7 +3238,7 @@ mod tests {
         let peer = agg_test_peer();
         let pamap = fs_pamap();
         let msg = build_flowspec_route_monitoring(
-            &peer, true, FS_NLRI_A, &pamap, false,
+            &peer, true, FS_NLRI_A, &pamap, false, None,
         )
         .unwrap();
 
@@ -3246,7 +3276,7 @@ mod tests {
         let peer = agg_test_peer();
         let pamap = fs_pamap();
         let msg = build_flowspec_route_monitoring(
-            &peer, true, FS_NLRI_A, &pamap, true,
+            &peer, true, FS_NLRI_A, &pamap, true, None,
         )
         .unwrap();
         let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
@@ -3279,6 +3309,7 @@ mod tests {
             FS_NLRI_A,
             &pamap,
             false,
+            None,
         )
         .is_none());
     }
@@ -3394,8 +3425,10 @@ mod tests {
             messages.push((msg, n));
             true
         };
-        assert!(agg.add_flowspec(1, true, FS_NLRI_A, &pamap, &mut sink));
-        assert!(agg.add_flowspec(1, true, FS_NLRI_B, &pamap, &mut sink));
+        assert!(agg
+            .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg
+            .add_flowspec(1, None, true, FS_NLRI_B, &pamap, &mut sink));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 1);
         let (msg, n) = &messages[0];
@@ -3439,7 +3472,8 @@ mod tests {
             Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 0)), 24)
                 .unwrap();
         assert!(agg.add(1, None, prefix, &pamap, &mut sink));
-        assert!(agg.add_flowspec(1, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg
+            .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 2);
     }
@@ -3451,13 +3485,13 @@ mod tests {
         // under test, and append_flowspec_nlri does not re-validate.
         let long_nlri = vec![0xaau8; 300];
         let mut buf = Vec::new();
-        append_flowspec_nlri(&mut buf, &long_nlri);
+        append_flowspec_nlri(&mut buf, &long_nlri, None);
         assert_eq!(buf.len(), 2 + 300);
         assert_eq!(
             u16::from_be_bytes([buf[0], buf[1]]),
             0xf000 | 300u16
         );
         assert_eq!(&buf[2..], &long_nlri[..]);
-        assert_eq!(flowspec_nlri_encoded_len(&long_nlri), 302);
+        assert_eq!(flowspec_nlri_encoded_len(&long_nlri, false), 302);
     }
 }
