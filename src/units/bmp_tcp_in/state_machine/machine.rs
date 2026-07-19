@@ -1218,13 +1218,17 @@ where
                         // copy for EVERY successfully parsed message —
                         // including EoR markers and messages whose NLRI we
                         // cannot store (they carry no parsed counterpart;
-                        // forwarding them is a fidelity bonus). The only
-                        // session-level exclusion is ADD-PATH: the
-                        // synthesized Peer Up downstream strips the
-                        // ADD-PATH capability, so a consumer would misparse
-                        // raw path-id-carrying NLRI. ADD-PATH sessions emit
-                        // no raw copies at all and their storable routes
-                        // keep flowing via the rebuild path.
+                        // forwarding them is a fidelity bonus). ADD-PATH
+                        // sessions are eligible too: the synthesized Peer
+                        // Up downstream advertises cap 69 for exactly the
+                        // families this SessionConfig parses with path ids
+                        // (`addpath_families`, attached at PeerUp), so a
+                        // downstream consumer decodes the verbatim
+                        // path-id-carrying NLRI correctly. The raw copy
+                        // carries the SESSION ingress id while the parsed
+                        // payloads of the same message carry path-child
+                        // ids — bmp-out resolves children to their session
+                        // before its raw-coverage duplicate check.
                         //
                         // The per-peer header's A-flag (legacy 2-byte
                         // AS_PATH encoding) is rewritten from the
@@ -1232,11 +1236,7 @@ where
                         // after an alternate-config retry the router's own
                         // claim is known to be wrong, and downstream relies
                         // on this flag to decode the verbatim UPDATE.
-                        let raw = if peer_config
-                            .enabled_addpaths()
-                            .next()
-                            .is_none()
-                        {
+                        let raw =
                             saved_self.details.get_peer_ingress_id(&pph).map(
                                 |ingress_id| {
                                     let mut body = msg.as_ref()
@@ -1252,10 +1252,7 @@ where
                                         body: Bytes::from(body),
                                     }
                                 },
-                            )
-                        } else {
-                            None
-                        };
+                            );
 
                         saved_self.mk_routing_update_result_with_raw(
                             Update::Bulk(Box::new(payloads)),
@@ -1688,14 +1685,14 @@ const UNDECODED_CAP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 /// Capability codes that bmp-out can neither synthesize nor pass through,
 /// because netom re-encodes route-monitoring UPDATEs in a way that is
 /// incompatible with them (see `bmp_tcp_out::bmp_builder`):
-///   5  = ExtendedNextHop  — next hops are rebuilt, not replayed
-///   69 = AddPath          — NLRI is re-encoded without path-ids
+///   5 = ExtendedNextHop — next hops are rebuilt, not replayed
 /// Everything else a peer advertises is either synthesized to match our
-/// output encoding or forwarded verbatim, so only these two are genuinely
-/// lost. We log them (rate-limited) since they can reduce route fidelity for
+/// output encoding (ADD-PATH, code 69, is synthesized from the negotiated
+/// `addpath_families`) or forwarded verbatim, so only this one is genuinely
+/// lost. We log it (rate-limited) since it can reduce route fidelity for
 /// the affected peer downstream. Keep in sync with
 /// `bmp_tcp_out::bmp_builder`'s passthrough exclude set.
-const DROPPED_CAP_CODES: &[u8] = &[5, 69];
+const DROPPED_CAP_CODES: &[u8] = &[5];
 
 /// What to log for a received-but-not-forwarded BGP capability. Mirrors
 /// [`UnknownPeerLog`]: the first sighting of each distinct capability code is
@@ -1886,9 +1883,9 @@ impl PeerAware for PeerStates {
 
         // Surface (rate-limited) capabilities a peer advertised that bmp-out
         // cannot carry because we re-encode routes incompatibly with them
-        // (AddPath / ExtendedNextHop). Other capabilities are synthesized or
-        // passed through, so this is a focused route-fidelity warning rather
-        // than a flood.
+        // (ExtendedNextHop). Other capabilities are synthesized or passed
+        // through, so this is a focused route-fidelity warning rather than
+        // a flood.
         let now = Instant::now();
         let caps = Capabilities(&remote_capabilities);
         for cap in caps.iter() {

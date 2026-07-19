@@ -361,6 +361,14 @@ struct BmpTcpOutRunner {
     /// ingress is seen, cleared on session teardown (`Withdraw` /
     /// `WithdrawBulk`). See the coverage notes in `direct_update`.
     raw_covered: dashmap::DashSet<IngressId>,
+    /// Memo of payload ingress id -> owning session id for the raw-coverage
+    /// duplicate check: raw copies carry the SESSION id while the parsed
+    /// payloads of an ADD-PATH message carry path-child ids
+    /// (`IngressType::BgpPath`), so a child must resolve to its parent
+    /// before the `raw_covered` test — otherwise fastpath clients receive
+    /// every ADD-PATH route twice. Identity for non-children; entries are
+    /// dropped on session teardown alongside the coverage marks.
+    raw_session_of: dashmap::DashMap<IngressId, IngressId>,
 }
 
 #[async_trait]
@@ -380,9 +388,9 @@ impl DirectUpdate for BmpTcpOutRunner {
         // payloads of the same message and does so for every message of
         // an eligible session, so marking on first sight loses nothing
         // and never duplicates. Peers without raw copies — non-BMP
-        // sources (BGP, MRT), ADD-PATH sessions, or a bmp-tcp-in with
-        // `forward_raw_updates` off — are never marked and keep using
-        // the rebuild path, whatever this unit's `fastpath` setting.
+        // sources (BGP, MRT), or a bmp-tcp-in with `forward_raw_updates`
+        // off — are never marked and keep using the rebuild path,
+        // whatever this unit's `fastpath` setting.
         match &update {
             // Verbatim Route Monitoring copies are only consumed in
             // fastpath mode; otherwise the parsed payload path covers
@@ -396,10 +404,14 @@ impl DirectUpdate for BmpTcpOutRunner {
             // Parsed payloads of a raw-covered peer duplicate the raw
             // copies; skip them. An Update carries routes of exactly one
             // peer (units re-emit per source message), so the first
-            // payload decides.
+            // payload decides. Payloads of an ADD-PATH message carry
+            // path-child ids while the raw copy was marked under the
+            // session id, so resolve child -> session first.
             Update::Single(payload) => {
                 if self.fastpath
-                    && self.raw_covered.contains(&payload.ingress_id)
+                    && self.raw_covered.contains(
+                        &self.raw_session_of(payload.ingress_id),
+                    )
                 {
                     return;
                 }
@@ -407,7 +419,9 @@ impl DirectUpdate for BmpTcpOutRunner {
             Update::Bulk(payloads) => {
                 if self.fastpath {
                     if let Some(payload) = payloads.first() {
-                        if self.raw_covered.contains(&payload.ingress_id) {
+                        if self.raw_covered.contains(
+                            &self.raw_session_of(payload.ingress_id),
+                        ) {
                             return;
                         }
                     }
@@ -416,13 +430,17 @@ impl DirectUpdate for BmpTcpOutRunner {
             // Session teardown: drop coverage marks. Ingress ids are
             // reused across reconnects (register Layer D), and the next
             // session may not forward raw copies — a stale mark would
-            // then silently discard that peer's parsed payloads.
+            // then silently discard that peer's parsed payloads. The
+            // session memo goes too (bounded memory; a reused id simply
+            // re-resolves).
             Update::Withdraw(ingress_id, _) => {
                 self.raw_covered.remove(ingress_id);
+                self.raw_session_of.remove(ingress_id);
             }
             Update::WithdrawBulk(entries) => {
                 for (ingress_id, _) in entries.iter() {
                     self.raw_covered.remove(ingress_id);
+                    self.raw_session_of.remove(ingress_id);
                 }
             }
             _ => {}
@@ -550,7 +568,31 @@ impl BmpTcpOutRunner {
             status_reporter,
             clients: Arc::new(RwLock::new(HashMap::new())),
             raw_covered: dashmap::DashSet::new(),
+            raw_session_of: dashmap::DashMap::new(),
         }
+    }
+
+    /// Resolve a payload's ingress id to its owning session id for the
+    /// raw-coverage duplicate check: ADD-PATH path-children map to their
+    /// parent, everything else to itself. Memoized (the relation is
+    /// immutable per id); ids not (yet) in the register resolve to
+    /// themselves un-memoized so they re-resolve once registered.
+    fn raw_session_of(&self, ingress_id: IngressId) -> IngressId {
+        if let Some(session) = self.raw_session_of.get(&ingress_id) {
+            return *session;
+        }
+        use crate::ingress::IngressType;
+        let session = match self.ingress_register.get(ingress_id) {
+            Some(info)
+                if info.ingress_type == Some(IngressType::BgpPath) =>
+            {
+                info.parent_ingress.unwrap_or(ingress_id)
+            }
+            Some(_) => ingress_id,
+            None => return ingress_id,
+        };
+        self.raw_session_of.insert(ingress_id, session);
+        session
     }
 
     async fn run(

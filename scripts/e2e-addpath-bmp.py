@@ -16,6 +16,7 @@ import urllib.request
 HTTP_ADDR = os.environ["HTTP_ADDR"]
 BMP_IN_ADDR = os.environ["BMP_IN_ADDR"]
 BMP_OUT_ADDR = os.environ["BMP_OUT_ADDR"]
+BMP_OUT_REBUILD_ADDR = os.environ["BMP_OUT_REBUILD_ADDR"]
 
 PEER_IP = "10.99.0.1"
 PEER_AS = 65001
@@ -209,9 +210,15 @@ def collect_announced_pids(reader, want, context):
 
 
 def main():
-    # Consumer B1 connects first: it observes the (empty) initial dump and
-    # then the whole session live.
-    b1 = BmpReader(connect(BMP_OUT_ADDR))
+    # Two consumers connect first and observe the whole session live:
+    # b_fast on the fastpath unit (verbatim raw forwarding — its duplicate
+    # suppression must map path-child payloads back to the session, or
+    # every route arrives twice), b_reb on the rebuild unit (NLRI
+    # re-encoded with path ids by bmp-out itself).
+    consumers = [
+        ("fastpath", BmpReader(connect(BMP_OUT_ADDR))),
+        ("rebuild", BmpReader(connect(BMP_OUT_REBUILD_ADDR))),
+    ]
 
     feeder = connect(BMP_IN_ADDR)
     feeder.sendall(initiation())
@@ -219,28 +226,40 @@ def main():
     feeder.sendall(announce(1, "192.0.2.1"))
     feeder.sendall(announce(2, "192.0.2.2"))
 
-    # B1: Peer Up advertising cap 69 in both OPENs, then both paths with
-    # their ids (the live path emits one Route Monitoring per payload).
-    expect_peer_up_with_cap69(b1, "live")
-    pids = collect_announced_pids(b1, want=2, context="live")
-    assert sorted(pids) == [1, 2], f"FAIL (live): pids {pids}"
-    print("live restream: cap 69 advertised, paths 1+2 with path ids: OK")
-
-    # Withdraw path 1; B1 must see a withdrawal carrying path id 1.
-    feeder.sendall(withdraw(1))
-    while True:
-        msg_type, msg = b1.read_msg()
-        if msg_type != 0:
-            continue
-        wd, _nlri = parse_route_monitoring(msg)
-        if not wd:
-            continue
-        entries = addpath_entries(wd)
-        assert entries == [(1, PREFIX_WIRE)], (
-            f"FAIL (live withdraw): {entries}"
+    # Each consumer: Peer Up advertising cap 69 in both OPENs, then both
+    # paths with their ids (one Route Monitoring per payload/raw copy).
+    for context, reader in consumers:
+        expect_peer_up_with_cap69(reader, context)
+        pids = collect_announced_pids(reader, want=2, context=context)
+        assert sorted(pids) == [1, 2], f"FAIL ({context}): pids {pids}"
+        print(
+            f"{context} live restream: cap 69 advertised, paths 1+2 "
+            "with path ids: OK"
         )
-        break
-    print("live withdraw of path 1 carries its path id: OK")
+
+    # Withdraw path 1; both consumers must see a withdrawal carrying path
+    # id 1 — and NO duplicate announcements of pids 1/2 in between (the
+    # fastpath duplicate-suppression check would otherwise deliver every
+    # parsed payload on top of its raw copy).
+    feeder.sendall(withdraw(1))
+    for context, reader in consumers:
+        while True:
+            msg_type, msg = reader.read_msg()
+            if msg_type != 0:
+                continue
+            wd, nlri = parse_route_monitoring(msg)
+            if not wd:
+                assert not nlri, (
+                    f"FAIL ({context}): duplicate announcement "
+                    f"{addpath_entries(nlri)} after the initial paths"
+                )
+                continue
+            entries = addpath_entries(wd)
+            assert entries == [(1, PREFIX_WIRE)], (
+                f"FAIL ({context} withdraw): {entries}"
+            )
+            break
+        print(f"{context} withdraw of path 1 carries its path id: OK")
 
     # Consumer B2 connects now: its initial dump must advertise cap 69 and
     # replay ONLY the still-active path 2, with its path id.
@@ -268,26 +287,29 @@ def main():
     assert len(parents) == 1 and None not in parents, children
     print("/ingresses shows two bgpPath children with pathId + parent: OK")
 
-    # Peer down: exactly ONE downstream Peer Down (the session; the path
-    # children never became downstream peers).
+    # Peer down: exactly ONE downstream Peer Down per consumer (the
+    # session; the path children never became downstream peers).
     feeder.sendall(peer_down())
-    peer_downs = 0
-    end = time.monotonic() + 3.0
-    while time.monotonic() < end:
-        b1.sock.settimeout(max(0.1, end - time.monotonic()))
-        try:
-            msg_type, _msg = b1.read_msg()
-        except (socket.timeout, TimeoutError):
-            break
-        if msg_type == 2:
-            peer_downs += 1
-    assert peer_downs == 1, (
-        f"FAIL: expected exactly 1 Peer Down, saw {peer_downs}"
-    )
-    print("peer down emitted exactly once for the session: OK")
+    for context, reader in consumers:
+        peer_downs = 0
+        end = time.monotonic() + 3.0
+        while time.monotonic() < end:
+            reader.sock.settimeout(max(0.1, end - time.monotonic()))
+            try:
+                msg_type, _msg = reader.read_msg()
+            except (socket.timeout, TimeoutError):
+                break
+            if msg_type == 2:
+                peer_downs += 1
+        assert peer_downs == 1, (
+            f"FAIL ({context}): expected exactly 1 Peer Down, "
+            f"saw {peer_downs}"
+        )
+        print(f"{context}: peer down emitted exactly once: OK")
 
     feeder.close()
-    b1.sock.close()
+    for _, reader in consumers:
+        reader.sock.close()
     b2.sock.close()
 
 

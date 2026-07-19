@@ -350,10 +350,14 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
     else {
         panic!("expected RoutingUpdate");
     };
-    // ...and no raw fastpath copy: ADD-PATH sessions are excluded from
-    // verbatim restreaming (the synthesized downstream PeerUp does not
-    // yet advertise cap 69).
-    assert!(raw.is_none(), "ADD-PATH session must not emit raw copies");
+    // ...and a raw fastpath copy attributed to the SESSION id (bmp-out
+    // advertises cap 69 downstream, so verbatim path-id NLRI parse fine;
+    // its duplicate check maps the payloads' child ids back to this id).
+    let Some(Update::RouteMonitoringRaw { ingress_id: raw_id, .. }) = raw
+    else {
+        panic!("ADD-PATH session must emit raw fastpath copies");
+    };
+    assert_eq!(raw_id, session_id);
     let Update::Bulk(payloads) = update else {
         panic!("expected Update::Bulk");
     };
