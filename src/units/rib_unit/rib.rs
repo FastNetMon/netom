@@ -1483,14 +1483,24 @@ impl Rib {
         added
     }
 
-    /// Layer C garbage-collection sweep. Reclaims two kinds of idle BMP
-    /// register entries that have stayed `Disconnected` across at least one
-    /// full sweep interval — i.e. were torn down and did not reconnect:
+    /// Layer C garbage-collection sweep. Reclaims idle register entries that
+    /// have stayed `Disconnected` across at least one full sweep interval —
+    /// i.e. were torn down and did not reconnect:
     ///
     /// * BMP-monitored peers (`IngressType::BgpViaBmp`): their mark-withdrawn
     ///   RIB records are physically reclaimed (`remove_for_ingresses`).
     ///   Without this, the peers that Layer D keeps as Disconnected (for mui
     ///   reuse) would hold their records forever if they never came back.
+    ///   Deferred while any ADD-PATH path-child still references the peer as
+    ///   `parent_ingress` — reclaiming the parent first would leave children
+    ///   whose claim identity dangles; children go first, the session follows
+    ///   one sweep later.
+    ///
+    /// * ADD-PATH path-children (`IngressType::BgpPath`, of both BMP-monitored
+    ///   and direct BGP sessions): they hold RIB records under their own mui,
+    ///   so they take the same record-reclaiming path as `BgpViaBmp` peers.
+    ///   This also reaps children whose path id simply stopped being announced
+    ///   across a session flap (the rebind claim leaves them Disconnected).
     ///
     /// * BMP routers (`IngressType::Bmp`, the parent entries) that have **no
     ///   children left in the register**. These hold no RIB records of their
@@ -1539,6 +1549,17 @@ impl Rib {
             match i.ingress_type {
                 Some(ingress::IngressType::BgpViaBmp) => {
                     disconnected.insert(*id);
+                    // Defer while ADD-PATH path-children still reference
+                    // this session as parent: they are reclaimed this
+                    // sweep, the session becomes eligible on the next one.
+                    if !parents_in_use.contains(id) {
+                        peers.insert(*id);
+                    }
+                }
+                Some(ingress::IngressType::BgpPath) => {
+                    // Path-children carry RIB records under their own mui,
+                    // so they flow through the record-reclaiming path.
+                    disconnected.insert(*id);
                     peers.insert(*id);
                 }
                 Some(ingress::IngressType::Bmp) => {
@@ -1577,8 +1598,8 @@ impl Rib {
             if !reclaimed.is_empty() {
                 self.remove_for_ingresses(&reclaimed);
                 info!(
-                    "rib GC: reclaimed {} BMP peer(s) idle (Disconnected) \
-                     for >= one GC interval",
+                    "rib GC: reclaimed {} peer/path ingress(es) idle \
+                     (Disconnected) for >= one GC interval",
                     reclaimed.len()
                 );
             }

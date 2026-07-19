@@ -1585,6 +1585,82 @@ async fn gc_reclaims_idle_bmp_routers() {
     assert!(reg.get(30).is_some(), "Connected router reclaimed");
 }
 
+/// ADD-PATH path-children (`BgpPath`) flow through the record-carrying GC
+/// path, and a Disconnected session is deferred while children still
+/// reference it as parent: children reclaim first, the session follows one
+/// sweep later. A Disconnected child of a *live* session (its path id
+/// stopped being announced across a flap) is reclaimed without touching the
+/// session.
+#[tokio::test]
+async fn gc_reclaims_path_children_then_session() {
+    use crate::ingress::register::IngressState;
+    use crate::ingress::{IngressInfo, IngressType};
+    use std::collections::HashSet;
+
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+
+    let mk = |typ: IngressType,
+              state: IngressState,
+              parent: Option<u32>| {
+        let mut info = IngressInfo::new()
+            .with_ingress_type(typ)
+            .with_state(state);
+        if let Some(parent) = parent {
+            info = info.with_parent_ingress(parent);
+        }
+        info
+    };
+
+    // Session 40 went down with its two path-children.
+    reg.update_info(
+        40,
+        mk(IngressType::BgpViaBmp, IngressState::Disconnected, None),
+    );
+    for child in [41u32, 42] {
+        reg.update_info(
+            child,
+            mk(IngressType::BgpPath, IngressState::Disconnected, Some(40)),
+        );
+    }
+    // Session 50 is alive; its child 51 stopped being announced.
+    reg.update_info(
+        50,
+        mk(IngressType::BgpViaBmp, IngressState::Connected, None),
+    );
+    reg.update_info(
+        51,
+        mk(IngressType::BgpPath, IngressState::Disconnected, Some(50)),
+    );
+
+    // First sweep: idle-interval guard, nothing reclaimed.
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    for id in [40, 41, 42, 50, 51] {
+        assert!(reg.get(id).is_some(), "id {id} reclaimed too early");
+    }
+
+    // Second sweep: all children reclaim; session 40 is deferred because
+    // 41/42 still referenced it in the snapshot; live session 50 untouched.
+    let prev = rib.gc_disconnected_bmp_peers(prev);
+    assert!(reg.get(41).is_none(), "path child 41 not reclaimed");
+    assert!(reg.get(42).is_none(), "path child 42 not reclaimed");
+    assert!(reg.get(51).is_none(), "idle child of live session kept");
+    assert!(
+        reg.get(40).is_some(),
+        "session reclaimed while children still referenced it"
+    );
+    assert!(reg.get(50).is_some(), "Connected session reclaimed");
+
+    // Third sweep: 40 is childless now and reclaims.
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(
+        reg.get(40).is_none(),
+        "session not reclaimed after its children were gone"
+    );
+    assert!(reg.get(50).is_some(), "Connected session reclaimed");
+}
+
 /// A router that reconnects (flips back to Connected) between sweeps must be
 /// protected by the `remove_if_disconnected` guard even though it was a
 /// reclaim candidate from the previous sweep.
