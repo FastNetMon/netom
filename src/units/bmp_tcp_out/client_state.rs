@@ -61,6 +61,15 @@ pub struct ClientState {
     /// `known_peers` in `remove_known_peer` (Peer Down / reappear).
     peer_info_cache: RwLock<HashMap<IngressId, Arc<PeerInfo>>>,
 
+    /// Per-client memo of "emit as": maps any ingress id seen in an Update
+    /// to the id its messages are emitted under plus the RFC 7911 path id
+    /// to encode, i.e. an ADD-PATH path-child (`IngressType::BgpPath`) maps
+    /// to `(parent session id, Some(path_id))`, anything else to
+    /// `(itself, None)`. Both the child→parent relation and an entry's type
+    /// are immutable for the life of an ingress id, so entries never need
+    /// invalidation.
+    emit_target_cache: RwLock<HashMap<IngressId, (IngressId, Option<u32>)>>,
+
     /// When this client connected.
     pub connected_at: DateTime<Utc>,
 
@@ -114,6 +123,7 @@ impl ClientState {
             dump_buffer: tokio::sync::Mutex::new(Vec::new()),
             known_peers: RwLock::new(HashSet::new()),
             peer_info_cache: RwLock::new(HashMap::new()),
+            emit_target_cache: RwLock::new(HashMap::new()),
             connected_at: Utc::now(),
             messages_sent: AtomicUsize::new(0),
             bytes_sent: AtomicUsize::new(0),
@@ -314,6 +324,26 @@ impl ClientState {
             .write()
             .await
             .insert(ingress_id, peer_info);
+    }
+
+    /// Return the memoized emit target for an ingress id, if resolved before.
+    pub async fn cached_emit_target(
+        &self,
+        ingress_id: IngressId,
+    ) -> Option<(IngressId, Option<u32>)> {
+        self.emit_target_cache.read().await.get(&ingress_id).copied()
+    }
+
+    /// Memoize the emit target for an ingress id.
+    pub async fn cache_emit_target(
+        &self,
+        ingress_id: IngressId,
+        target: (IngressId, Option<u32>),
+    ) {
+        self.emit_target_cache
+            .write()
+            .await
+            .insert(ingress_id, target);
     }
 }
 

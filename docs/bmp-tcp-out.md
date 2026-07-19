@@ -225,9 +225,16 @@ What it does *not* change:
   stored in the RIB.
 - **Non-BMP sources** (BGP, MRT) have no raw copies; their routes keep
   being rebuilt.
-- **ADD-PATH sessions** emit no raw copies (the synthesized Peer Up strips
-  the ADD-PATH capability, so a consumer would misparse path-id-carrying
-  NLRI); their storable routes keep flowing via the rebuild path.
+- **ADD-PATH sessions** emit no raw copies yet; their routes flow via the
+  rebuild path with full path fidelity. Each `(session, path_id)` is stored
+  under its own path-child ingress (`IngressType::BgpPath`); on emit the
+  child resolves back to its parent session's per-peer header, the
+  synthesized Peer Up advertises the ADD-PATH capability (code 69,
+  SendReceive, in both OPENs) for the session's negotiated v4/v6 unicast
+  families, and the re-encoded NLRI carry the 4-byte path id — in the
+  initial dump and live. (Multicast ADD-PATH routes are emitted with path
+  ids inside the unicast NLRI space — the encoder's pre-existing family
+  collapse; FlowSpec-ADD-PATH routes are dropped at ingest.)
 
 Caveat: fastpath is a **pre-filter mirror**. Routes dropped or rewritten by
 roto filters in upstream units are restreamed in their original form. Set

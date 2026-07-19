@@ -96,6 +96,14 @@ pub struct PeerInfo {
     /// (`capabilities_as_vec`). Capabilities not synthesized or excluded are
     /// passed through verbatim into the received OPEN (see `OpenCapExtras`).
     pub peer_capabilities: Vec<u8>,
+    /// ADD-PATH capability (69) value bytes to advertise in BOTH synthesized
+    /// OPENs (per family: AFI u16 BE + SAFI u8 + direction u8), so downstream
+    /// computes ADD-PATH as negotiated and parses our re-encoded NLRI with
+    /// path ids. Derived from the upstream session's negotiated families
+    /// (`IngressInfo::addpath_families`), filtered to the families bmp-out
+    /// actually re-encodes with path ids (v4/v6 unicast), direction forced to
+    /// SendReceive. Empty = no ADD-PATH downstream.
+    pub addpath_cap_value: Vec<u8>,
     pub admin_label: Option<String>,
 }
 
@@ -106,9 +114,13 @@ pub struct PeerInfo {
 ///       match our actual output encoding
 ///   9=BgpRole 73=FQDN 75=SoftwareVersion                — synthesized from
 ///       parsed `OpenCapExtras` fields
-///   5=ExtendedNextHop 69=AddPath                         — would change how
-///       downstream parses our re-encoded UPDATEs (next hops rebuilt, NLRI
-///       has no path-ids). Kept in sync with `machine::DROPPED_CAP_CODES`.
+///   69=AddPath — synthesized from the session's *negotiated* families
+///       (`PeerInfo::addpath_cap_value`), never passed through: the upstream
+///       OPEN blob is one side's offer, not the negotiated set, and it may
+///       list families/directions that don't match our re-encoding.
+///   5=ExtendedNextHop — would change how downstream parses our re-encoded
+///       UPDATEs (next hops are rebuilt). Kept in sync with
+///       `machine::DROPPED_CAP_CODES`.
 const PASSTHROUGH_EXCLUDE: &[u8] = &[1, 5, 9, 64, 65, 69, 73, 75];
 
 /// Best-effort optional capabilities recovered from an upstream session and
@@ -179,6 +191,29 @@ impl PeerInfo {
             }
         }
 
+        // ADD-PATH families to advertise downstream: the session's
+        // negotiated set, filtered to the families whose NLRI bmp-out
+        // re-encodes with path ids. Multicast is folded into unicast NLRI
+        // by the re-encoder (a pre-existing family collapse — see
+        // `supported_afisafis`), so its routes carry path ids inside the
+        // unicast family and no separate multicast triple is advertised.
+        // FlowSpec-ADD-PATH routes are dropped at ingest, so none will be
+        // emitted. Direction is forced to SendReceive so the two OPENs
+        // negotiate cleanly downstream.
+        let mut addpath_cap_value = Vec::new();
+        for quad in
+            info.addpath_families.as_deref().unwrap_or(&[]).chunks(4)
+        {
+            if let [afi_hi, afi_lo, safi, _dir] = *quad {
+                if (afi_hi, afi_lo) == (0, 1) || (afi_hi, afi_lo) == (0, 2) {
+                    if safi == 1 {
+                        addpath_cap_value
+                            .extend_from_slice(&[afi_hi, afi_lo, safi, 3]);
+                    }
+                }
+            }
+        }
+
         PeerInfo {
             peer_type,
             peer_flags,
@@ -196,6 +231,7 @@ impl PeerInfo {
                 (dt.timestamp() as u32, dt.timestamp_subsec_micros())
             }),
             peer_capabilities,
+            addpath_cap_value,
             admin_label: None,
         }
     }
@@ -404,6 +440,7 @@ fn build_bgp_open(
     extras: &OpenCapExtras,
     afisafis: &[AfiSafiType],
     advertise_graceful_restart: bool,
+    addpath_cap_value: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut caps = Vec::new();
 
@@ -425,6 +462,16 @@ fn build_bgp_open(
         caps.extend_from_slice(&afi.to_be_bytes());
         caps.push(0);
         caps.push(safi);
+    }
+
+    // Capability: ADD-PATH (code 69, RFC 7911). Emitted in BOTH OPENs (the
+    // caller passes the same value for sent and received) so downstream
+    // computes the intersection as negotiated and parses our re-encoded
+    // NLRI with path ids for these families.
+    if let Some(value) = addpath_cap_value.filter(|v| !v.is_empty()) {
+        caps.push(69);
+        caps.push(value.len() as u8);
+        caps.extend_from_slice(value);
     }
 
     if advertise_graceful_restart {
@@ -617,12 +664,14 @@ pub fn build_peer_up(
         role: peer.peer_role,
         passthrough: &peer.peer_capabilities,
     };
+    let addpath_cap = Some(peer.addpath_cap_value.as_slice());
     let sent_open = build_bgp_open(
         peer.peer_asn,
         [0u8; 4],
         &OpenCapExtras::default(),
         &afisafis,
         advertise_graceful_restart,
+        addpath_cap,
     );
     let received_open = build_bgp_open(
         peer.peer_asn,
@@ -630,6 +679,7 @@ pub fn build_peer_up(
         &received_extras,
         &afisafis,
         advertise_graceful_restart,
+        addpath_cap,
     );
     let max_tlv_len = u16::MAX as usize;
 
@@ -699,13 +749,18 @@ pub fn build_peer_down(peer: &PeerInfo) -> Vec<u8> {
 }
 
 /// Build a BMP Route Monitoring message wrapping a BGP UPDATE.
+///
+/// `path_id` is the RFC 7911 path identifier to prepend to the NLRI, for
+/// routes stored under an ADD-PATH path-child ingress. The caller must be
+/// per-(peer, family) consistent with the advertised ADD-PATH capability.
 pub fn build_route_monitoring(
     peer: &PeerInfo,
     prefix: Prefix,
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
+    path_id: Option<u32>,
 ) -> Option<Vec<u8>> {
-    let bgp_update = build_bgp_update(prefix, pamap, is_withdrawal)?;
+    let bgp_update = build_bgp_update(prefix, pamap, is_withdrawal, path_id)?;
     let total_len =
         BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + bgp_update.len();
 
@@ -718,10 +773,14 @@ pub fn build_route_monitoring(
 }
 
 /// Build a BMP Route Monitoring message from a RotondaRoute.
+///
+/// `path_id`: see [`build_route_monitoring`]. Ignored for FlowSpec routes
+/// (FlowSpec-ADD-PATH is dropped at ingest, so none reach this builder).
 pub fn build_route_monitoring_from_route(
     peer: &PeerInfo,
     route: &RotondaRoute,
     is_withdrawal: bool,
+    path_id: Option<u32>,
 ) -> Option<Vec<u8>> {
     let (prefix, pamap) = match route {
         RotondaRoute::Ipv4Unicast(nlri, pamap) => {
@@ -768,7 +827,7 @@ pub fn build_route_monitoring_from_route(
         }
     };
 
-    build_route_monitoring(peer, prefix, pamap, is_withdrawal)
+    build_route_monitoring(peer, prefix, pamap, is_withdrawal, path_id)
 }
 
 /// Append raw FlowSpec NLRI bytes with their RFC 8955 §4.1 length header:
@@ -908,14 +967,14 @@ fn hash_pa_blob(blob: &[u8]) -> u64 {
 /// fresh MP_REACH_NLRI is rebuilt around all the prefixes.
 fn build_aggregated_route_monitoring(
     peer: &PeerInfo,
-    prefixes: &[Prefix],
+    prefixes: &[(Prefix, Option<u32>)],
     pa_bytes: &[u8],
     next_hop: Option<&[u8]>,
     is_v4: bool,
 ) -> Vec<u8> {
     let mut nlri = Vec::new();
-    for p in prefixes {
-        append_prefix_nlri(&mut nlri, *p);
+    for (p, pid) in prefixes {
+        append_prefix_nlri(&mut nlri, *p, *pid);
     }
 
     let bgp_update = if is_v4 {
@@ -1002,7 +1061,10 @@ struct AggGroup {
     /// (`raw[2..]`) and to recompute the filtered attributes at emit.
     raw: Arc<[u8]>,
     is_v4: bool,
-    prefixes: Vec<Prefix>,
+    /// `(prefix, RFC 7911 path id)` pairs. The group key includes
+    /// `path_id.is_some()`, so one group never mixes plain and path-id
+    /// NLRI (invalid on the wire within one UPDATE).
+    prefixes: Vec<(Prefix, Option<u32>)>,
     /// Running encoded length of the NLRI accumulated so far.
     nlri_total: usize,
     /// Encoded BGP UPDATE length with zero prefixes (everything but NLRI).
@@ -1047,8 +1109,13 @@ impl AggGroup {
         AGG_MEM_PER_GROUP + self.prefixes.len() * AGG_MEM_PER_PREFIX
     }
 
-    fn push(&mut self, prefix: Prefix, nlri_len: usize) {
-        self.prefixes.push(prefix);
+    fn push(
+        &mut self,
+        prefix: Prefix,
+        path_id: Option<u32>,
+        nlri_len: usize,
+    ) {
+        self.prefixes.push((prefix, path_id));
         self.nlri_total += nlri_len;
     }
 
@@ -1216,7 +1283,12 @@ impl FsAggGroup {
 /// This keeps aggregation effective at a given budget instead of repeatedly
 /// dumping half-empty groups (which a flush-everything policy would do).
 pub struct RouteAggregator {
-    groups: HashMap<(IngressId, bool, u64), AggGroup>,
+    /// Key: (peer ingress, is_v4, carries-path-ids, attribute-blob hash).
+    /// The third component keeps ADD-PATH and plain NLRI in separate
+    /// groups — mixing them in one UPDATE would be unparseable (relevant
+    /// when a session has ADD-PATH for one family only, e.g. unicast but
+    /// not multicast, both encoded into the same v4/v6 NLRI space).
+    groups: HashMap<(IngressId, bool, bool, u64), AggGroup>,
     // FlowSpec groups live in their own map so flowspec and unicast NLRI
     // structurally cannot share an UPDATE; they draw on the same byte
     // budget as the unicast groups.
@@ -1276,6 +1348,7 @@ impl RouteAggregator {
     pub fn add(
         &mut self,
         ingress_id: IngressId,
+        path_id: Option<u32>,
         prefix: Prefix,
         pamap: &RotondaPaMap,
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
@@ -1292,8 +1365,8 @@ impl RouteAggregator {
         let is_v4 = prefix.is_v4();
         let raw = pamap.as_ref();
         let blob = raw.get(2..).unwrap_or(&[]);
-        let key = (ingress_id, is_v4, hash_pa_blob(blob));
-        let nlri_len = nlri_encoded_len(prefix);
+        let key = (ingress_id, is_v4, path_id.is_some(), hash_pa_blob(blob));
+        let nlri_len = nlri_encoded_len(prefix, path_id.is_some());
 
         // Pull the group out so the budget bookkeeping below borrows `self`
         // freely.
@@ -1336,7 +1409,7 @@ impl RouteAggregator {
         if group.is_empty() && group.base_len + nlri_len > MAX_BGP_UPDATE_LEN
         {
             if let Some(msg) =
-                build_route_monitoring(peer, prefix, pamap, false)
+                build_route_monitoring(peer, prefix, pamap, false, path_id)
             {
                 if !sink(msg, 1) {
                     return false;
@@ -1347,7 +1420,7 @@ impl RouteAggregator {
             return true;
         }
 
-        group.push(prefix, nlri_len);
+        group.push(prefix, path_id, nlri_len);
         self.buffered_bytes += group.cost();
         self.groups.insert(key, group);
 
@@ -1443,7 +1516,7 @@ impl RouteAggregator {
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
         // Order open groups by prefix count, descending.
-        let mut keys: Vec<(IngressId, bool, u64)> =
+        let mut keys: Vec<(IngressId, bool, bool, u64)> =
             self.groups.keys().copied().collect();
         keys.sort_unstable_by_key(|k| {
             std::cmp::Reverse(
@@ -1511,7 +1584,7 @@ impl RouteAggregator {
         // Drain groups into a temporary so `self.peer_info` can be borrowed
         // for the per-group lookup without conflicting with the drain (the
         // peer map is now an owned HashMap, not a cheap-to-clone Arc).
-        let groups: Vec<((IngressId, bool, u64), AggGroup)> =
+        let groups: Vec<((IngressId, bool, bool, u64), AggGroup)> =
             self.groups.drain().collect();
         for (key, group) in groups {
             if let Some(peer) = self.peer_info.get(&key.0) {
@@ -1638,11 +1711,12 @@ fn build_bgp_update(
     prefix: Prefix,
     pamap: &RotondaPaMap,
     is_withdrawal: bool,
+    path_id: Option<u32>,
 ) -> Option<Vec<u8>> {
     if is_withdrawal {
         // A single-prefix withdrawal is a small, fixed-shape message that
         // can never approach the 2-byte length limit.
-        return Some(build_bgp_update_withdrawal(prefix));
+        return Some(build_bgp_update_withdrawal(prefix, path_id));
     }
 
     let is_ipv4 = prefix.is_v4();
@@ -1653,7 +1727,7 @@ fn build_bgp_update(
 
     if is_ipv4 {
         // For IPv4: put prefix in NLRI field
-        let nlri_bytes = encode_prefix_nlri(prefix);
+        let nlri_bytes = encode_prefix_nlri(prefix, path_id);
         let update_body_len = 2 + 2 + pa_bytes.len() + nlri_bytes.len();
         let total_len = 19 + update_body_len;
 
@@ -1674,7 +1748,8 @@ fn build_bgp_update(
         Some(buf)
     } else {
         // For IPv6: add MP_REACH_NLRI (type 14) with the original next hop
-        let mp_reach = build_mp_reach_nlri(prefix, orig_next_hop.as_deref());
+        let mp_reach =
+            build_mp_reach_nlri(prefix, orig_next_hop.as_deref(), path_id);
         let total_pa_len = pa_bytes.len() + mp_reach.len();
 
         let update_body_len = 2 + 2 + total_pa_len;
@@ -1794,9 +1869,12 @@ fn filter_pa_from_raw(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
 }
 
 /// Build a BGP UPDATE withdrawal message.
-fn build_bgp_update_withdrawal(prefix: Prefix) -> Vec<u8> {
+fn build_bgp_update_withdrawal(
+    prefix: Prefix,
+    path_id: Option<u32>,
+) -> Vec<u8> {
     if prefix.is_v4() {
-        let nlri_bytes = encode_prefix_nlri(prefix);
+        let nlri_bytes = encode_prefix_nlri(prefix, path_id);
         let update_body_len = 2 + nlri_bytes.len() + 2;
         let total_len = 19 + update_body_len;
 
@@ -1811,7 +1889,7 @@ fn build_bgp_update_withdrawal(prefix: Prefix) -> Vec<u8> {
 
         buf
     } else {
-        let mp_unreach = build_mp_unreach_nlri(prefix);
+        let mp_unreach = build_mp_unreach_nlri(prefix, path_id);
         let update_body_len = 2 + 2 + mp_unreach.len();
         let total_len = 19 + update_body_len;
 
@@ -1828,9 +1906,20 @@ fn build_bgp_update_withdrawal(prefix: Prefix) -> Vec<u8> {
     }
 }
 
-/// Append a prefix encoded as BGP NLRI (prefix length byte + prefix bytes)
-/// to `buf`. Shared by the single- and multi-prefix encoders.
-fn append_prefix_nlri(buf: &mut Vec<u8>, prefix: Prefix) {
+/// Append a prefix encoded as BGP NLRI to `buf`: an optional 4-byte
+/// RFC 7911 path identifier, then the prefix length byte and prefix bytes.
+/// Shared by the single- and multi-prefix encoders. The caller must be
+/// consistent per (peer, family): once the synthesized PeerUp advertises
+/// ADD-PATH for a family, every NLRI for it must carry a path id.
+fn append_prefix_nlri(
+    buf: &mut Vec<u8>,
+    prefix: Prefix,
+    path_id: Option<u32>,
+) {
+    if let Some(pid) = path_id {
+        buf.extend_from_slice(&pid.to_be_bytes());
+    }
+
     let prefix_len = prefix.len();
     let num_bytes = ((prefix_len as usize) + 7) / 8;
 
@@ -1846,18 +1935,20 @@ fn append_prefix_nlri(buf: &mut Vec<u8>, prefix: Prefix) {
     }
 }
 
-/// Encode a prefix as BGP NLRI (prefix length byte + prefix bytes).
-fn encode_prefix_nlri(prefix: Prefix) -> Vec<u8> {
+/// Encode a prefix as BGP NLRI ([path id] + prefix length byte + prefix
+/// bytes).
+fn encode_prefix_nlri(prefix: Prefix, path_id: Option<u32>) -> Vec<u8> {
     let num_bytes = ((prefix.len() as usize) + 7) / 8;
-    let mut buf = Vec::with_capacity(1 + num_bytes);
-    append_prefix_nlri(&mut buf, prefix);
+    let mut buf =
+        Vec::with_capacity(1 + num_bytes + 4 * path_id.is_some() as usize);
+    append_prefix_nlri(&mut buf, prefix, path_id);
     buf
 }
 
-/// Wire length of a prefix encoded as BGP NLRI (length byte + significant
-/// prefix bytes), without allocating.
-fn nlri_encoded_len(prefix: Prefix) -> usize {
-    1 + ((prefix.len() as usize) + 7) / 8
+/// Wire length of a prefix encoded as BGP NLRI (optional 4-byte path id +
+/// length byte + significant prefix bytes), without allocating.
+fn nlri_encoded_len(prefix: Prefix, has_path_id: bool) -> usize {
+    1 + ((prefix.len() as usize) + 7) / 8 + 4 * has_path_id as usize
 }
 
 fn build_eor_ipv4(peer: &PeerInfo) -> Vec<u8> {
@@ -1912,8 +2003,12 @@ fn build_eor_mp_unreach(peer: &PeerInfo, afisafi: AfiSafiType) -> Vec<u8> {
 /// `next_hop` is the raw next hop bytes extracted from the original
 /// MP_REACH_NLRI. If not available, falls back to a zeroed next hop
 /// of the appropriate length (4 for IPv4, 16 for IPv6).
-fn build_mp_reach_nlri(prefix: Prefix, next_hop: Option<&[u8]>) -> Vec<u8> {
-    let nlri_bytes = encode_prefix_nlri(prefix);
+fn build_mp_reach_nlri(
+    prefix: Prefix,
+    next_hop: Option<&[u8]>,
+    path_id: Option<u32>,
+) -> Vec<u8> {
+    let nlri_bytes = encode_prefix_nlri(prefix, path_id);
 
     let afi: u16 = if prefix.is_v4() { 1 } else { 2 };
     let safi: u8 = 1; // Unicast
@@ -1953,8 +2048,8 @@ fn build_mp_reach_nlri(prefix: Prefix, next_hop: Option<&[u8]>) -> Vec<u8> {
 }
 
 /// Build MP_UNREACH_NLRI path attribute for IPv6 withdrawal.
-fn build_mp_unreach_nlri(prefix: Prefix) -> Vec<u8> {
-    let nlri_bytes = encode_prefix_nlri(prefix);
+fn build_mp_unreach_nlri(prefix: Prefix, path_id: Option<u32>) -> Vec<u8> {
+    let nlri_bytes = encode_prefix_nlri(prefix, path_id);
 
     let afi: u16 = if prefix.is_v4() { 1 } else { 2 };
     let safi: u8 = 1;
@@ -2020,6 +2115,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2047,6 +2143,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2089,6 +2186,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2157,6 +2255,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2177,7 +2276,7 @@ mod tests {
             Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 0)), 24)
                 .unwrap();
 
-        let bytes = encode_prefix_nlri(prefix);
+        let bytes = encode_prefix_nlri(prefix, None);
         assert_eq!(bytes[0], 24);
         assert_eq!(bytes[1..], [10, 0, 0]);
     }
@@ -2190,7 +2289,7 @@ mod tests {
         )
         .unwrap();
 
-        let bytes = encode_prefix_nlri(prefix);
+        let bytes = encode_prefix_nlri(prefix, None);
         assert_eq!(bytes[0], 32);
         assert_eq!(bytes[1..], [192, 168, 1, 1]);
     }
@@ -2212,6 +2311,7 @@ mod tests {
             &OpenCapExtras::default(),
             &[AfiSafiType::Ipv4Unicast],
             true,
+            None,
         );
         // Find GR capability (code 64) in the capabilities
         let bgp_body = &open[19..]; // skip marker(16) + length(2) + type(1)
@@ -2249,6 +2349,7 @@ mod tests {
                 AfiSafiType::Ipv6FlowSpec,
             ],
             true,
+            None,
         );
         let bgp_body = &open_v6[19..];
         let opt_params_len = bgp_body[9] as usize;
@@ -2275,6 +2376,7 @@ mod tests {
             &OpenCapExtras::default(),
             &[AfiSafiType::Ipv4Unicast, AfiSafiType::Ipv6Unicast],
             false,
+            None,
         );
         let bgp_body = &open[19..];
         let opt_params_len = bgp_body[9] as usize;
@@ -2305,6 +2407,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2345,6 +2448,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2431,6 +2535,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: Some(r#"{"sysName":"router1"}"#.to_string()),
         };
 
@@ -2477,6 +2582,7 @@ mod tests {
             peer_role: Some(3), // Customer
             session_up_time: Some((0x1234_5678, 0x0009_0a0b)),
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2548,6 +2654,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: blob,
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         };
 
@@ -2560,11 +2667,205 @@ mod tests {
             contains(&[200u8, 3, 0xAA, 0xBB, 0xCC]),
             "advisory capability was not passed through"
         );
-        // AddPath (code 69) must not be re-emitted.
+        // AddPath (code 69) must not be re-emitted via passthrough — it is
+        // only ever synthesized from `addpath_cap_value` (empty here).
         assert!(
             !contains(&[69u8, 4, 0x00, 0x01, 0x01, 0x03]),
             "AddPath capability must be excluded from the passthrough"
         );
+    }
+
+    /// A non-empty `addpath_cap_value` is synthesized as capability 69 in
+    /// BOTH embedded OPENs, so downstream computes ADD-PATH as negotiated.
+    #[test]
+    fn peer_up_advertises_addpath_in_both_opens() {
+        let mut peer = make_peer([0u8; 8]);
+        peer.addpath_cap_value = vec![0, 1, 1, 3]; // v4 unicast SendReceive
+
+        let msg = build_peer_up(&peer, true);
+        let needle = [69u8, 4, 0, 1, 1, 3];
+        let occurrences = msg
+            .windows(needle.len())
+            .filter(|w| *w == needle)
+            .count();
+        assert_eq!(
+            occurrences, 2,
+            "cap 69 must appear in both the sent and received OPEN"
+        );
+    }
+
+    /// `from_ingress_info` keeps only the ADD-PATH families bmp-out actually
+    /// re-encodes with path ids (v4/v6 unicast), forcing SendReceive:
+    /// multicast is folded into unicast NLRI and FlowSpec-ADD-PATH is
+    /// dropped at ingest, so advertising them would be wrong.
+    #[test]
+    fn from_ingress_info_filters_addpath_families() {
+        let info = IngressInfo::new()
+            .with_remote_addr("10.0.0.9".parse::<IpAddr>().unwrap())
+            .with_remote_asn(Asn::from_u32(65000))
+            .with_addpath_families(vec![
+                0, 1, 1, 1, // v4 unicast, Receive -> kept, forced to 3
+                0, 1, 2, 3, // v4 multicast -> dropped (family collapse)
+                0, 2, 1, 3, // v6 unicast -> kept
+                0, 1, 133, 3, // v4 flowspec -> dropped
+            ]);
+        let peer = PeerInfo::from_ingress_info(&info);
+        assert_eq!(peer.addpath_cap_value, vec![0, 1, 1, 3, 0, 2, 1, 3]);
+
+        // No addpath_families at all -> empty value, no cap 69 emitted.
+        let info = IngressInfo::new()
+            .with_remote_addr("10.0.0.9".parse::<IpAddr>().unwrap());
+        let peer = PeerInfo::from_ingress_info(&info);
+        assert!(peer.addpath_cap_value.is_empty());
+    }
+
+    /// Path-id-carrying NLRI must round-trip through routecore's ADD-PATH
+    /// parser: v4 announce + withdraw (conventional fields) and v6 announce
+    /// + withdraw (synthesized MP_REACH / MP_UNREACH).
+    #[test]
+    fn path_id_nlri_roundtrips_through_routecore() {
+        use bytes::Bytes;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        use routecore::bgp::nlri::afisafi::{IsPrefix, Nlri};
+
+        let peer = make_peer([0u8; 8]);
+        let mut sc = SessionConfig::modern();
+        sc.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+        sc.add_addpath_rxtx(AfiSafiType::Ipv6Unicast);
+
+        let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]); // ORIGIN=IGP
+        let v4: Prefix = "10.0.0.0/24".parse().unwrap();
+        let v6: Prefix = "2001:db8::/32".parse().unwrap();
+
+        let bgp_update = |msg: Vec<u8>| {
+            Bytes::copy_from_slice(
+                &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..],
+            )
+        };
+
+        for (prefix, pid, withdraw) in [
+            (v4, 7u32, false),
+            (v4, 7, true),
+            (v6, 9, false),
+            (v6, 9, true),
+        ] {
+            let msg = build_route_monitoring(
+                &peer,
+                prefix,
+                &pamap,
+                withdraw,
+                Some(pid),
+            )
+            .expect("message must build");
+            let upd = UpdateMessage::from_octets(bgp_update(msg), &sc)
+                .expect("re-encoded UPDATE must parse");
+            let nlri: Vec<Nlri<Bytes>> = if withdraw {
+                upd.withdrawals().unwrap().map(|n| n.unwrap()).collect()
+            } else {
+                upd.announcements().unwrap().map(|n| n.unwrap()).collect()
+            };
+            assert_eq!(nlri.len(), 1, "{prefix} withdraw={withdraw}");
+            match &nlri[0] {
+                Nlri::Ipv4UnicastAddpath(n) => {
+                    assert_eq!(n.prefix(), prefix);
+                    assert_eq!(IsPrefix::path_id(n).map(|p| p.0), Some(pid));
+                }
+                Nlri::Ipv6UnicastAddpath(n) => {
+                    assert_eq!(n.prefix(), prefix);
+                    assert_eq!(IsPrefix::path_id(n).map(|p| p.0), Some(pid));
+                }
+                other => panic!(
+                    "expected ADD-PATH NLRI for {prefix}, got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The aggregator packs multiple path ids of one prefix into one
+    /// UPDATE, and never mixes path-id and plain NLRI in one group (the
+    /// wire format would be unparseable).
+    #[test]
+    fn aggregator_separates_and_encodes_path_ids() {
+        use bytes::Bytes;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        use routecore::bgp::nlri::afisafi::Nlri;
+
+        let peer = agg_test_peer();
+        let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]);
+        let mut peer_map: HashMap<IngressId, PeerInfo> = HashMap::new();
+        peer_map.insert(7, peer.clone());
+        let mut agg = RouteAggregator::new(64 * 1024 * 1024, peer_map);
+
+        let addpath_prefix: Prefix = "10.0.0.0/24".parse().unwrap();
+        let plain_prefix: Prefix = "10.9.0.0/16".parse().unwrap();
+        let mut messages: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut sink = |m: Vec<u8>, _n: usize| {
+                messages.push(m);
+                true
+            };
+            // Two paths for one prefix plus one plain route, all sharing
+            // one (peer, family, attribute-set).
+            assert!(agg.add(7, Some(1), addpath_prefix, &pamap, &mut sink));
+            assert!(agg.add(7, Some(2), addpath_prefix, &pamap, &mut sink));
+            assert!(agg.add(7, None, plain_prefix, &pamap, &mut sink));
+            assert!(agg.flush_all(&mut sink));
+        }
+        assert_eq!(
+            messages.len(),
+            2,
+            "path-id and plain NLRI must flush as separate UPDATEs"
+        );
+
+        let mut sc_addpath = SessionConfig::modern();
+        sc_addpath.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+
+        let mut seen_addpath = false;
+        let mut seen_plain = false;
+        for msg in &messages {
+            let bgp = Bytes::copy_from_slice(
+                &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..],
+            );
+            // The ADD-PATH message parses with the addpath config into
+            // exactly the two path ids; the plain one with the modern
+            // config into the single prefix.
+            let addpath_parse = UpdateMessage::from_octets(
+                bgp.clone(),
+                &sc_addpath,
+            )
+            .ok()
+            .and_then(|upd| {
+                upd.announcements()
+                    .ok()?
+                    .collect::<Result<Vec<_>, _>>()
+                    .ok()
+            });
+            match addpath_parse.as_deref() {
+                Some(
+                    [Nlri::Ipv4UnicastAddpath(a), Nlri::Ipv4UnicastAddpath(b)],
+                ) => {
+                    let mut pids = [
+                        IsPrefix::path_id(a).map(|p| p.0),
+                        IsPrefix::path_id(b).map(|p| p.0),
+                    ];
+                    pids.sort_unstable();
+                    assert_eq!(pids, [Some(1), Some(2)]);
+                    seen_addpath = true;
+                    continue;
+                }
+                _ => {}
+            }
+            let upd = UpdateMessage::from_octets(
+                bgp,
+                &SessionConfig::modern(),
+            )
+            .expect("plain UPDATE must parse");
+            let anns: Vec<_> =
+                upd.announcements().unwrap().map(|n| n.unwrap()).collect();
+            assert_eq!(anns.len(), 1);
+            seen_plain = true;
+        }
+        assert!(seen_addpath && seen_plain);
     }
 
     /// Extract the 8-byte peer_distinguisher from a BMP message that
@@ -2592,6 +2893,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         }
     }
@@ -2726,6 +3028,7 @@ mod tests {
             peer_role: None,
             session_up_time: None,
             peer_capabilities: Vec::new(),
+            addpath_cap_value: Vec::new(),
             admin_label: None,
         }
     }
@@ -2738,13 +3041,31 @@ mod tests {
         let peer = agg_test_peer();
         let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]); // ORIGIN=IGP
         let (pa_bytes, nh) = filter_raw_path_attributes(&pamap);
-        let prefixes = vec![
-            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 0, 0)), 24)
+        let prefixes: Vec<(Prefix, Option<u32>)> = vec![
+            (
+                Prefix::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 0, 0)),
+                    24,
+                )
                 .unwrap(),
-            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 0)), 24)
+                None,
+            ),
+            (
+                Prefix::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(10, 2, 0, 0)),
+                    24,
+                )
                 .unwrap(),
-            Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 3, 0, 0)), 16)
+                None,
+            ),
+            (
+                Prefix::new(
+                    IpAddr::V4(std::net::Ipv4Addr::new(10, 3, 0, 0)),
+                    16,
+                )
                 .unwrap(),
+                None,
+            ),
         ];
         let msg = build_aggregated_route_monitoring(
             &peer,
@@ -2799,7 +3120,7 @@ mod tests {
                     24,
                 )
                 .unwrap();
-                assert!(agg.add(7, p, &pamap, &mut sink));
+                assert!(agg.add(7, None, p, &pamap, &mut sink));
             }
             assert!(agg.flush_all(&mut sink));
         }
@@ -2855,7 +3176,7 @@ mod tests {
                 )
                 .unwrap();
                 let pamap = if i % 2 == 0 { &pamap_a } else { &pamap_b };
-                assert!(agg.add(7, p, pamap, &mut sink));
+                assert!(agg.add(7, None, p, pamap, &mut sink));
             }
             assert!(agg.flush_all(&mut sink));
         }
@@ -2995,6 +3316,7 @@ mod tests {
                 AfiSafiType::Ipv6FlowSpec,
             ],
             false,
+            None,
         );
         let bgp_body = &open[19..];
         let opt_params_len = bgp_body[9] as usize;
@@ -3116,7 +3438,7 @@ mod tests {
         let prefix =
             Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 0)), 24)
                 .unwrap();
-        assert!(agg.add(1, prefix, &pamap, &mut sink));
+        assert!(agg.add(1, None, prefix, &pamap, &mut sink));
         assert!(agg.add_flowspec(1, true, FS_NLRI_A, &pamap, &mut sink));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 2);

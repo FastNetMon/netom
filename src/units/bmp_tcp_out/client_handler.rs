@@ -81,6 +81,33 @@ fn build_peer_info_for_emit(
     peer_info
 }
 
+/// Resolve the ingress an Update entry is *emitted as*: an ADD-PATH
+/// path-child (`IngressType::BgpPath`) maps to its parent session for the
+/// downstream per-peer header, carrying its RFC 7911 path id along for NLRI
+/// encoding; anything else emits as itself with no path id. Memoized per
+/// client (the relation is immutable per ingress id); an id not (yet) in
+/// the register resolves to itself and is NOT memoized, so it re-resolves
+/// once registered.
+async fn resolve_emit_target(
+    client: &Arc<ClientState>,
+    ingress_register: &register::Register,
+    ingress_id: IngressId,
+) -> (IngressId, Option<u32>) {
+    if let Some(target) = client.cached_emit_target(ingress_id).await {
+        return target;
+    }
+    let target = match ingress_register.get(ingress_id) {
+        Some(info) if info.ingress_type == Some(IngressType::BgpPath) => (
+            info.parent_ingress.unwrap_or(ingress_id),
+            info.path_id,
+        ),
+        Some(_) => (ingress_id, None),
+        None => return (ingress_id, None),
+    };
+    client.cache_emit_target(ingress_id, target).await;
+    target
+}
+
 /// Perform the initial table dump for a newly connected BMP client.
 ///
 /// Uses a two-phase approach for fast dumps with many peers:
@@ -255,13 +282,45 @@ pub async fn perform_initial_dump(
             DUMP_AGGREGATOR_MAX_BYTES,
             peer_info_map,
         );
+        // Walk-local memo of mui -> (emit ingress, path id): ADD-PATH
+        // path-children (IngressType::BgpPath) hold RIB records under
+        // their own mui but are emitted under their parent session's
+        // per-peer header with the path id re-attached to the NLRI.
+        // The relation is immutable per id, so one register lookup per
+        // distinct mui suffices for the whole walk.
+        let mut emit_targets: HashMap<IngressId, (IngressId, Option<u32>)> =
+            HashMap::new();
         // Set if the consumer (client) goes away mid-walk, so we skip the
         // post-walk flush instead of re-encoding messages for a dead socket.
         let mut client_gone = false;
         let walk_result = rib_for_walk.stream_prefix_records(|pr| {
             let prefix = pr.prefix;
             for route_record in pr.meta {
-                let ingress_id = route_record.multi_uniq_id;
+                let record_mui = route_record.multi_uniq_id;
+                let (ingress_id, path_id) = match emit_targets
+                    .get(&record_mui)
+                {
+                    Some(t) => *t,
+                    None => {
+                        let t = match ingress_register_for_walk
+                            .get(record_mui)
+                        {
+                            Some(info)
+                                if info.ingress_type
+                                    == Some(IngressType::BgpPath) =>
+                            {
+                                (
+                                    info.parent_ingress
+                                        .unwrap_or(record_mui),
+                                    info.path_id,
+                                )
+                            }
+                            _ => (record_mui, None),
+                        };
+                        emit_targets.insert(record_mui, t);
+                        t
+                    }
+                };
                 let mut sink = |msg: Vec<u8>, n: usize| {
                     msg_tx.blocking_send((msg, n)).is_ok()
                 };
@@ -305,7 +364,9 @@ pub async fn perform_initial_dump(
                 }
                 let pamap = &route_record.meta;
                 *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
-                if !aggregator.add(ingress_id, prefix, pamap, &mut sink) {
+                if !aggregator.add(
+                    ingress_id, path_id, prefix, pamap, &mut sink,
+                ) {
                     // Consumer dropped (client disconnected). Bail out of the
                     // iteration so the walk stops promptly.
                     client_gone = true;
@@ -921,7 +982,16 @@ async fn send_payload_to_client(
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
 ) -> bool {
-    let ingress_id = payload.ingress_id;
+    // ADD-PATH path-children emit under their parent session's per-peer
+    // header, with their path id re-attached to the NLRI. Everything below
+    // (known_peers, PeerInfo cache, lazy Peer Up) keys on the emit id, so
+    // sibling paths share one downstream peer.
+    let (ingress_id, path_id) = resolve_emit_target(
+        client,
+        ingress_register,
+        payload.ingress_id,
+    )
+    .await;
 
     // Fast path: PeerInfo is constant per peer for the session, so once it is
     // cached (Peer Up already sent, header already built) every subsequent
@@ -933,6 +1003,7 @@ async fn send_payload_to_client(
             &peer_info,
             &payload.rx_value,
             is_withdrawal,
+            path_id,
         ) {
             Some(msg) => client.send_message_mode(msg, blocking).await,
             None => true, // Skip if we can't build the message
@@ -994,6 +1065,7 @@ async fn send_payload_to_client(
         &peer_info,
         &payload.rx_value,
         is_withdrawal,
+        path_id,
     ) {
         client.send_message_mode(msg, blocking).await
     } else {
@@ -1064,6 +1136,12 @@ async fn send_peer_reappeared(
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
 ) -> bool {
+    // A re-activated ADD-PATH path-child (rib re-activation emits the
+    // child's mui) reappears as its parent session downstream: children
+    // are never peers of their own, and a Peer Up synthesized from the
+    // child's thin register entry would carry a bogus header.
+    let (ingress_id, _path_id) =
+        resolve_emit_target(client, ingress_register, ingress_id).await;
     if let Some(info) = ingress_register.get(ingress_id) {
         let peer_info = build_peer_info_for_emit(
             &info,
@@ -1347,6 +1425,217 @@ mod tests {
             eors.iter().filter(|(_, safi)| *safi == 133).count(),
             2
         );
+    }
+
+    /// Full dump with an ADD-PATH session (two path-children holding one
+    /// prefix each under their own mui) plus a plain peer: exactly one
+    /// Peer Up per *session* (none for children), the session's Peer Up
+    /// advertises cap 69 in both OPENs, both paths are replayed with
+    /// their path ids under the parent's per-peer header, the plain
+    /// peer stays path-id-free, and EoRs follow all routes.
+    #[tokio::test]
+    async fn dump_replays_addpath_children_under_parent_session() {
+        use crate::payload::{RotondaPaMap, RotondaRoute};
+        use crate::roto_runtime::Ctx;
+        use bytes::Bytes;
+        use rotonda_store::prefix_record::RouteStatus;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        use routecore::bgp::nlri::afisafi::{IsPrefix, Nlri};
+        use std::str::FromStr;
+        use std::sync::Mutex;
+
+        let register: Arc<register::Register> = Default::default();
+        let ctx = Arc::new(Mutex::new(Ctx::empty()));
+        let rib = Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
+
+        // ADD-PATH session with two path-children, plus a plain peer.
+        let session = register.register();
+        register.update_info(
+            session,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpViaBmp)
+                .with_state(IngressState::Connected)
+                .with_remote_addr("10.9.9.1".parse::<IpAddr>().unwrap())
+                .with_remote_asn(Asn::from_u32(65001))
+                .with_addpath_families(vec![0, 1, 1, 3]),
+        );
+        let mut children = Vec::new();
+        for path_id in [1u32, 2] {
+            let child = register.register();
+            register.update_info(
+                child,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpPath)
+                    .with_parent_ingress(session)
+                    .with_path_id(path_id)
+                    .with_state(IngressState::Connected)
+                    .with_remote_addr(
+                        "10.9.9.1".parse::<IpAddr>().unwrap(),
+                    )
+                    .with_remote_asn(Asn::from_u32(65001)),
+            );
+            children.push(child);
+        }
+        let plain_peer = register.register();
+        register.update_info(
+            plain_peer,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpViaBmp)
+                .with_state(IngressState::Connected)
+                .with_remote_addr("10.9.9.2".parse::<IpAddr>().unwrap())
+                .with_remote_asn(Asn::from_u32(65002)),
+        );
+
+        let addpath_prefix =
+            inetnum::addr::Prefix::from_str("10.1.0.0/24").unwrap();
+        let addpath_route = RotondaRoute::Ipv4Unicast(
+            addpath_prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        for child in &children {
+            rib.insert(
+                &addpath_route,
+                RouteStatus::Active,
+                1,
+                *child,
+                false,
+                false,
+            )
+            .unwrap();
+        }
+        let plain_prefix =
+            inetnum::addr::Prefix::from_str("10.2.0.0/24").unwrap();
+        let plain_route = RotondaRoute::Ipv4Unicast(
+            plain_prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(
+            &plain_route,
+            RouteStatus::Active,
+            1,
+            plain_peer,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let client = Arc::new(ClientState::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+            10_000,
+            10 * 1024 * 1024,
+        ));
+        let gate = crate::comms::Gate::default();
+        let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
+        let status_reporter =
+            Arc::new(BmpTcpOutStatusReporter::new("test", metrics.clone()));
+
+        let ok = perform_initial_dump(
+            &client,
+            &rib,
+            &register,
+            "test-sys",
+            "test-descr",
+            false,
+            FanInPeerDistinguisher::Off,
+            &metrics,
+            &status_reporter,
+        )
+        .await;
+        assert!(ok, "dump must complete");
+        drop(client);
+
+        let mut kinds = Vec::new();
+        let mut peer_up_cap69_counts = Vec::new();
+        let mut addpath_pids: Vec<u32> = Vec::new();
+        let mut plain_prefix_seen = false;
+        let cap69 = [69u8, 4, 0, 1, 1, 3];
+        let mut sc_addpath = SessionConfig::modern();
+        sc_addpath.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+        while let Ok(msg) = rx.try_recv() {
+            let kind = classify(&msg);
+            if kind == MsgKind::PeerUp {
+                peer_up_cap69_counts.push(
+                    msg.windows(cap69.len())
+                        .filter(|w| *w == cap69)
+                        .count(),
+                );
+            }
+            if kind == MsgKind::Route(1, 1) {
+                let bgp = Bytes::copy_from_slice(&msg[48..]);
+                // Try ADD-PATH parse first; a plain single-prefix UPDATE
+                // parsed with ADD-PATH enabled cannot yield valid
+                // Ipv4UnicastAddpath NLRI for our test prefix.
+                let parsed_addpath =
+                    UpdateMessage::from_octets(bgp.clone(), &sc_addpath)
+                        .ok()
+                        .and_then(|upd| {
+                            upd.announcements()
+                                .ok()?
+                                .collect::<Result<Vec<_>, _>>()
+                                .ok()
+                        })
+                        .filter(|anns| {
+                            anns.iter().all(|n| {
+                                matches!(
+                                    n,
+                                    Nlri::Ipv4UnicastAddpath(a)
+                                        if a.prefix() == addpath_prefix
+                                )
+                            }) && !anns.is_empty()
+                        });
+                if let Some(anns) = parsed_addpath {
+                    for n in anns {
+                        if let Nlri::Ipv4UnicastAddpath(a) = n {
+                            addpath_pids.extend(
+                                IsPrefix::path_id(&a).map(|p| p.0),
+                            );
+                        }
+                    }
+                } else {
+                    let upd = UpdateMessage::from_octets(
+                        bgp,
+                        &SessionConfig::modern(),
+                    )
+                    .expect("plain UPDATE must parse");
+                    for n in upd.announcements().unwrap() {
+                        if let Nlri::Ipv4Unicast(u) = n.unwrap() {
+                            assert_eq!(u.prefix(), plain_prefix);
+                            plain_prefix_seen = true;
+                        }
+                    }
+                }
+            }
+            kinds.push(kind);
+        }
+
+        assert_eq!(kinds[0], MsgKind::Initiation);
+        // One Peer Up per session — children never become peers.
+        assert_eq!(peer_up_cap69_counts.len(), 2);
+        // Exactly one of the two Peer Ups advertises cap 69, in both OPENs.
+        let mut counts = peer_up_cap69_counts.clone();
+        counts.sort_unstable();
+        assert_eq!(
+            counts,
+            vec![0, 2],
+            "the ADD-PATH session must advertise cap 69 in both OPENs, \
+             the plain peer in neither"
+        );
+        // Both paths replayed with their ids; the plain route without.
+        addpath_pids.sort_unstable();
+        assert_eq!(addpath_pids, vec![1, 2]);
+        assert!(plain_prefix_seen);
+        // All routes precede all EoRs.
+        let last_route = kinds
+            .iter()
+            .rposition(|k| matches!(k, MsgKind::Route(..)))
+            .unwrap();
+        let first_eor = kinds
+            .iter()
+            .position(|k| matches!(k, MsgKind::Eor(..)))
+            .unwrap();
+        assert!(last_route < first_eor);
     }
 
     /// Build the same peer (same peer_ip, peer_asn) attributed to two
