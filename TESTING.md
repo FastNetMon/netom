@@ -48,6 +48,14 @@ decoded rules verified through the HTTP API
  - `scripts/e2e-flowspec-exabgp.sh` — live BGP session: exabgp announces 8
    diverse FlowSpec rules (plus one unicast route for RFC 8955 §6 validation)
    to a bgp-tcp-in unit that negotiates the FlowSpec families.
+ - `scripts/e2e-addpath-bmp.sh` — ADD-PATH (RFC 7911) through the full BMP
+   pipeline: a crafted BMP session negotiates ADD-PATH (cap 69 in both
+   OPENs), announces one prefix under two path ids, withdraws one, and goes
+   down. Asserts on the bmp-out side that the synthesized Peer Up advertises
+   cap 69 in both OPENs, both paths restream live with their path ids, the
+   withdrawal carries its path id, a reconnect dump replays only the active
+   path, `/api/v1/ingresses` shows the two `bgpPath` children, and Peer Down
+   fires exactly once (driver: `scripts/e2e-addpath-bmp.py`).
 
 Both scripts build netom themselves (set `NETOM_BIN` to skip that), install
 their tools (mrtgen, exabgp) into a scratch directory when missing, and clean
