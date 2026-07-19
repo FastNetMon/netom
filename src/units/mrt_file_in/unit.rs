@@ -205,8 +205,21 @@ impl MrtInRunner {
             BgpMsg::Update(upd) => {
                 let received = std::time::Instant::now();
                 let mut payloads = SmallVec::new();
-                let rr_reach = explode_announcements(&upd)?;
-                let rr_unreach = explode_withdrawals(&upd)?;
+                // ADD-PATH entries (Some(path_id)) are dropped here for
+                // good: routecore's MRT layer has no RFC 8050 (ADD-PATH)
+                // subtype support at all, so a BGP4MP stream yielding
+                // path-id NLRI cannot occur today — this filter is
+                // dead-code insurance, not a TODO.
+                let rr_reach: Vec<_> = explode_announcements(&upd)?
+                    .into_iter()
+                    .filter(|(_, pid)| pid.is_none())
+                    .map(|(rr, _)| rr)
+                    .collect();
+                let rr_unreach: Vec<_> = explode_withdrawals(&upd)?
+                    .into_iter()
+                    .filter(|(_, pid)| pid.is_none())
+                    .map(|(rr, _)| rr)
+                    .collect();
 
                 announcements_sent += rr_reach.len();
                 withdrawals_sent += rr_unreach.len();

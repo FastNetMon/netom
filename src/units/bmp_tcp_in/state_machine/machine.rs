@@ -1276,8 +1276,19 @@ where
         _trace_id: Option<u8>,
     ) -> Result<(SmallVec<[Payload; 8]>, UpdateReportMessage), session::Error>
     {
-        let rr_reach = explode_announcements(bgp_msg)?;
-        let rr_unreach = explode_withdrawals(bgp_msg)?;
+        // TODO(addpath): resolve per-(session, path_id) child ingresses for
+        // the Some(path_id) entries instead of dropping them; until then this
+        // preserves the previous behavior of not storing ADD-PATH routes.
+        let rr_reach: Vec<_> = explode_announcements(bgp_msg)?
+            .into_iter()
+            .filter(|(_, pid)| pid.is_none())
+            .map(|(rr, _)| rr)
+            .collect();
+        let rr_unreach: Vec<_> = explode_withdrawals(bgp_msg)?
+            .into_iter()
+            .filter(|(_, pid)| pid.is_none())
+            .map(|(rr, _)| rr)
+            .collect();
 
         let ingress_id = if let Some(ingress_id) =
             self.details.get_peer_ingress_id(&pph)

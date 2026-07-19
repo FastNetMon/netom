@@ -711,8 +711,19 @@ impl Processor {
         let mut payloads = SmallVec::new();
 
         //  RotondaRoute announcements:
-        let rr_reach = explode_announcements(&bgp_msg)?;
-        let rr_unreach = explode_withdrawals(&bgp_msg)?;
+        // TODO(addpath): resolve per-(session, path_id) child ingresses for
+        // the Some(path_id) entries instead of dropping them; until then this
+        // preserves the previous behavior of not storing ADD-PATH routes.
+        let rr_reach: Vec<_> = explode_announcements(&bgp_msg)?
+            .into_iter()
+            .filter(|(_, pid)| pid.is_none())
+            .map(|(rr, _)| rr)
+            .collect();
+        let rr_unreach: Vec<_> = explode_withdrawals(&bgp_msg)?
+            .into_iter()
+            .filter(|(_, pid)| pid.is_none())
+            .map(|(rr, _)| rr)
+            .collect();
 
         // Update per-AFI/SAFI Adj-RIB-In counters before consuming
         // the route lists. Bucket by AFI/SAFI so we take the

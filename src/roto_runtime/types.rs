@@ -16,6 +16,7 @@ use log::{debug, warn};
 use routecore::bgp::{
     message::UpdateMessage,
     nlri::afisafi::{AfiSafiNlri, Nlri, NlriType},
+    nlri::common::PathId,
     types::AfiSafiType,
 };
 use serde::{Deserialize, Serialize};
@@ -492,16 +493,18 @@ impl OutputStreamMessage {
 const UNSUPPORTED_NLRI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Process-global accounting for NLRI dropped because their [`NlriType`] has no
-/// [`RotondaRoute`] representation. This covers genuinely unsupported families
-/// (FlowSpec, MPLS-VPN, EVPN, RouteTarget, ...) *and* the ADD-PATH encodings of
-/// otherwise-supported families (`Ipv4UnicastAddpath`, `Ipv6UnicastAddpath`,
-/// ...), which `RotondaRoute` cannot yet hold. Such NLRI parse fine in routecore
-/// but are dropped before any RIB in the [`RotondaRoute`] `TryFrom` chokepoint.
+/// [`RotondaRoute`] representation: genuinely unsupported families (MPLS-VPN,
+/// EVPN, RouteTarget, ...) and the ADD-PATH encodings of families whose plain
+/// form we store but whose ADD-PATH form we don't (`Ipv4FlowSpecAddpath`,
+/// `Ipv6FlowSpecAddpath`). ADD-PATH unicast/multicast NLRI are *not* counted
+/// here — [`convert_nlri`] strips their path id into a per-path child ingress
+/// and stores them. Such NLRI parse fine in routecore but are dropped before
+/// any RIB in the [`convert_nlri`] chokepoint.
 ///
 /// Keyed on [`NlriType`] rather than `AfiSafiType` precisely so the ADD-PATH
-/// variants stay distinct: `AfiSafiType` collapses e.g. `Ipv4UnicastAddpath`
-/// down to `Ipv4Unicast`, which would mislabel dropped ADD-PATH routes as the
-/// plain unicast family that *is* stored.
+/// variants stay distinct: `AfiSafiType` collapses e.g. `Ipv4FlowSpecAddpath`
+/// down to `Ipv4FlowSpec`, which would mislabel dropped ADD-PATH routes as the
+/// plain family that *is* stored.
 ///
 /// This serves two purposes:
 ///
@@ -589,7 +592,8 @@ impl UnsupportedNlriMetrics {
             warn!(
                 "Dropping route(s) with unsupported NLRI type {nlri_type:?}: \
                  no RotondaRoute representation, not stored in any RIB (note: \
-                 ADD-PATH encodings such as Ipv4UnicastAddpath land here too). \
+                 FlowSpec ADD-PATH encodings land here too; unicast/multicast \
+                 ADD-PATH routes are stored under per-path child ingresses). \
                  Further drops are summarized at most once per {}s and counted \
                  in netom_unsupported_nlri_dropped_total.",
                 UNSUPPORTED_NLRI_SUMMARY_INTERVAL.as_secs(),
@@ -637,7 +641,7 @@ impl metrics::Source for UnsupportedNlriMetrics {
         }
 
         // One HELP/TYPE block, one labelled row per NLRI type, e.g.
-        // netom_unsupported_nlri_dropped_total{nlri_type="Ipv4UnicastAddpath"}.
+        // netom_unsupported_nlri_dropped_total{nlri_type="Ipv4FlowSpecAddpath"}.
         target.append(&DROPPED_METRIC, None, |records| {
             for (nlri_type, count) in &totals {
                 let nlri_type = format!("{nlri_type:?}");
@@ -662,68 +666,108 @@ pub fn unsupported_nlri_metrics() -> Arc<UnsupportedNlriMetrics> {
 }
 
 /// Record one NLRI dropped because its [`NlriType`] has no [`RotondaRoute`]
-/// representation. Called from the shared `TryFrom` drop path; bumps the
-/// Prometheus counter and drives the throttled `warn!` logging.
+/// representation. Called from the shared [`convert_nlri`] drop path; bumps
+/// the Prometheus counter and drives the throttled `warn!` logging.
 fn note_unsupported_nlri(nlri_type: NlriType) {
     UNSUPPORTED_NLRI.note(nlri_type, Instant::now());
 }
 
-impl<O: AsRef<[u8]>> TryFrom<(Nlri<O>, RotondaPaMap)> for RotondaRoute {
-    type Error = ();
-    fn try_from(value: (Nlri<O>, RotondaPaMap)) -> Result<Self, Self::Error> {
-        let res = match value.0 {
-            Nlri::Ipv4Unicast(n) => RotondaRoute::Ipv4Unicast(n, value.1),
-            Nlri::Ipv4Multicast(n) => RotondaRoute::Ipv4Multicast(n, value.1),
-            Nlri::Ipv6Unicast(n) => RotondaRoute::Ipv6Unicast(n, value.1),
-            Nlri::Ipv6Multicast(n) => RotondaRoute::Ipv6Multicast(n, value.1),
-            // Copy the flowspec NLRI out of the (possibly borrowed) octets
-            // into owned Bytes; identity is the raw NLRI bytes.
-            Nlri::Ipv4FlowSpec(n) => RotondaRoute::Ipv4FlowSpec(
-                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
-                value.1,
-            ),
-            Nlri::Ipv6FlowSpec(n) => RotondaRoute::Ipv6FlowSpec(
-                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
-                value.1,
-            ),
+/// Convert one parsed NLRI plus its path attributes into the stored
+/// [`RotondaRoute`] form.
+///
+/// ADD-PATH (RFC 7911) unicast/multicast variants convert to the same
+/// plain variants — the store key has no path-id representation — and the
+/// stripped [`PathId`] is returned alongside so the caller can resolve a
+/// per-(session, path_id) child ingress to store the route under. Plain
+/// variants return `None`. NLRI types with no `RotondaRoute` representation
+/// (MPLS/VPN/EVPN/VPLS/RouteTarget, and FlowSpec-ADD-PATH) are counted and
+/// dropped as before.
+pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
+    nlri: Nlri<O>,
+    pamap: RotondaPaMap,
+) -> Result<(RotondaRoute, Option<PathId>), ()> {
+    use routecore::bgp::nlri::afisafi::Addpath;
 
-            Nlri::Ipv4UnicastAddpath(..)
-            | Nlri::Ipv4MulticastAddpath(..)
-            | Nlri::Ipv4MplsUnicast(..)
-            | Nlri::Ipv4MplsUnicastAddpath(..)
-            | Nlri::Ipv4MplsVpnUnicast(..)
-            | Nlri::Ipv4MplsVpnUnicastAddpath(..)
-            | Nlri::Ipv4RouteTarget(..)
-            | Nlri::Ipv4RouteTargetAddpath(..)
-            | Nlri::Ipv4FlowSpecAddpath(..)
-            | Nlri::Ipv6UnicastAddpath(..)
-            | Nlri::Ipv6MulticastAddpath(..)
-            | Nlri::Ipv6MplsUnicast(..)
-            | Nlri::Ipv6MplsUnicastAddpath(..)
-            | Nlri::Ipv6MplsVpnUnicast(..)
-            | Nlri::Ipv6MplsVpnUnicastAddpath(..)
-            | Nlri::Ipv6FlowSpecAddpath(..)
-            | Nlri::L2VpnVpls(..)
-            | Nlri::L2VpnVplsAddpath(..)
-            | Nlri::L2VpnEvpn(..)
-            | Nlri::L2VpnEvpnAddpath(..) => {
-                note_unsupported_nlri(value.0.nlri_type());
-                debug!(
-                    "NLRI type {:?} not yet supported in RotondaRoute: {}",
-                    value.0.nlri_type(),
-                    value.0
-                );
-                return Err(());
-            }
-        };
+    let res = match nlri {
+        Nlri::Ipv4Unicast(n) => (RotondaRoute::Ipv4Unicast(n, pamap), None),
+        Nlri::Ipv4Multicast(n) => {
+            (RotondaRoute::Ipv4Multicast(n, pamap), None)
+        }
+        Nlri::Ipv6Unicast(n) => (RotondaRoute::Ipv6Unicast(n, pamap), None),
+        Nlri::Ipv6Multicast(n) => {
+            (RotondaRoute::Ipv6Multicast(n, pamap), None)
+        }
+        Nlri::Ipv4UnicastAddpath(n) => {
+            let pid = n.path_id();
+            (RotondaRoute::Ipv4Unicast(n.into(), pamap), Some(pid))
+        }
+        Nlri::Ipv4MulticastAddpath(n) => {
+            let pid = n.path_id();
+            (RotondaRoute::Ipv4Multicast(n.into(), pamap), Some(pid))
+        }
+        Nlri::Ipv6UnicastAddpath(n) => {
+            let pid = n.path_id();
+            (RotondaRoute::Ipv6Unicast(n.into(), pamap), Some(pid))
+        }
+        Nlri::Ipv6MulticastAddpath(n) => {
+            let pid = n.path_id();
+            (RotondaRoute::Ipv6Multicast(n.into(), pamap), Some(pid))
+        }
+        // Copy the flowspec NLRI out of the (possibly borrowed) octets
+        // into owned Bytes; identity is the raw NLRI bytes.
+        Nlri::Ipv4FlowSpec(n) => (
+            RotondaRoute::Ipv4FlowSpec(
+                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                pamap,
+            ),
+            None,
+        ),
+        Nlri::Ipv6FlowSpec(n) => (
+            RotondaRoute::Ipv6FlowSpec(
+                n.nlri().to_owned_octets::<bytes::Bytes>().into(),
+                pamap,
+            ),
+            None,
+        ),
 
-        Ok(res)
-    }
+        Nlri::Ipv4MplsUnicast(..)
+        | Nlri::Ipv4MplsUnicastAddpath(..)
+        | Nlri::Ipv4MplsVpnUnicast(..)
+        | Nlri::Ipv4MplsVpnUnicastAddpath(..)
+        | Nlri::Ipv4RouteTarget(..)
+        | Nlri::Ipv4RouteTargetAddpath(..)
+        | Nlri::Ipv4FlowSpecAddpath(..)
+        | Nlri::Ipv6MplsUnicast(..)
+        | Nlri::Ipv6MplsUnicastAddpath(..)
+        | Nlri::Ipv6MplsVpnUnicast(..)
+        | Nlri::Ipv6MplsVpnUnicastAddpath(..)
+        | Nlri::Ipv6FlowSpecAddpath(..)
+        | Nlri::L2VpnVpls(..)
+        | Nlri::L2VpnVplsAddpath(..)
+        | Nlri::L2VpnEvpn(..)
+        | Nlri::L2VpnEvpnAddpath(..) => {
+            note_unsupported_nlri(nlri.nlri_type());
+            debug!(
+                "NLRI type {:?} not yet supported in RotondaRoute: {}",
+                nlri.nlri_type(),
+                nlri
+            );
+            return Err(());
+        }
+    };
+
+    Ok(res)
 }
 
+/// Explode a BGP UPDATE's announcements into storable routes.
+///
+/// Each entry carries the RFC 7911 path id when the NLRI was an ADD-PATH
+/// variant (`None` otherwise) so the caller can resolve the per-path child
+/// ingress to store the route under.
 pub(crate) fn explode_announcements(
     bgp_update: &UpdateMessage<impl routecore::Octets>,
-) -> Result<Vec<RotondaRoute>, routecore::bgp::ParseError> {
+) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError>
+{
     let mut res = vec![];
 
     let pas = bgp_update.path_attributes()?;
@@ -731,7 +775,7 @@ pub(crate) fn explode_announcements(
 
     for a in bgp_update.announcements()? {
         let a = a?;
-        if let Ok(r) = (a, pamap.clone()).try_into() {
+        if let Ok(r) = convert_nlri(a, pamap.clone()) {
             res.push(r);
         } else {
             debug!("unsupported AFI/SAFI in explode_announcements");
@@ -740,9 +784,12 @@ pub(crate) fn explode_announcements(
     Ok(res)
 }
 
+/// Explode a BGP UPDATE's withdrawals into storable routes; see
+/// [`explode_announcements`] for the path-id component.
 pub(crate) fn explode_withdrawals(
     bgp_update: &UpdateMessage<impl routecore::Octets>,
-) -> Result<Vec<RotondaRoute>, routecore::bgp::ParseError> {
+) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError>
+{
     let mut res = vec![];
 
     let pamap = RotondaPaMap::new(
@@ -754,7 +801,7 @@ pub(crate) fn explode_withdrawals(
 
     for w in bgp_update.withdrawals()? {
         let w = w?;
-        if let Ok(r) = (w, pamap.clone()).try_into() {
+        if let Ok(r) = convert_nlri(w, pamap.clone()) {
             res.push(r);
         } else {
             debug!("unsupported AFI/SAFI in explode_withdrawals");
@@ -788,10 +835,11 @@ mod tests {
     fn unsupported_nlri_counter_increments_and_renders() {
         let m = UnsupportedNlriMetrics::default();
         let now = Instant::now();
-        // Two ADD-PATH unicast drops (the real-world case: AfiSafiType would
-        // collapse these to plain Ipv4Unicast) and one FlowSpec drop.
-        m.note(NlriType::Ipv4UnicastAddpath, now);
-        m.note(NlriType::Ipv4UnicastAddpath, now);
+        // Two FlowSpec ADD-PATH drops (still unsupported — unlike ADD-PATH
+        // unicast/multicast, which convert_nlri now stores; AfiSafiType
+        // would collapse these to plain Ipv4FlowSpec) and one FlowSpec drop.
+        m.note(NlriType::Ipv4FlowSpecAddpath, now);
+        m.note(NlriType::Ipv4FlowSpecAddpath, now);
         m.note(NlriType::Ipv6FlowSpec, now);
 
         let mut target =
@@ -802,9 +850,9 @@ mod tests {
         assert!(
             out.contains(
                 "netom_unsupported_nlri_dropped_total\
-                 {nlri_type=\"Ipv4UnicastAddpath\"} 2"
+                 {nlri_type=\"Ipv4FlowSpecAddpath\"} 2"
             ),
-            "missing ADD-PATH unicast total in:\n{out}"
+            "missing FlowSpec ADD-PATH total in:\n{out}"
         );
         assert!(
             out.contains(
@@ -813,6 +861,79 @@ mod tests {
             ),
             "missing FlowSpec total in:\n{out}"
         );
+    }
+
+    #[test]
+    fn explode_surfaces_addpath_path_ids() {
+        use std::str::FromStr;
+
+        use routecore::bgp::message::update_builder::UpdateBuilder;
+        use routecore::bgp::message::SessionConfig;
+        use routecore::bgp::nlri::afisafi::{Ipv4UnicastNlri, IsPrefix};
+
+        let prefix =
+            inetnum::addr::Prefix::from_str("10.0.0.0/24").unwrap();
+
+        // Two paths for one prefix, and an ADD-PATH withdrawal, built with
+        // routecore's own encoder.
+        let mut builder = UpdateBuilder::new_vec();
+        builder
+            .add_announcement(
+                Ipv4UnicastNlri::try_from(prefix)
+                    .unwrap()
+                    .into_addpath(PathId(1)),
+            )
+            .unwrap();
+        builder
+            .add_announcement(
+                Ipv4UnicastNlri::try_from(prefix)
+                    .unwrap()
+                    .into_addpath(PathId(2)),
+            )
+            .unwrap();
+        // Parsing with ADD-PATH enabled for the family must surface the
+        // stripped path ids next to plain-variant RotondaRoutes.
+        let mut sc = SessionConfig::modern();
+        sc.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+        let upd = builder.into_message(&sc).unwrap();
+
+        let announced = explode_announcements(&upd).unwrap();
+        assert_eq!(announced.len(), 2);
+        let mut pids = vec![];
+        for (rr, pid) in &announced {
+            match rr {
+                RotondaRoute::Ipv4Unicast(n, _) => {
+                    assert_eq!(n.prefix(), prefix)
+                }
+                other => panic!("unexpected RotondaRoute {other:?}"),
+            }
+            pids.push(pid.expect("path id must be surfaced"));
+        }
+        pids.sort_unstable();
+        assert_eq!(pids, [PathId(1), PathId(2)]);
+
+        // Withdrawals carry the path id the same way.
+        let mut builder = UpdateBuilder::new_vec();
+        builder
+            .append_withdrawals(vec![Ipv4UnicastNlri::try_from(prefix)
+                .unwrap()
+                .into_addpath(PathId(7))])
+            .unwrap();
+        let upd = builder.into_message(&sc).unwrap();
+
+        let withdrawn = explode_withdrawals(&upd).unwrap();
+        assert_eq!(withdrawn.len(), 1);
+        assert_eq!(withdrawn[0].1, Some(PathId(7)));
+
+        // A plain (non-ADD-PATH) message keeps yielding None.
+        let mut builder = UpdateBuilder::new_vec();
+        builder
+            .add_announcement(Ipv4UnicastNlri::try_from(prefix).unwrap())
+            .unwrap();
+        let upd = builder.into_message(&SessionConfig::modern()).unwrap();
+        let announced = explode_announcements(&upd).unwrap();
+        assert_eq!(announced.len(), 1);
+        assert_eq!(announced[0].1, None);
     }
 
     #[test]

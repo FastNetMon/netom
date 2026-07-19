@@ -1181,11 +1181,11 @@ fn mk_route_update_with_communities(
 
     let mut bulk = SmallVec::new();
 
-    for r in rws {
+    for (r, _pid) in rws {
         bulk.push(Payload::new(r, None, ingress_id, RouteStatus::Active));
     }
 
-    for w in wdws {
+    for (w, _pid) in wdws {
         bulk.push(Payload::new(w, None, ingress_id, RouteStatus::Withdrawn));
     }
     Update::Bulk(Box::new(bulk))
@@ -1313,11 +1313,11 @@ fn mk_route_update_with_ingress(
 
     let mut bulk = SmallVec::new();
 
-    for r in rws {
+    for (r, _pid) in rws {
         bulk.push(Payload::new(r, None, ingress_id, RouteStatus::Active));
     }
 
-    for w in wdws {
+    for (w, _pid) in wdws {
         bulk.push(Payload::new(w, None, ingress_id, RouteStatus::Withdrawn));
     }
     Update::Bulk(Box::new(bulk))
