@@ -610,6 +610,36 @@ impl Register {
         None
     }
 
+    /// Find an existing ADD-PATH path-child of `parent` for `path_id` and
+    /// atomically *claim* it by flipping it to `Connected` under a single
+    /// write lock (same TOCTOU reasoning as
+    /// [`find_existing_peer_and_claim`](Self::find_existing_peer_and_claim)).
+    ///
+    /// Children are matched on `{ingress_type == BgpPath, parent_ingress,
+    /// path_id}` — the identity that must stay stable across session flaps so
+    /// a re-announced path rebinds to its previous mui and re-activates its
+    /// withdrawn RIB records instead of minting a new id per flap.
+    pub fn find_existing_path_child_and_claim(
+        &self,
+        parent: IngressId,
+        path_id: u32,
+    ) -> Option<IngressId> {
+        let mut lock = self.info.write().unwrap();
+        for (id, info) in lock.iter_mut() {
+            if info.state == Some(IngressState::Connected) {
+                continue;
+            }
+            if info.ingress_type == Some(IngressType::BgpPath)
+                && info.parent_ingress == Some(parent)
+                && info.path_id == Some(path_id)
+            {
+                info.state = Some(IngressState::Connected);
+                return Some(*id);
+            }
+        }
+        None
+    }
+
     /// Search existing [`IngressId`] on the BMP router leven
     ///
     /// For the BMP router level, the comparison is based on the parent
@@ -681,6 +711,17 @@ pub enum IngressType {
     Bgp,
     Mrt,
     Rtr,
+    /// Per-path child of a BGP session with ADD-PATH (RFC 7911) enabled.
+    ///
+    /// Each distinct `(session, path_id)` pair gets its own ingress id so
+    /// the RIB (keyed on `(prefix, mui)`) can hold multiple paths for one
+    /// prefix from one peer. `parent_ingress` is the session's ingress id —
+    /// a `BgpViaBmp` or `Bgp` entry, whose own type disambiguates origin —
+    /// and `path_id` holds the RFC 7911 path identifier. Children are never
+    /// downstream peers themselves: bmp-out resolves them back to the parent
+    /// session for the per-peer header and re-attaches the path id when
+    /// encoding NLRI.
+    BgpPath,
 }
 
 #[derive(
@@ -727,7 +768,15 @@ info_for_field!(IngressInfo{
    #[serde(serialize_with = "serialize_capability_names")]
    local_capabilities: Vec<u8>,
    #[serde(serialize_with = "serialize_capability_names")]
-   remote_capabilities: Vec<u8>
+   remote_capabilities: Vec<u8>,
+   path_id: u32, // RFC 7911 path identifier; set on IngressType::BgpPath children only
+   // ADD-PATH capability (69) *value* bytes for the families the session
+   // actually parses with path ids: per family AFI(u16 BE) + SAFI(u8) +
+   // direction(u8). Set on *session* ingresses, derived from the session's
+   // SessionConfig::enabled_addpaths() (the negotiated set), not from
+   // remote_capabilities (which is one side's OPEN, not the intersection).
+   #[serde(serialize_with = "serialize_addpath_families")]
+   addpath_families: Vec<u8>
 });
 
 /// Serialize a raw BGP capability blob (`capabilities_as_vec` wire format) as
@@ -748,6 +797,44 @@ where
         .iter()
         .map(|c| c.typ().to_string())
         .collect();
+    let mut seq = serializer.serialize_seq(Some(names.len()))?;
+    for name in &names {
+        seq.serialize_element(name)?;
+    }
+    seq.end()
+}
+
+/// Serialize ADD-PATH capability value bytes (per family: AFI u16 BE, SAFI
+/// u8, direction u8) as a human-readable list for the `/ingresses` dump,
+/// e.g. `["Ipv4Unicast/SendReceive"]`. Malformed trailing bytes render as
+/// `"invalid"` rather than failing serialization.
+fn serialize_addpath_families<S>(
+    caps: &Option<Vec<u8>>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeSeq;
+    let blob = caps.as_deref().unwrap_or(&[]);
+    let mut names = Vec::new();
+    for quad in blob.chunks(4) {
+        if let [afi_hi, afi_lo, safi, dir] = *quad {
+            let fam = routecore::bgp::types::AfiSafiType::from((
+                u16::from_be_bytes([afi_hi, afi_lo]),
+                safi,
+            ));
+            let dir = match dir {
+                1 => "Receive",
+                2 => "Send",
+                3 => "SendReceive",
+                _ => "invalid",
+            };
+            names.push(format!("{fam}/{dir}"));
+        } else {
+            names.push("invalid".into());
+        }
+    }
     let mut seq = serializer.serialize_seq(Some(names.len()))?;
     for name in &names {
         seq.serialize_element(name)?;
@@ -928,6 +1015,78 @@ mod tests {
             .with_ingress_type(IngressType::Bgp);
 
         assert_eq!(res.find_existing_bgp_session(&query), None);
+    }
+
+    /// Mint a `BgpPath` child under `parent` in the given state.
+    fn mk_path_child(
+        res: &Register,
+        parent: IngressId,
+        path_id: u32,
+        state: IngressState,
+    ) -> IngressId {
+        let id = res.register();
+        res.update_info(
+            id,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(parent)
+                .with_path_id(path_id)
+                .with_state(state),
+        );
+        id
+    }
+
+    #[test]
+    fn path_child_claim_reuses_disconnected() {
+        let res = Register::new();
+        let session = res.register();
+        let child =
+            mk_path_child(&res, session, 7, IngressState::Disconnected);
+
+        let claimed = res.find_existing_path_child_and_claim(session, 7);
+        assert_eq!(claimed, Some(child));
+        // The claim itself must flip the entry to Connected...
+        assert_eq!(
+            res.get(child).unwrap().state,
+            Some(IngressState::Connected)
+        );
+        // ...so a second claim for the same identity finds nothing.
+        assert_eq!(res.find_existing_path_child_and_claim(session, 7), None);
+    }
+
+    #[test]
+    fn path_child_claim_ignores_connected_and_other_identities() {
+        let res = Register::new();
+        let session = res.register();
+        let other_session = res.register();
+        mk_path_child(&res, session, 7, IngressState::Connected);
+        mk_path_child(&res, session, 8, IngressState::Disconnected);
+        mk_path_child(&res, other_session, 7, IngressState::Connected);
+
+        // Connected child of the right identity: not claimable.
+        assert_eq!(res.find_existing_path_child_and_claim(session, 7), None);
+        // Wrong parent: not claimable either.
+        assert_eq!(
+            res.find_existing_path_child_and_claim(other_session, 8),
+            None
+        );
+    }
+
+    #[test]
+    fn ids_for_parent_returns_path_children() {
+        let res = Register::new();
+        let session = res.register();
+        let c1 = mk_path_child(&res, session, 1, IngressState::Connected);
+        let c2 = mk_path_child(&res, session, 2, IngressState::Connected);
+        // A child of some other parent must not appear.
+        let other = res.register();
+        mk_path_child(&res, other, 1, IngressState::Connected);
+
+        let mut children = res.ids_for_parent(session);
+        children.sort_unstable();
+        let mut expected = vec![c1, c2];
+        expected.sort_unstable();
+        assert_eq!(children, expected);
     }
 
     #[test]
