@@ -483,6 +483,53 @@ async fn flowspec_validation_spans_addpath_child_muis() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unicast_api_exposes_addpath_session_path_and_internal_child() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let session = register.register();
+    register.update_info(
+        session,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let child = register.register();
+    register.update_info(
+        child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(77u32),
+    );
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    rib.insert(&route, RouteStatus::Active, 1, child, true, false)
+        .unwrap();
+
+    let mut json = Vec::new();
+    rib.search_and_output_routes(
+        crate::representation::Json(&mut json),
+        AfiSafiType::Ipv4Unicast,
+        prefix,
+        super::QueryFilter::default(),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let row = &json["data"]["routes"][0];
+    assert_eq!(row["ingress"]["id"], child);
+    assert_eq!(row["source"]["ingressId"], session);
+    assert_eq!(row["source"]["pathId"], 77);
+    assert_eq!(row["source"]["internalPathIngressId"], child);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ingests_compressed_mrtgen_files() {
     for extension in ["gz", "bz2"] {
         let runner =

@@ -2570,6 +2570,10 @@ impl Rib {
                     let ingress = ingress_info
                         .get(&record.multi_uniq_id)
                         .map(|info| (record.multi_uniq_id, info).into());
+                    let source = RouteSource::resolve(
+                        record.multi_uniq_id,
+                        ingress_info.get(&record.multi_uniq_id),
+                    );
                     let status = RouteStatusWrapper(record.status);
 
                     if filter.fields_path_attributes.is_some() {
@@ -2578,6 +2582,7 @@ impl Rib {
                             section,
                             status,
                             ingress,
+                            source,
                             pamap: RotondaPaMapWithQueryFilter(
                                 &record.meta,
                                 &filter,
@@ -2590,6 +2595,7 @@ impl Rib {
                             section,
                             status,
                             ingress,
+                            source,
                             pamap: &record.meta,
                         };
                         serde_json::to_writer(&mut *target, &line)?;
@@ -2642,6 +2648,47 @@ pub struct SearchResult {
     query_filter: QueryFilter,
 }
 
+/// Stable public identity for the source of a route.
+///
+/// ADD-PATH records use a child ingress as their store MUI. API consumers,
+/// however, need the owning session and the path ID scoped to that session;
+/// the child ID is retained as an explicit implementation/debug identifier.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RouteSource {
+    pub ingress_id: IngressId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_id: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_path_ingress_id: Option<IngressId>,
+}
+
+impl RouteSource {
+    pub(crate) fn resolve(
+        record_ingress_id: IngressId,
+        info: Option<&IngressInfo>,
+    ) -> Self {
+        if matches!(
+            info.and_then(|info| info.ingress_type.as_ref()),
+            Some(ingress::IngressType::BgpPath)
+        ) {
+            Self {
+                ingress_id: info
+                    .and_then(|info| info.parent_ingress)
+                    .unwrap_or(record_ingress_id),
+                path_id: info.and_then(|info| info.path_id),
+                internal_path_ingress_id: Some(record_ingress_id),
+            }
+        } else {
+            Self {
+                ingress_id: record_ingress_id,
+                path_id: None,
+                internal_path_ingress_id: None,
+            }
+        }
+    }
+}
+
 crate::genoutput_json!(SearchResult);
 
 impl SearchResult {
@@ -2672,6 +2719,10 @@ impl SearchResult {
         self.ingress_info
             .get(&ingress_id)
             .map(|info| (ingress_id, info).into())
+    }
+
+    fn route_source(&self, ingress_id: IngressId) -> RouteSource {
+        RouteSource::resolve(ingress_id, self.ingress_info.get(&ingress_id))
     }
 
     /// Write one JSON object per line (NDJSON / JSONL).
@@ -2728,6 +2779,7 @@ impl SearchResult {
                 section,
                 status,
                 ingress,
+                source: self.route_source(record.multi_uniq_id),
                 pamap: RotondaPaMapWithQueryFilter(
                     &record.meta,
                     query_filter,
@@ -2740,6 +2792,7 @@ impl SearchResult {
                 section,
                 status,
                 ingress,
+                source: self.route_source(record.multi_uniq_id),
                 pamap: &record.meta,
             };
             serde_json::to_writer(&mut *target, &line)?;
@@ -2756,6 +2809,7 @@ struct JsonlLine<'a, 'b> {
     status: RouteStatusWrapper,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress: Option<IdAndInfo<'b>>,
+    source: RouteSource,
     #[serde(flatten)]
     pamap: &'a RotondaPaMap,
 }
@@ -2767,6 +2821,7 @@ struct JsonlLineFiltered<'a, 'b, 'c> {
     status: RouteStatusWrapper,
     #[serde(skip_serializing_if = "Option::is_none")]
     ingress: Option<IdAndInfo<'b>>,
+    source: RouteSource,
     #[serde(flatten)]
     pamap: RotondaPaMapWithQueryFilter<'a, 'c>,
 }
@@ -2923,6 +2978,7 @@ impl Serialize for RecordWrapper<'_, '_> {
         struct Helper<'a, 'b> {
             status: RouteStatusWrapper,
             ingress: Option<IdAndInfo<'b>>,
+            source: RouteSource,
             #[serde(flatten)]
             pamap: &'a RotondaPaMap,
             //pamap: RotondaPaMapWithQueryFilter<'a, 'b>,//(&RotondaPaMap, &self.2),
@@ -2932,6 +2988,7 @@ impl Serialize for RecordWrapper<'_, '_> {
         struct HelperWithQueryFilter<'a, 'b, 'c> {
             status: RouteStatusWrapper,
             ingress: Option<IdAndInfo<'b>>,
+            source: RouteSource,
             #[serde(flatten)]
             pamap: RotondaPaMapWithQueryFilter<'a, 'c>, //(&RotondaPaMap, &self.2),
         }
@@ -2948,6 +3005,7 @@ impl Serialize for RecordWrapper<'_, '_> {
         if query_filter.fields_path_attributes.is_some() {
             HelperWithQueryFilter {
                 ingress: self.1.id_and_info(self.0.multi_uniq_id),
+                source: self.1.route_source(self.0.multi_uniq_id),
                 status: RouteStatusWrapper(self.0.status),
                 pamap: RotondaPaMapWithQueryFilter(
                     &self.0.meta,
@@ -2958,6 +3016,7 @@ impl Serialize for RecordWrapper<'_, '_> {
         } else {
             Helper {
                 ingress: self.1.id_and_info(self.0.multi_uniq_id),
+                source: self.1.route_source(self.0.multi_uniq_id),
                 status: RouteStatusWrapper(self.0.status),
                 pamap: &self.0.meta,
             }
@@ -3485,6 +3544,28 @@ mod tests {
     fn flowspec_rows(rib: &Rib) -> Vec<FlowSpecQueryRow> {
         rib.query_flowspec(true, None, false, false, None, None)
             .unwrap()
+    }
+
+    #[test]
+    fn route_source_exposes_addpath_session_path_and_internal_child() {
+        let session = 7u32;
+        let child = 11u32;
+        let child_info = IngressInfo::new()
+            .with_ingress_type(ingress::IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(42u32);
+
+        let source = RouteSource::resolve(child, Some(&child_info));
+        let json = serde_json::to_value(source).unwrap();
+        assert_eq!(json["ingressId"], session);
+        assert_eq!(json["pathId"], 42);
+        assert_eq!(json["internalPathIngressId"], child);
+
+        let plain = serde_json::to_value(RouteSource::resolve(session, None))
+            .unwrap();
+        assert_eq!(plain["ingressId"], session);
+        assert!(plain.get("pathId").is_none());
+        assert!(plain.get("internalPathIngressId").is_none());
     }
 
     /// Guard test for the design's central storage assumption: a rule with

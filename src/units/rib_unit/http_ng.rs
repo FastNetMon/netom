@@ -338,7 +338,10 @@ struct FlowSpecRow {
     /// The prefix the rule is keyed on: its destination-prefix component,
     /// or the family default route for rules without a usable one.
     key_prefix: String,
+    /// Legacy store ingress ID. For ADD-PATH this is the internal child;
+    /// use `source` for the stable session/path identity.
     ingress_id: IngressId,
+    source: super::rib::RouteSource,
     validity: &'static str,
     /// Human-readable rule (RFC 8955/8956 components).
     nlri: String,
@@ -440,21 +443,28 @@ fn build_flowspec_response(
 
     let out: Vec<FlowSpecRow> = parsed
         .into_iter()
-        .map(|(row, nlri)| FlowSpecRow {
-            key_prefix: row.key_prefix.to_string(),
-            ingress_id: row.ingress_id,
-            validity: row.rule.validity.as_str(),
-            nlri: nlri
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "<malformed>".to_string()),
-            nlri_hex: row
-                .rule
-                .nlri
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect(),
-            actions: decode_actions(&row.rule.pamap),
-            attributes: row.rule.pamap,
+        .map(|(row, nlri)| {
+            let ingress_info = rib.ingress_register.get(row.ingress_id);
+            FlowSpecRow {
+                key_prefix: row.key_prefix.to_string(),
+                ingress_id: row.ingress_id,
+                source: super::rib::RouteSource::resolve(
+                    row.ingress_id,
+                    ingress_info.as_ref(),
+                ),
+                validity: row.rule.validity.as_str(),
+                nlri: nlri
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "<malformed>".to_string()),
+                nlri_hex: row
+                    .rule
+                    .nlri
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect(),
+                actions: decode_actions(&row.rule.pamap),
+                attributes: row.rule.pamap,
+            }
         })
         .collect();
 
@@ -696,5 +706,36 @@ mod tests {
         };
         assert!(message.contains("filter[originAsn]"));
         assert!(message.contains("format"));
+    }
+
+    #[test]
+    fn flowspec_row_exposes_addpath_source_without_breaking_ingress_id() {
+        use crate::ingress::{IngressInfo, IngressType};
+
+        let session = 5u32;
+        let child = 9u32;
+        let child_info = IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(123u32);
+        let row = FlowSpecRow {
+            key_prefix: "192.0.2.0/24".into(),
+            ingress_id: child,
+            source: super::super::rib::RouteSource::resolve(
+                child,
+                Some(&child_info),
+            ),
+            validity: "valid",
+            nlri: "destination 192.0.2.0/24".into(),
+            nlri_hex: "0118c00002".into(),
+            actions: Vec::new(),
+            attributes: crate::payload::RotondaPaMap::empty_path_attributes(),
+        };
+
+        let json = serde_json::to_value(row).unwrap();
+        assert_eq!(json["ingressId"], child);
+        assert_eq!(json["source"]["ingressId"], session);
+        assert_eq!(json["source"]["pathId"], 123);
+        assert_eq!(json["source"]["internalPathIngressId"], child);
     }
 }
