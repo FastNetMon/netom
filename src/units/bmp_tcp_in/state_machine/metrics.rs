@@ -142,6 +142,12 @@ pub struct RouterBmpMetrics {
     pub num_peers_up: Arc<AtomicUsize>,
     pub num_peers_up_eor_capable: Arc<AtomicUsize>,
     pub num_peers_up_dumping: Arc<AtomicUsize>,
+    /// ADD-PATH path-child ingresses minted (fresh register entries; claim
+    /// rebinds after a flap don't count).
+    pub num_addpath_path_children_minted: Arc<AtomicUsize>,
+    /// ADD-PATH withdrawals dropped because their path id was never seen
+    /// announced on the session.
+    pub num_addpath_unknown_path_id_withdrawals: Arc<AtomicUsize>,
     pub parse_errors: Arc<ParseErrorsRingBuffer>,
 }
 
@@ -210,6 +216,18 @@ impl BmpStateMachineMetrics {
         "bmp_state_num_up_peers_with_pending_eors",
         "the number of up peers with at least one pending End-of-RIB signal",
         MetricType::Gauge,
+        MetricUnit::Total,
+    );
+    const NUM_ADDPATH_PATH_CHILDREN_MINTED_METRIC: Metric = Metric::new(
+        "bmp_state_num_addpath_path_children_minted",
+        "the number of ADD-PATH path-child ingresses minted for this router's peers",
+        MetricType::Counter,
+        MetricUnit::Total,
+    );
+    const NUM_ADDPATH_UNKNOWN_PATH_ID_WITHDRAWALS_METRIC: Metric = Metric::new(
+        "bmp_state_num_addpath_unknown_path_id_withdrawals",
+        "the number of ADD-PATH withdrawals dropped because their path id was never announced on the session",
+        MetricType::Counter,
         MetricUnit::Total,
     );
 }
@@ -282,6 +300,20 @@ impl metrics::Source for BmpStateMachineMetrics {
                 router_id,
                 Self::NUM_WITHDRAWALS_METRIC,
                 metrics.num_withdrawals.load(SeqCst),
+            );
+            append_per_router_metric(
+                unit_name,
+                target,
+                router_id,
+                Self::NUM_ADDPATH_PATH_CHILDREN_MINTED_METRIC,
+                metrics.num_addpath_path_children_minted.load(SeqCst),
+            );
+            append_per_router_metric(
+                unit_name,
+                target,
+                router_id,
+                Self::NUM_ADDPATH_UNKNOWN_PATH_ID_WITHDRAWALS_METRIC,
+                metrics.num_addpath_unknown_path_id_withdrawals.load(SeqCst),
             );
             append_per_router_metric(
                 unit_name,

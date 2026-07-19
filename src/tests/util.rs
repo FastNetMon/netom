@@ -197,7 +197,6 @@ pub mod bgp {
         }
 
         #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::vec_init_then_push)]
         pub fn mk_peer_up_notification_msg(
             per_peer_header: &PerPeerHeader,
             local_address: IpAddr,
@@ -209,6 +208,41 @@ pub mod bgp {
             received_bgp_identifier: u32,
             information_tlvs: Vec<(InformationTlvType, String)>,
             eor_capable: bool,
+        ) -> Bytes {
+            mk_peer_up_notification_msg_with_capabilities(
+                per_peer_header,
+                local_address,
+                local_port,
+                remote_port,
+                sent_open_asn,
+                received_open_asn,
+                sent_bgp_identifier,
+                received_bgp_identifier,
+                information_tlvs,
+                eor_capable,
+                &[],
+            )
+        }
+
+        /// Like [`mk_peer_up_notification_msg`], but additionally injects the
+        /// given `(capability code, capability value)` triples into **both**
+        /// embedded OPEN messages. BMP peer session settings are derived from
+        /// the intersection of the two OPENs (e.g. ADD-PATH, RFC 7911 cap
+        /// 69), so a capability meant to be "negotiated" must appear in both.
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::vec_init_then_push)]
+        pub fn mk_peer_up_notification_msg_with_capabilities(
+            per_peer_header: &PerPeerHeader,
+            local_address: IpAddr,
+            local_port: u16,
+            remote_port: u16,
+            sent_open_asn: u16,
+            received_open_asn: u16,
+            sent_bgp_identifier: u32,
+            received_bgp_identifier: u32,
+            information_tlvs: Vec<(InformationTlvType, String)>,
+            eor_capable: bool,
+            extra_caps: &[(u8, Vec<u8>)],
         ) -> Bytes {
             let mut buf = BytesMut::new();
             push_bmp_common_header(&mut buf, MessageType::PeerUpNotification);
@@ -292,7 +326,7 @@ pub mod bgp {
             bgp_msg_buf.extend_from_slice(&sent_open_asn.to_be_bytes());
             bgp_msg_buf.extend_from_slice(&0u16.to_be_bytes()); // 0 hold time - disables keep alive
             bgp_msg_buf.extend_from_slice(&sent_bgp_identifier.to_be_bytes());
-            bgp_msg_buf.extend_from_slice(&0u8.to_be_bytes()); // 0 optional parameters
+            push_open_capabilities(&mut bgp_msg_buf, false, extra_caps);
 
             // Finalize BGP message
             finalize_bgp_msg_len(&mut bgp_msg_buf);
@@ -312,219 +346,7 @@ pub mod bgp {
             bgp_msg_buf
                 .extend_from_slice(&received_bgp_identifier.to_be_bytes());
 
-            if !eor_capable {
-                bgp_msg_buf.extend_from_slice(&0u8.to_be_bytes()); // 0 optional parameter bytes
-            } else {
-                // A peer capable of sending the special End-Of-Rib marker BGP
-                // UPDATE message advertises this ability using a BGP capability
-                // (RFC 5492) which is expressed as an optional parameter type 2
-                // with a capability code 64 (from RFC 4274).
-
-                // Optional Parameters:
-                //
-                // This field contains a list of optional parameters, in which
-                // each parameter is encoded as a <Parameter Type, Parameter
-                // Length, Parameter Value> triplet.
-                //
-                //  0                   1
-                //  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
-                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-...
-                // |  Parm. Type   | Parm. Length  |  Parameter Value (variable)
-                // +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-...
-                //
-                // Parameter Type is a one octet field that unambiguously
-                // identifies individual parameters.  Parameter Length is a one
-                // octet field that contains the length of the Parameter Value
-                // field in octets.  Parameter Value is a variable length field
-                // that is interpreted according to the value of the Parameter
-                // Type field.
-                //
-                // [RFC3392] defines the Capabilities Optional Parameter.
-                //
-                // From: https://datatracker.ietf.org/doc/html/rfc4271#section-4.2
-                // Note that RFC 3392 was obsoleted by RFC 5492
-                //
-                // Which leads us to...
-
-                // 4.  Capabilities Optional Parameter (Parameter Type 2):
-                //
-                // This is an Optional Parameter that is used by a BGP speaker to convey
-                // to its BGP peer the list of capabilities supported by the speaker.
-                // The encoding of BGP Optional Parameters is specified in Section 4.2
-                // of [RFC4271].  The parameter type of the Capabilities Optional
-                // Parameter is 2.
-                //
-                // The parameter contains one or more triples <Capability Code,
-                // Capability Length, Capability Value>, where each triple is encoded as
-                // shown below:
-                //
-                //        +------------------------------+
-                //        | Capability Code (1 octet)    |
-                //        +------------------------------+
-                //        | Capability Length (1 octet)  |
-                //        +------------------------------+
-                //        | Capability Value (variable)  |
-                //        ~                              ~
-                //        +------------------------------+
-                //
-                // The use and meaning of these fields are as follows:
-                //
-                //    Capability Code:
-                //
-                //       Capability Code is a one-octet unsigned binary integer that
-                //       unambiguously identifies individual capabilities.
-                //
-                //    Capability Length:
-                //
-                //       Capability Length is a one-octet unsigned binary integer that
-                //       contains the length of the Capability Value field in octets.
-                //
-                //    Capability Value:
-                //
-                //       Capability Value is a variable-length field that is interpreted
-                //       according to the value of the Capability Code field.
-                //
-                // From: https://datatracker.ietf.org/doc/html/rfc5492#section-4
-                //
-                // Which leads us further on to ...
-
-                // 3.  Graceful Restart Capability
-                //
-                // The Graceful Restart Capability is a new BGP capability [BGP-CAP]
-                // that can be used by a BGP speaker to indicate its ability to preserve
-                // its forwarding state during BGP restart.  It can also be used to
-                // convey to its peer its intention of generating the End-of-RIB marker
-                // upon the completion of its initial routing updates.
-                //
-                // This capability is defined as follows:
-                //
-                //    Capability code: 64
-                //
-                //    Capability length: variable
-                //
-                //    Capability value: Consists of the "Restart Flags" field, "Restart
-                //    Time" field, and 0 to 63 of the tuples <AFI, SAFI, Flags for
-                //    address family> as follows:
-                //
-                //       +--------------------------------------------------+
-                //       | Restart Flags (4 bits)                           |
-                //       +--------------------------------------------------+
-                //       | Restart Time in seconds (12 bits)                |
-                //       +--------------------------------------------------+
-                //       | Address Family Identifier (16 bits)              |
-                //       +--------------------------------------------------+
-                //       | Subsequent Address Family Identifier (8 bits)    |
-                //       +--------------------------------------------------+
-                //       | Flags for Address Family (8 bits)                |
-                //       +--------------------------------------------------+
-                //       | ...                                              |
-                //       +--------------------------------------------------+
-                //       | Address Family Identifier (16 bits)              |
-                //       +--------------------------------------------------+
-                //       | Subsequent Address Family Identifier (8 bits)    |
-                //       +--------------------------------------------------+
-                //       | Flags for Address Family (8 bits)                |
-                //       +--------------------------------------------------+
-                //
-                // The use and meaning of the fields are as follows:
-                //
-                //    Restart Flags:
-                //
-                //       This field contains bit flags related to restart.
-                //
-                //           0 1 2 3
-                //          +-+-+-+-+
-                //          |R|Resv.|
-                //          +-+-+-+-+
-                //
-                //       The most significant bit is defined as the Restart State (R)
-                //       bit, which can be used to avoid possible deadlock caused by
-                //       waiting for the End-of-RIB marker when multiple BGP speakers
-                //       peering with each other restart.  When set (value 1), this bit
-                //       indicates that the BGP speaker has restarted, and its peer MUST
-                //       NOT wait for the End-of-RIB marker from the speaker before
-                //       advertising routing information to the speaker.
-                //
-                //       The remaining bits are reserved and MUST be set to zero by the
-                //       sender and ignored by the receiver.
-                //
-                //    Restart Time:
-                //
-                //       This is the estimated time (in seconds) it will take for the
-                //       BGP session to be re-established after a restart.  This can be
-                //       used to speed up routing convergence by its peer in case that
-                //       the BGP speaker does not come back after a restart.
-                //
-                //    Address Family Identifier (AFI), Subsequent Address Family
-                //       Identifier (SAFI):
-                //
-                //       The AFI and SAFI, taken in combination, indicate that Graceful
-                //       Restart is supported for routes that are advertised with the
-                //       same AFI and SAFI.  Routes may be explicitly associated with a
-                //       particular AFI and SAFI using the encoding of [BGP-MP] or
-                //       implicitly associated with <AFI=IPv4, SAFI=Unicast> if using
-                //       the encoding of [BGP-4].
-                //
-                //    Flags for Address Family:
-                //
-                //       This field contains bit flags relating to routes that were
-                //       advertised with the given AFI and SAFI.
-                //
-                //           0 1 2 3 4 5 6 7
-                //          +-+-+-+-+-+-+-+-+
-                //          |F|   Reserved  |
-                //          +-+-+-+-+-+-+-+-+
-                //
-                //       The most significant bit is defined as the Forwarding State (F)
-                //       bit, which can be used to indicate whether the forwarding state
-                //       for routes that were advertised with the given AFI and SAFI has
-                //       indeed been preserved during the previous BGP restart.  When
-                //       set (value 1), the bit indicates that the forwarding state has
-                //       been preserved.
-                //
-                //       The remaining bits are reserved and MUST be set to zero by the
-                //       sender and ignored by the receiver.
-                // From: https://datatracker.ietf.org/doc/html/rfc4724#section-3
-
-                // BGP optional parameters: optp_len, optp_params
-                // Where:
-                //   optp_len = octet len of optp_params
-                //   optp_params = [(optpi_type, optpi_len, optpi_value), ...]
-                //     Where:
-                //       optpi_type = 2 (the RFC 5492 capabilities optional parameter code)
-                //       optpi_len = the octet len of optpi_vals
-                //       optpi_value = [(cap_code, cap_len, cap_val), ...]
-                //         Where there is a single tuple with:
-                //           cap_code = 64 (the RFC 4724 graceful restart capability code)
-                //           cap_len  = 2 (two bytes for 4-bit flags + 12-bit restart time)
-                //           cap_val  = 0 (0 4-bit flags + 0 12-bit restart time)
-                //       }
-                //   }
-
-                // innermost layer
-                let cap_code = 64u8;
-                let cap_len = 2u8;
-                let cap_val = 0u16;
-
-                // middle layer
-                let optpi_type = 2u8;
-                let mut optpi_value = Vec::<u8>::new();
-                optpi_value.push(cap_code);
-                optpi_value.push(cap_len);
-                optpi_value.extend_from_slice(&cap_val.to_be_bytes());
-                let optpi_len = u8::try_from(optpi_value.len()).unwrap();
-
-                // outer layer
-                let mut optp_params = Vec::<u8>::new();
-                optp_params.push(optpi_type);
-                optp_params.push(optpi_len);
-                optp_params.append(&mut optpi_value);
-                let optp_len = u8::try_from(optp_params.len()).unwrap();
-
-                // extend the BGP OPEN message with the optional parameters
-                bgp_msg_buf.extend_from_slice(&[optp_len]);
-                bgp_msg_buf.extend_from_slice(&optp_params);
-            }
+            push_open_capabilities(&mut bgp_msg_buf, eor_capable, extra_caps);
 
             // Finalize BGP message
             finalize_bgp_msg_len(&mut bgp_msg_buf);
@@ -1182,6 +1004,45 @@ pub mod bgp {
             let len_bytes: [u8; 2] = (buf.len() as u16).to_be_bytes();
             buf[16] = len_bytes[0];
             buf[17] = len_bytes[1];
+        }
+
+        /// Append the BGP OPEN "Optional Parameters Length" byte and, when
+        /// there is anything to advertise, a single RFC 5492 Capabilities
+        /// optional parameter (type 2) containing:
+        ///
+        ///  * the Graceful Restart capability (code 64, RFC 4724; zero
+        ///    restart flags/time) when `eor_capable`, and
+        ///  * every `(capability code, capability value)` triple from
+        ///    `extra_caps`, encoded as <code(1), len(1), value>.
+        fn push_open_capabilities(
+            bgp_msg_buf: &mut BytesMut,
+            eor_capable: bool,
+            extra_caps: &[(u8, Vec<u8>)],
+        ) {
+            let mut caps = Vec::<u8>::new();
+            if eor_capable {
+                caps.push(64u8); // Graceful Restart capability code
+                caps.push(2u8); // 4-bit flags + 12-bit restart time
+                caps.extend_from_slice(&0u16.to_be_bytes());
+            }
+            for (code, value) in extra_caps {
+                caps.push(*code);
+                caps.push(u8::try_from(value.len()).unwrap());
+                caps.extend_from_slice(value);
+            }
+
+            if caps.is_empty() {
+                bgp_msg_buf.extend_from_slice(&0u8.to_be_bytes()); // 0 optional parameter bytes
+            } else {
+                let optpi_len = u8::try_from(caps.len()).unwrap();
+                // one type-2 (Capabilities) optional parameter
+                bgp_msg_buf.extend_from_slice(&[
+                    optpi_len + 2, // Opt Parm Len
+                    2u8,           // Parameter Type: Capabilities
+                    optpi_len,     // Parameter Length
+                ]);
+                bgp_msg_buf.extend_from_slice(&caps);
+            }
         }
 
         fn push_bmp_common_header(buf: &mut BytesMut, msg_type: MessageType) {

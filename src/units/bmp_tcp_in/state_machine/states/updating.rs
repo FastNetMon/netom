@@ -266,6 +266,24 @@ impl PeerAware for Updating {
         self.peer_states.get_peer_ingress_id(pph)
     }
 
+    fn get_or_create_path_child(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: routecore::bgp::nlri::common::PathId,
+        register: &Arc<ingress::Register>,
+    ) -> Option<(ingress::IngressId, bool)> {
+        self.peer_states
+            .get_or_create_path_child(pph, path_id, register)
+    }
+
+    fn get_path_child(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: routecore::bgp::nlri::common::PathId,
+    ) -> Option<ingress::IngressId> {
+        self.peer_states.get_path_child(pph, path_id)
+    }
+
     fn update_peer_config(
         &mut self,
         pph: &PerPeerHeader<Bytes>,

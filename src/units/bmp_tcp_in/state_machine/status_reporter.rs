@@ -99,6 +99,23 @@ impl BmpStateMachineStatusReporter {
         metrics.parse_errors.push(err, bytes, false);
     }
 
+    pub fn addpath_path_child_minted(&self, router_id: Arc<RouterId>) {
+        self.metrics
+            .router_metrics(router_id)
+            .num_addpath_path_children_minted
+            .fetch_add(1, SeqCst);
+    }
+
+    pub fn addpath_unknown_path_id_withdrawal(
+        &self,
+        router_id: Arc<RouterId>,
+    ) {
+        self.metrics
+            .router_metrics(router_id)
+            .num_addpath_unknown_path_id_withdrawals
+            .fetch_add(1, SeqCst);
+    }
+
     pub fn pending_eors_update(
         &self,
         router_id: Arc<RouterId>,

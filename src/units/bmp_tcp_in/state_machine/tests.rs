@@ -307,6 +307,153 @@ fn route_monitoring_carries_raw_copy_for_fastpath() {
 }
 
 #[test]
+fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
+    use crate::ingress;
+    use crate::ingress::register::{IngressState, IngressType};
+
+    // A register shared with the state machine so entries can be asserted.
+    let register: Arc<ingress::Register> = Arc::default();
+    let processor = mk_test_processor_with_register(&register);
+
+    let initiation_msg_buf =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let pph = mk_per_peer_header("127.0.0.1", 12345);
+    let peer_up_msg_buf = mk_addpath_peer_up_notification_msg(&pph);
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation_msg_buf, None)
+        .next_state;
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+
+    // The session ingress carries the negotiated ADD-PATH families
+    // (cap-69 value bytes: AFI=1, SAFI=1, some direction).
+    let (session_id, session_info) = register
+        .cloned_info()
+        .into_iter()
+        .find(|(_, info)| {
+            info.ingress_type == Some(IngressType::BgpViaBmp)
+        })
+        .expect("PeerUp must register a session ingress");
+    let fams = session_info
+        .addpath_families
+        .expect("session must carry addpath_families");
+    assert_eq!(&fams[0..3], &[0, 1, 1], "AFI 1 / SAFI 1 expected");
+    assert!(matches!(fams[3], 1..=3), "valid ADD-PATH direction");
+
+    // Announcing one prefix twice with distinct path ids yields two
+    // payloads under two distinct path-child ingresses...
+    let announce = mk_addpath_v4_route_monitoring_msg(&pph, &[1, 2]);
+    let res = processor.process_msg(Instant::now(), announce, None);
+    let MessageType::RoutingUpdate { update, raw } = res.message_type
+    else {
+        panic!("expected RoutingUpdate");
+    };
+    // ...and no raw fastpath copy: ADD-PATH sessions are excluded from
+    // verbatim restreaming (the synthesized downstream PeerUp does not
+    // yet advertise cap 69).
+    assert!(raw.is_none(), "ADD-PATH session must not emit raw copies");
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert_eq!(payloads.len(), 2);
+    let child_ids: Vec<_> =
+        payloads.iter().map(|p| p.ingress_id).collect();
+    assert_ne!(child_ids[0], child_ids[1]);
+    for (payload, expected_pid) in payloads.iter().zip([1u32, 2u32]) {
+        assert_ne!(payload.ingress_id, session_id);
+        let info = register.get(payload.ingress_id).unwrap();
+        assert_eq!(info.ingress_type, Some(IngressType::BgpPath));
+        assert_eq!(info.parent_ingress, Some(session_id));
+        assert_eq!(info.path_id, Some(expected_pid));
+        assert_eq!(info.state, Some(IngressState::Connected));
+    }
+
+    // A withdrawal for an announced path id resolves to the same child.
+    let withdraw = mk_addpath_v4_withdrawal_msg(&pph, 1);
+    let res = res
+        .next_state
+        .process_msg(Instant::now(), withdraw, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type
+    else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].ingress_id, child_ids[0]);
+
+    // A withdrawal for a never-announced path id is dropped, not minted.
+    let bogus_withdraw = mk_addpath_v4_withdrawal_msg(&pph, 9);
+    let res = res
+        .next_state
+        .process_msg(Instant::now(), bogus_withdraw, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type
+    else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert!(payloads.is_empty(), "unknown path id must not withdraw");
+    assert!(register
+        .cloned_info()
+        .values()
+        .all(|info| info.path_id != Some(9)));
+
+    // PeerDown withdraws and disconnects the session AND all its
+    // path-children in one WithdrawBulk.
+    let peer_down_msg_buf = mk_peer_down_notification_msg(&pph);
+    let res = res
+        .next_state
+        .process_msg(Instant::now(), peer_down_msg_buf, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type
+    else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::WithdrawBulk(entries) = update else {
+        panic!("expected Update::WithdrawBulk, got {update:?}");
+    };
+    let withdrawn: Vec<_> = entries.iter().map(|(id, _)| *id).collect();
+    assert_eq!(entries.len(), 3);
+    assert!(withdrawn.contains(&session_id));
+    assert!(withdrawn.contains(&child_ids[0]));
+    assert!(withdrawn.contains(&child_ids[1]));
+    for id in &withdrawn {
+        assert_eq!(
+            register.get(*id).unwrap().state,
+            Some(IngressState::Disconnected)
+        );
+    }
+
+    // A reconnect that re-announces path id 1 rebinds the same child
+    // (claimed back from Disconnected), so its RIB records re-activate
+    // under the same mui instead of duplicating under a fresh one.
+    let peer_up_msg_buf = mk_addpath_peer_up_notification_msg(&pph);
+    let processor = res
+        .next_state
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+    let announce = mk_addpath_v4_route_monitoring_msg(&pph, &[1]);
+    let res = processor.process_msg(Instant::now(), announce, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type
+    else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert_eq!(payloads.len(), 1);
+    assert_eq!(payloads[0].ingress_id, child_ids[0]);
+    assert_eq!(
+        register.get(child_ids[0]).unwrap().state,
+        Some(IngressState::Connected)
+    );
+}
+
+#[test]
 fn end_of_rib_route_monitoring_also_carries_raw_copy() {
     // Live EoR markers (Updating state) produce no parsed payloads, but
     // eligible sessions must emit a raw copy for EVERY parsed message —
@@ -2004,6 +2151,112 @@ fn mk_test_processor() -> BmpState {
         bmp_state_machine_metrics,
         Arc::default(),
     )
+}
+
+fn mk_test_processor_with_register(
+    register: &Arc<crate::ingress::Register>,
+) -> BmpState {
+    let gate = crate::comms::Gate::default();
+    let bmp_tcp_in_metrics = Arc::new(BmpTcpInMetrics::new(&gate));
+    let bmp_state_machine_metrics = Arc::new(BmpStateMachineMetrics::new());
+    let status_reporter =
+        Arc::new(BmpTcpInStatusReporter::new("mock", bmp_tcp_in_metrics));
+
+    let ingress_id = register.register();
+
+    BmpState::new(
+        ingress_id,
+        Arc::new(ingress_id.to_string()),
+        status_reporter,
+        bmp_state_machine_metrics,
+        register.clone(),
+    )
+}
+
+/// A PeerUp advertising the ADD-PATH capability (code 69) for IPv4 Unicast,
+/// SendReceive, in **both** embedded OPENs, so the derived session config
+/// (the intersection of the two) parses this peer's UPDATEs with path ids.
+fn mk_addpath_peer_up_notification_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+) -> BmpMsg<Bytes> {
+    let addpath_cap = (69u8, vec![0u8, 1, 1, 3]); // AFI 1, SAFI 1, SendReceive
+    let bytes =
+        crate::bgp::encode::mk_peer_up_notification_msg_with_capabilities(
+            pph,
+            "10.0.0.1".parse().unwrap(),
+            11019,
+            4567,
+            111,
+            222,
+            0,
+            0,
+            vec![],
+            false,
+            &[addpath_cap],
+        );
+    BmpMsg::from_octets(bytes).unwrap()
+}
+
+/// SessionConfig matching [`mk_addpath_peer_up_notification_msg`], for
+/// building UPDATEs with routecore's encoder.
+fn mk_addpath_session_config() -> routecore::bgp::message::SessionConfig {
+    use routecore::bgp::types::AfiSafiType;
+
+    let mut sc = routecore::bgp::message::SessionConfig::modern();
+    sc.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+    sc
+}
+
+/// RouteMonitoring announcing `10.0.0.0/24` once per given path id.
+fn mk_addpath_v4_route_monitoring_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+    path_ids: &[u32],
+) -> BmpMsg<Bytes> {
+    use routecore::bgp::message::update_builder::UpdateBuilder;
+    use routecore::bgp::nlri::afisafi::Ipv4UnicastNlri;
+    use routecore::bgp::nlri::common::PathId;
+
+    let mut builder = UpdateBuilder::new_vec();
+    for pid in path_ids {
+        builder
+            .add_announcement(
+                Ipv4UnicastNlri::from_str("10.0.0.0/24")
+                    .unwrap()
+                    .into_addpath(PathId(*pid)),
+            )
+            .unwrap();
+    }
+    let upd = builder.into_message(&mk_addpath_session_config()).unwrap();
+    let bgp_msg_buf = Bytes::copy_from_slice(upd.as_ref());
+    BmpMsg::from_octets(crate::bgp::encode::mk_raw_route_monitoring_msg(
+        pph,
+        bgp_msg_buf,
+    ))
+    .unwrap()
+}
+
+/// RouteMonitoring withdrawing `10.0.0.0/24` for one path id.
+fn mk_addpath_v4_withdrawal_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+    path_id: u32,
+) -> BmpMsg<Bytes> {
+    use routecore::bgp::message::update_builder::UpdateBuilder;
+    use routecore::bgp::nlri::afisafi::Ipv4UnicastNlri;
+    use routecore::bgp::nlri::common::PathId;
+
+    let mut builder = UpdateBuilder::new_vec();
+    builder
+        .append_withdrawals(vec![Ipv4UnicastNlri::from_str("10.0.0.0/24")
+            .unwrap()
+            .into_addpath(PathId(path_id))])
+        .unwrap();
+    let upd = builder.into_message(&mk_addpath_session_config()).unwrap();
+    let bgp_msg_buf = Bytes::copy_from_slice(upd.as_ref());
+    BmpMsg::from_octets(crate::bgp::encode::mk_raw_route_monitoring_msg(
+        pph,
+        bgp_msg_buf,
+    ))
+    .unwrap()
 }
 
 fn mk_initiation_msg(sys_name: &str, sys_descr: &str) -> BmpMsg<Bytes> {

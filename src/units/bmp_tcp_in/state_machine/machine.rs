@@ -33,6 +33,7 @@ use routecore::bmp::message::InformationTlvIter;
 use routecore::{
     bgp::nlri::afisafi::IsPrefix,
     bgp::nlri::afisafi::Nlri,
+    bgp::nlri::common::PathId,
     bgp::{
         message::{
             open::{Capabilities, CapabilityType},
@@ -193,6 +194,14 @@ pub struct PeerState {
     /// original peer, otherwise their ingress and any routes stored
     /// under it leak.
     pub synthesized: bool,
+
+    /// ADD-PATH (RFC 7911) path-children of this peer: one child
+    /// `IngressId` per distinct path id seen announced on this session,
+    /// lazily minted (`IngressType::BgpPath`, `parent_ingress` = this
+    /// peer's `ingress_id`). The RIB stores each path's route under the
+    /// child mui, keeping (prefix, mui) unique per path. Teardown must
+    /// disconnect and withdraw these together with the peer itself.
+    pub path_children: HashMap<PathId, ingress::IngressId>,
 }
 
 impl std::fmt::Debug for PeerState {
@@ -553,6 +562,25 @@ pub trait PeerAware {
         _pph: &PerPeerHeader<Bytes>,
     ) -> Option<ingress::IngressId>;
 
+    /// Resolve — lazily minting if needed — the ADD-PATH path-child ingress
+    /// for `(peer, path_id)`. Returns the child id and whether a fresh
+    /// register entry was minted (`false` on a map hit or a reclaimed
+    /// Disconnected child). `None` when the peer itself is unknown.
+    fn get_or_create_path_child(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: PathId,
+        register: &Arc<ingress::Register>,
+    ) -> Option<(ingress::IngressId, bool)>;
+
+    /// Look up the existing path-child for `(peer, path_id)`. Never mints:
+    /// a withdrawal for a never-announced path id has nothing to withdraw.
+    fn get_path_child(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: PathId,
+    ) -> Option<ingress::IngressId>;
+
     fn is_peer_eor_capable(&self, pph: &PerPeerHeader<Bytes>)
         -> Option<bool>;
 
@@ -719,30 +747,34 @@ where
             // (bmp-out) because the register entry still exists for lookup.
             // Flipping to Disconnected also makes filters (e.g. the bmp-out
             // dump) skip peers that currently have no active routes.
-            let entry_for = |peer: &PeerState,
-                             register: &Arc<ingress::Register>|
-             -> (
-                ingress::IngressId,
-                Option<ingress::IngressInfo>,
-            ) {
-                register.update_info(
-                    peer.ingress_id,
-                    ingress::IngressInfo::new().with_state(
-                        ingress::register::IngressState::Disconnected,
-                    ),
-                );
-                (peer.ingress_id, None)
-            };
-
+            // A peer comes down together with all its ADD-PATH
+            // path-children: each child holds RIB records under its own
+            // mui, so every child must be flipped Disconnected and appear
+            // in the withdraw set or its routes stay visible forever.
             let entries: Vec<(
                 ingress::IngressId,
                 Option<ingress::IngressInfo>,
             )> = removed_peers
                 .iter()
-                .map(|s| entry_for(s, &self.ingress_register))
+                .flat_map(|peer| {
+                    std::iter::once(peer.ingress_id)
+                        .chain(peer.path_children.values().copied())
+                })
+                .map(|ingress_id| {
+                    self.ingress_register.update_info(
+                        ingress_id,
+                        ingress::IngressInfo::new().with_state(
+                            ingress::register::IngressState::Disconnected,
+                        ),
+                    );
+                    (ingress_id, None)
+                })
                 .collect();
 
-            if removed_peers.len() == 1 && !removed_peers[0].synthesized {
+            if removed_peers.len() == 1
+                && !removed_peers[0].synthesized
+                && removed_peers[0].path_children.is_empty()
+            {
                 self.mk_routing_update_result(Update::Withdraw(
                     removed_peers[0].ingress_id,
                     None,
@@ -1276,21 +1308,10 @@ where
         _trace_id: Option<u8>,
     ) -> Result<(SmallVec<[Payload; 8]>, UpdateReportMessage), session::Error>
     {
-        // TODO(addpath): resolve per-(session, path_id) child ingresses for
-        // the Some(path_id) entries instead of dropping them; until then this
-        // preserves the previous behavior of not storing ADD-PATH routes.
-        let rr_reach: Vec<_> = explode_announcements(bgp_msg)?
-            .into_iter()
-            .filter(|(_, pid)| pid.is_none())
-            .map(|(rr, _)| rr)
-            .collect();
-        let rr_unreach: Vec<_> = explode_withdrawals(bgp_msg)?
-            .into_iter()
-            .filter(|(_, pid)| pid.is_none())
-            .map(|(rr, _)| rr)
-            .collect();
+        let rr_reach = explode_announcements(bgp_msg)?;
+        let rr_unreach = explode_withdrawals(bgp_msg)?;
 
-        let ingress_id = if let Some(ingress_id) =
+        let session_ingress_id = if let Some(ingress_id) =
             self.details.get_peer_ingress_id(&pph)
         {
             ingress_id
@@ -1299,42 +1320,79 @@ where
             return Err(session::Error::for_str("missing ingress_id"));
         };
 
-        let mut payloads = SmallVec::new();
+        let mut payloads: SmallVec<[Payload; 8]> = SmallVec::new();
         let mut update_report_msg =
             UpdateReportMessage::new(self.router_id.clone());
 
         if !rr_reach.is_empty() {
-            //update_report_msg.inc_valid_announcements();
             update_report_msg.n_new_prefixes = rr_reach.len();
         }
-        //if rr_unreach.len() > 0 {
-        //    update_report_msg.inc_valid_withdrawals();
-        //}
 
-        payloads.extend(
-            //rws.into_iter().map(|rws| mk_payload(rws, received, context.clone()))
-            rr_reach.into_iter().map(|rr| {
-                update_report_msg.inc_valid_announcements();
-                Payload::with_received(
-                    rr,
-                    None,
-                    received,
-                    ingress_id,
-                    RouteStatus::Active,
-                )
-            }),
-        );
+        for (rr, path_id) in rr_reach {
+            // Plain NLRI store under the session's mui; ADD-PATH NLRI under
+            // the per-(session, path_id) child mui so several paths for one
+            // prefix from one peer coexist in the RIB.
+            let ingress_id = match path_id {
+                None => session_ingress_id,
+                Some(path_id) => match self.details.get_or_create_path_child(
+                    &pph,
+                    path_id,
+                    &self.ingress_register,
+                ) {
+                    Some((child_id, minted)) => {
+                        if minted {
+                            self.status_reporter
+                                .addpath_path_child_minted(
+                                    self.router_id.clone(),
+                                );
+                        }
+                        child_id
+                    }
+                    // Unreachable in practice: the session resolved above,
+                    // and get_or_create only fails on an unknown peer.
+                    None => session_ingress_id,
+                },
+            };
+            update_report_msg.inc_valid_announcements();
+            payloads.push(Payload::with_received(
+                rr,
+                None,
+                received,
+                ingress_id,
+                RouteStatus::Active,
+            ));
+        }
 
-        payloads.extend(rr_unreach.into_iter().map(|rr| {
+        for (rr, path_id) in rr_unreach {
+            let ingress_id = match path_id {
+                None => session_ingress_id,
+                Some(path_id) => {
+                    match self.details.get_path_child(&pph, path_id) {
+                        Some(child_id) => child_id,
+                        None => {
+                            // Withdrawal for a path id this session never
+                            // announced: nothing is stored under any mui
+                            // for it, and minting a child from a
+                            // withdrawal would leak an empty ingress.
+                            self.status_reporter
+                                .addpath_unknown_path_id_withdrawal(
+                                    self.router_id.clone(),
+                                );
+                            update_report_msg.inc_invalid_withdrawals();
+                            continue;
+                        }
+                    }
+                }
+            };
             update_report_msg.inc_valid_withdrawals();
-            Payload::with_received(
+            payloads.push(Payload::with_received(
                 rr,
                 None,
                 received,
                 ingress_id,
                 RouteStatus::Withdrawn,
-            )
-        }));
+            ));
+        }
 
         Ok((payloads, update_report_msg))
 
@@ -1688,6 +1746,22 @@ impl UndecodedCapThrottle {
     }
 }
 
+/// Encode the ADD-PATH families a session actually parses with path ids as
+/// BGP capability-69 *value* bytes: per family AFI (u16 BE) + SAFI (u8) +
+/// direction (u8). Empty when the session has no ADD-PATH family. Stored on
+/// the session's ingress entry (`addpath_families`) so bmp-out can advertise
+/// a matching capability downstream.
+fn encode_addpath_families(session_config: &SessionConfig) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (fam, dir) in session_config.enabled_addpaths() {
+        let (afi, safi): (u16, u8) = fam.into();
+        out.extend_from_slice(&afi.to_be_bytes());
+        out.push(safi);
+        out.push(u8::from(dir));
+    }
+    out
+}
+
 #[derive(Debug, Default)]
 pub struct PeerStates(
     HashMap<PerPeerHeader<Bytes>, PeerState>,
@@ -1720,14 +1794,20 @@ impl PeerStates {
     ) -> Vec<(ingress::IngressId, Option<ingress::IngressInfo>)> {
         self.0
             .values()
-            .map(|peer| {
+            .flat_map(|peer| {
+                // ADD-PATH path-children hold RIB records under their own
+                // muis; they disconnect and withdraw together with the peer.
+                std::iter::once(peer.ingress_id)
+                    .chain(peer.path_children.values().copied())
+            })
+            .map(|ingress_id| {
                 register.update_info(
-                    peer.ingress_id,
+                    ingress_id,
                     ingress::IngressInfo::new().with_state(
                         ingress::register::IngressState::Disconnected,
                     ),
                 );
-                (peer.ingress_id, None)
+                (ingress_id, None)
             })
             .collect()
     }
@@ -1870,7 +1950,13 @@ impl PeerAware for PeerStates {
             .with_peer_rib_type((pph.is_post_policy(), pph.rib_type()))
             .with_peer_type(pph.peer_type())
             .with_local_capabilities(local_capabilities)
-            .with_remote_capabilities(remote_capabilities);
+            .with_remote_capabilities(remote_capabilities)
+            // The negotiated ADD-PATH families (cap-69 value bytes), from
+            // the SessionConfig that will actually parse this peer's
+            // UPDATEs — not from one side's OPEN. Always set, so a rebind
+            // of a formerly-ADD-PATH session that renegotiated without it
+            // overwrites the stale families with an empty list.
+            .with_addpath_families(encode_addpath_families(&session_config));
         use routecore::bmp::message::PeerType;
         match pph.peer_type() {
             PeerType::GlobalInstance => { /* no Peer Distinguisher to set */ }
@@ -1941,6 +2027,7 @@ impl PeerAware for PeerStates {
                 },
                 ingress_id: peer_ingress_id,
                 synthesized: false,
+                path_children: HashMap::new(),
             }
         });
         (added, existing_peer_ingress_id)
@@ -1955,6 +2042,54 @@ impl PeerAware for PeerStates {
         pph: &PerPeerHeader<Bytes>,
     ) -> Option<ingress::IngressId> {
         self.0.get(pph).map(|e| e.ingress_id)
+    }
+
+    fn get_or_create_path_child(
+        &mut self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: PathId,
+        register: &Arc<ingress::Register>,
+    ) -> Option<(ingress::IngressId, bool)> {
+        let peer_state = self.0.get_mut(pph)?;
+        if let Some(id) = peer_state.path_children.get(&path_id) {
+            return Some((*id, false));
+        }
+
+        let session_id = peer_state.ingress_id;
+        // Prefer rebinding the Disconnected child a previous flap of this
+        // session left behind: its RIB records are re-activated on the
+        // next Active insert instead of duplicated under a fresh mui.
+        let (child_id, minted) = match register
+            .find_existing_path_child_and_claim(session_id, path_id.0)
+        {
+            Some(id) => (id, false),
+            None => (register.register(), true),
+        };
+        // Always (re-)apply the child info: creates the entry on a fresh
+        // mint, refreshes the display fields on a claim (update_info
+        // merges Some-fields only).
+        register.update_info(
+            child_id,
+            ingress::IngressInfo::new()
+                .with_ingress_type(ingress::IngressType::BgpPath)
+                .with_parent_ingress(session_id)
+                .with_path_id(path_id.0)
+                .with_state(ingress::register::IngressState::Connected)
+                .with_remote_addr(pph.address())
+                .with_remote_asn(pph.asn()),
+        );
+        peer_state.path_children.insert(path_id, child_id);
+        Some((child_id, minted))
+    }
+
+    fn get_path_child(
+        &self,
+        pph: &PerPeerHeader<Bytes>,
+        path_id: PathId,
+    ) -> Option<ingress::IngressId> {
+        self.0
+            .get(pph)
+            .and_then(|ps| ps.path_children.get(&path_id).copied())
     }
 
     fn update_peer_config(
@@ -2009,6 +2144,10 @@ impl PeerAware for PeerStates {
         let mut peer_state = self.0.get(source_pph).unwrap().clone();
         peer_state.ingress_id = ingress_id;
         peer_state.synthesized = true;
+        // Path-children belong to the source peer's ingress (they carry
+        // parent_ingress = source mui); the synthesized sibling mints its
+        // own under its own mui on first sight.
+        peer_state.path_children = HashMap::new();
         if let Some(_existing) = self.0.insert(dst_pph.clone(), peer_state) {
             warn!("Unexpected existing PeerState while trying to add_cloned_peer_config");
             false
