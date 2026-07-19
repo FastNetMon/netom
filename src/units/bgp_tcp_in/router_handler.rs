@@ -972,7 +972,6 @@ pub async fn handle_connection(
     );
 
     let cmds_tx2 = cmds_tx.clone();
-    let sess_tx2 = sess_tx.clone();
 
     let mut session = Session::new(
         candidate_config,
@@ -1017,7 +1016,6 @@ pub async fn handle_connection(
         let _ = cmds_tx2
             .send(Command::Disconnect(DisconnectReason::Other))
             .await;
-        let _ = sess_tx2.send(Message::ConnectionLost(None)).await;
         debug!("pre tcp_out.forget()");
         tcp_out.forget();
         debug!("post tcp_out.forget()");
