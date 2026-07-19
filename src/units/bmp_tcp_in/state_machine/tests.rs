@@ -458,6 +458,110 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
 }
 
 #[test]
+fn asymmetric_addpath_send_parses_adj_rib_out_path_ids() {
+    use crate::ingress;
+    use crate::ingress::register::IngressType;
+
+    let register: Arc<ingress::Register> = Arc::default();
+    let processor = mk_test_processor_with_register(&register);
+    let initiation =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+
+    // The monitored router negotiated Send-only ADD-PATH. Its Adj-RIB-Out
+    // UPDATEs therefore carry path IDs even though routecore's router-
+    // perspective SessionConfig has rx_addpath=false.
+    let mut pph = mk_per_peer_header("127.0.0.1", 12345);
+    pph.peer_flags = 0x10; // O flag: Adj-RIB-Out
+    let peer_up = mk_directional_addpath_peer_up_notification_msg(
+        &pph, 2, // sent OPEN: Send
+        1, // received OPEN: Receive
+    );
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation, None)
+        .next_state
+        .process_msg(Instant::now(), peer_up, None)
+        .next_state;
+
+    let (session_id, session_info) = register
+        .cloned_info()
+        .into_iter()
+        .find(|(_, info)| {
+            info.ingress_type == Some(IngressType::BgpViaBmp)
+        })
+        .expect("PeerUp must register a session ingress");
+    assert_eq!(
+        session_info.addpath_families,
+        Some(vec![0, 1, 1, 1]),
+        "Adj-RIB-Out Send must become the parser's Receive direction"
+    );
+
+    let announce = mk_addpath_v4_route_monitoring_msg(&pph, &[42]);
+    let res = processor.process_msg(Instant::now(), announce, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert_eq!(payloads.len(), 1);
+    assert_ne!(payloads[0].ingress_id, session_id);
+    let child = register.get(payloads[0].ingress_id).unwrap();
+    assert_eq!(child.ingress_type, Some(IngressType::BgpPath));
+    assert_eq!(child.path_id, Some(42));
+}
+
+#[test]
+fn asymmetric_addpath_send_does_not_advertise_ids_for_adj_rib_in() {
+    use crate::ingress;
+    use crate::ingress::register::IngressType;
+
+    let register: Arc<ingress::Register> = Arc::default();
+    let processor = mk_test_processor_with_register(&register);
+    let initiation =
+        mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC);
+    let pph = mk_per_peer_header("127.0.0.1", 12345);
+    let peer_up = mk_directional_addpath_peer_up_notification_msg(
+        &pph, 2, // monitored router Send
+        1, // remote peer Receive
+    );
+
+    let processor = processor
+        .process_msg(Instant::now(), initiation, None)
+        .next_state
+        .process_msg(Instant::now(), peer_up, None)
+        .next_state;
+
+    let (session_id, session_info) = register
+        .cloned_info()
+        .into_iter()
+        .find(|(_, info)| {
+            info.ingress_type == Some(IngressType::BgpViaBmp)
+        })
+        .expect("PeerUp must register a session ingress");
+    assert_eq!(session_info.addpath_families, Some(vec![]));
+
+    // Adj-RIB-In came from the remote Receive-only peer and is plain NLRI.
+    let res = processor.process_msg(
+        Instant::now(),
+        mk_route_monitoring_msg(&pph),
+        None,
+    );
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
+        panic!("expected RoutingUpdate");
+    };
+    let Update::Bulk(payloads) = update else {
+        panic!("expected Update::Bulk");
+    };
+    assert!(!payloads.is_empty());
+    assert!(payloads.iter().all(|p| p.ingress_id == session_id));
+    assert!(register
+        .cloned_info()
+        .values()
+        .all(|info| info.ingress_type != Some(IngressType::BgpPath)));
+}
+
+#[test]
 fn end_of_rib_route_monitoring_also_carries_raw_copy() {
     // Live EoR markers (Updating state) produce no parsed payloads, but
     // eligible sessions must emit a raw copy for EVERY parsed message —
@@ -2198,6 +2302,32 @@ fn mk_addpath_peer_up_notification_msg(
             false,
             &[addpath_cap],
         );
+    BmpMsg::from_octets(bytes).unwrap()
+}
+
+/// PeerUp with independently directional ADD-PATH capabilities in the sent
+/// (monitored router) and received (remote peer) OPENs.
+fn mk_directional_addpath_peer_up_notification_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+    sent_direction: u8,
+    received_direction: u8,
+) -> BmpMsg<Bytes> {
+    let sent = [(69u8, vec![0u8, 1, 1, sent_direction])];
+    let received = [(69u8, vec![0u8, 1, 1, received_direction])];
+    let bytes = crate::bgp::encode::mk_peer_up_notification_msg_with_asymmetric_capabilities(
+        pph,
+        "10.0.0.1".parse().unwrap(),
+        11019,
+        4567,
+        111,
+        222,
+        0,
+        0,
+        vec![],
+        false,
+        &sent,
+        &received,
+    );
     BmpMsg::from_octets(bytes).unwrap()
 }
 

@@ -230,7 +230,6 @@ pub mod bgp {
         /// the intersection of the two OPENs (e.g. ADD-PATH, RFC 7911 cap
         /// 69), so a capability meant to be "negotiated" must appear in both.
         #[allow(clippy::too_many_arguments)]
-        #[allow(clippy::vec_init_then_push)]
         pub fn mk_peer_up_notification_msg_with_capabilities(
             per_peer_header: &PerPeerHeader,
             local_address: IpAddr,
@@ -243,6 +242,41 @@ pub mod bgp {
             information_tlvs: Vec<(InformationTlvType, String)>,
             eor_capable: bool,
             extra_caps: &[(u8, Vec<u8>)],
+        ) -> Bytes {
+            mk_peer_up_notification_msg_with_asymmetric_capabilities(
+                per_peer_header,
+                local_address,
+                local_port,
+                remote_port,
+                sent_open_asn,
+                received_open_asn,
+                sent_bgp_identifier,
+                received_bgp_identifier,
+                information_tlvs,
+                eor_capable,
+                extra_caps,
+                extra_caps,
+            )
+        }
+
+        /// Build a Peer Up whose sent and received OPENs advertise different
+        /// capability values. This is needed for directional capabilities
+        /// such as ADD-PATH Send/Receive.
+        #[allow(clippy::too_many_arguments)]
+        #[allow(clippy::vec_init_then_push)]
+        pub fn mk_peer_up_notification_msg_with_asymmetric_capabilities(
+            per_peer_header: &PerPeerHeader,
+            local_address: IpAddr,
+            local_port: u16,
+            remote_port: u16,
+            sent_open_asn: u16,
+            received_open_asn: u16,
+            sent_bgp_identifier: u32,
+            received_bgp_identifier: u32,
+            information_tlvs: Vec<(InformationTlvType, String)>,
+            eor_capable: bool,
+            sent_extra_caps: &[(u8, Vec<u8>)],
+            received_extra_caps: &[(u8, Vec<u8>)],
         ) -> Bytes {
             let mut buf = BytesMut::new();
             push_bmp_common_header(&mut buf, MessageType::PeerUpNotification);
@@ -326,7 +360,7 @@ pub mod bgp {
             bgp_msg_buf.extend_from_slice(&sent_open_asn.to_be_bytes());
             bgp_msg_buf.extend_from_slice(&0u16.to_be_bytes()); // 0 hold time - disables keep alive
             bgp_msg_buf.extend_from_slice(&sent_bgp_identifier.to_be_bytes());
-            push_open_capabilities(&mut bgp_msg_buf, false, extra_caps);
+            push_open_capabilities(&mut bgp_msg_buf, false, sent_extra_caps);
 
             // Finalize BGP message
             finalize_bgp_msg_len(&mut bgp_msg_buf);
@@ -346,7 +380,11 @@ pub mod bgp {
             bgp_msg_buf
                 .extend_from_slice(&received_bgp_identifier.to_be_bytes());
 
-            push_open_capabilities(&mut bgp_msg_buf, eor_capable, extra_caps);
+            push_open_capabilities(
+                &mut bgp_msg_buf,
+                eor_capable,
+                received_extra_caps,
+            );
 
             // Finalize BGP message
             finalize_bgp_msg_len(&mut bgp_msg_buf);

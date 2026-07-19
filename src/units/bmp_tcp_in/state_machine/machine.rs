@@ -69,7 +69,8 @@ use crate::ingress::IngressId;
 use crate::{
     common::{
         routecore_extra::{
-            encode_addpath_families, generate_alternate_config,
+            encode_addpath_families_for_bmp_rib, generate_alternate_config,
+            session_config_for_bmp_rib,
         },
         status_reporter::AnyStatusReporter,
     },
@@ -965,6 +966,13 @@ where
                     adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
+                    adapted_ingress_info.addpath_families =
+                        Some(encode_addpath_families_for_bmp_rib(
+                            self.details
+                                .get_peer_config(&pph_nulled_flags)
+                                .expect("source peer config must exist"),
+                            pph.rib_type(),
+                        ));
                     adapted_ingress_info.state =
                         Some(ingress::register::IngressState::Connected);
                     // Layer D reuse: if this synthesized (peer, policy) was
@@ -1032,6 +1040,13 @@ where
                     adapted_ingress_info.rib_type = Some(pph.rib_type());
                     adapted_ingress_info.peer_rib_type =
                         Some((pph.is_post_policy(), pph.rib_type()).into());
+                    adapted_ingress_info.addpath_families =
+                        Some(encode_addpath_families_for_bmp_rib(
+                            self.details
+                                .get_peer_config(&sibling_pph)
+                                .expect("sibling peer config must exist"),
+                            pph.rib_type(),
+                        ));
                     adapted_ingress_info.state =
                         Some(ingress::register::IngressState::Connected);
                     // Layer D reuse (see the nulled-flags arm above).
@@ -1112,7 +1127,11 @@ where
             }
         };
 
-        let mut peer_config = peer_config.clone();
+        // PeerState keeps the negotiated configuration from the monitored
+        // router's perspective. Route Monitoring Adj-RIB-Out carries UPDATEs
+        // sent by that router, so invert ADD-PATH Send/Receive for parsing.
+        let mut peer_config =
+            session_config_for_bmp_rib(peer_config, pph.rib_type());
 
         let mut retry_due_to_err: Option<String> = None;
         loop {
@@ -1126,8 +1145,17 @@ where
                         );
 
                         // use this config from now on
-                        self.details
-                            .update_peer_config(&pph, peer_config.clone());
+                        // Store the corrected config back in the monitored
+                        // router's perspective. The direction transform is an
+                        // involution, which also keeps a future ADD-PATH-aware
+                        // alternate-config retry coherent.
+                        self.details.update_peer_config(
+                            &pph,
+                            session_config_for_bmp_rib(
+                                &peer_config,
+                                pph.rib_type(),
+                            ),
+                        );
                     }
 
                     let mut saved_self =
@@ -1939,7 +1967,10 @@ impl PeerAware for PeerStates {
             // UPDATEs — not from one side's OPEN. Always set, so a rebind
             // of a formerly-ADD-PATH session that renegotiated without it
             // overwrites the stale families with an empty list.
-            .with_addpath_families(encode_addpath_families(&session_config));
+            .with_addpath_families(encode_addpath_families_for_bmp_rib(
+                &session_config,
+                pph.rib_type(),
+            ));
         use routecore::bmp::message::PeerType;
         match pph.peer_type() {
             PeerType::GlobalInstance => { /* no Peer Distinguisher to set */ }

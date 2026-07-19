@@ -24,7 +24,13 @@ use roto::types::builtin::SourceId;
 use crate::payload::Payload;
 */
 
-use routecore::bgp::message::{update::FourOctetAsns, SessionConfig};
+use routecore::{
+    bgp::{
+        message::{update::FourOctetAsns, SessionConfig},
+        types::AddpathDirection,
+    },
+    bmp::message::RibType,
+};
 
 /// Encode the ADD-PATH families a session actually parses with path ids as
 /// BGP capability-69 *value* bytes: per family AFI (u16 BE) + SAFI (u8) +
@@ -33,13 +39,56 @@ use routecore::bgp::message::{update::FourOctetAsns, SessionConfig};
 /// a matching capability downstream.
 pub fn encode_addpath_families(session_config: &SessionConfig) -> Vec<u8> {
     let mut out = Vec::new();
-    for (fam, dir) in session_config.enabled_addpaths() {
+    for (fam, dir) in session_config
+        .enabled_addpaths()
+        .filter(|(fam, _)| session_config.rx_addpath(*fam))
+    {
         let (afi, safi): (u16, u8) = fam.into();
         out.extend_from_slice(&afi.to_be_bytes());
         out.push(safi);
         out.push(u8::from(dir));
     }
     out
+}
+
+/// Return the BGP parsing configuration for a BMP Route Monitoring stream.
+///
+/// [`SessionConfig`] expresses ADD-PATH direction from the monitored router's
+/// perspective. That is already the parser's receive direction for
+/// Adj-RIB-In. Adj-RIB-Out contains UPDATEs sent by the monitored router, so
+/// Send and Receive must be swapped before routecore parses the NLRI.
+pub fn session_config_for_bmp_rib(
+    session_config: &SessionConfig,
+    rib_type: RibType,
+) -> SessionConfig {
+    let mut config = session_config.clone();
+    if rib_type != RibType::AdjRibOut {
+        return config;
+    }
+
+    let addpaths: Vec<_> = config.enabled_addpaths().collect();
+    config.clear_addpaths();
+    for (fam, dir) in addpaths {
+        let dir = match dir {
+            AddpathDirection::Receive => AddpathDirection::Send,
+            AddpathDirection::Send => AddpathDirection::Receive,
+            AddpathDirection::SendReceive => AddpathDirection::SendReceive,
+        };
+        config.add_addpath(fam, dir);
+    }
+    config
+}
+
+/// Encode only the ADD-PATH families carried with path IDs in the selected
+/// BMP RIB stream.
+pub fn encode_addpath_families_for_bmp_rib(
+    session_config: &SessionConfig,
+    rib_type: RibType,
+) -> Vec<u8> {
+    encode_addpath_families(&session_config_for_bmp_rib(
+        session_config,
+        rib_type,
+    ))
 }
 
 // Originally based on code in bgmp::main.rs.
@@ -59,6 +108,50 @@ pub fn generate_alternate_config(
     //    alt_peer_config.inverse_addpath(AfiSafi::Ipv4Unicast);
 
     Some(alt_peer_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use routecore::bgp::types::AfiSafiType;
+
+    #[test]
+    fn addpath_capability_only_describes_received_path_ids() {
+        let mut config = SessionConfig::modern();
+        config.add_addpath(AfiSafiType::Ipv4Unicast, AddpathDirection::Send);
+        config
+            .add_addpath(AfiSafiType::Ipv6Unicast, AddpathDirection::Receive);
+
+        assert_eq!(
+            encode_addpath_families(&config),
+            vec![0, 2, 1, u8::from(AddpathDirection::Receive)]
+        );
+    }
+
+    #[test]
+    fn adj_rib_out_swaps_addpath_send_and_receive() {
+        let mut config = SessionConfig::modern();
+        config.add_addpath(AfiSafiType::Ipv4Unicast, AddpathDirection::Send);
+        config
+            .add_addpath(AfiSafiType::Ipv6Unicast, AddpathDirection::Receive);
+        config.add_addpath(
+            AfiSafiType::Ipv4FlowSpec,
+            AddpathDirection::SendReceive,
+        );
+
+        let outbound =
+            session_config_for_bmp_rib(&config, RibType::AdjRibOut);
+        assert!(outbound.rx_addpath(AfiSafiType::Ipv4Unicast));
+        assert!(!outbound.rx_addpath(AfiSafiType::Ipv6Unicast));
+        assert!(outbound.rx_addpath(AfiSafiType::Ipv4FlowSpec));
+
+        // Applying the transform twice restores the router-perspective
+        // configuration used in PeerState.
+        assert_eq!(
+            session_config_for_bmp_rib(&outbound, RibType::AdjRibOut),
+            config
+        );
+    }
 }
 
 /*
