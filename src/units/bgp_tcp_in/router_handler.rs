@@ -15,6 +15,7 @@ use rotonda_store::prefix_record::RouteStatus;
 use routecore::bgp::message::{
     Message as BgpMsg, SessionConfig, UpdateMessage,
 };
+use routecore::bgp::message::update::UpdateTreatment;
 use smallvec::{smallvec, SmallVec};
 use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
@@ -54,6 +55,16 @@ use crate::{ingress, roto_runtime};
 use super::peer_config::{CombinedConfig, ConfigExt};
 use super::unit::BgpTcpIn;
 use super::unit::RotoFunc;
+
+fn apply_update_treatment<T>(
+    treatment: UpdateTreatment,
+    announcements: &mut Vec<T>,
+    withdrawals: &mut Vec<T>,
+) {
+    if treatment == UpdateTreatment::TreatAsWithdraw {
+        withdrawals.append(announcements);
+    }
+}
 use super::unit::SESSION_ID_COUNTER;
 
 #[async_trait::async_trait]
@@ -804,8 +815,22 @@ impl Processor {
         let mut payloads = SmallVec::new();
 
         //  RotondaRoute announcements:
-        let rr_reach = explode_announcements(&bgp_msg)?;
-        let rr_unreach = explode_withdrawals(&bgp_msg)?;
+        let mut rr_reach = explode_announcements(&bgp_msg)?;
+        let mut rr_unreach = explode_withdrawals(&bgp_msg)?;
+        match bgp_msg.treatment() {
+            UpdateTreatment::Normal => {}
+            UpdateTreatment::AttributeDiscard => {
+                warn!("processing UPDATE after RFC 7606 attribute discard");
+            }
+            UpdateTreatment::TreatAsWithdraw => {
+                warn!("applying RFC 7606 treat-as-withdraw to UPDATE");
+            }
+        }
+        apply_update_treatment(
+            bgp_msg.treatment(),
+            &mut rr_reach,
+            &mut rr_unreach,
+        );
 
         // Update per-AFI/SAFI Adj-RIB-In counters before consuming
         // the route lists. Bucket by AFI/SAFI so we take the
@@ -1050,7 +1075,20 @@ mod tests {
         },
     };
 
-    use super::BgpSession;
+    use super::{apply_update_treatment, BgpSession, UpdateTreatment};
+
+    #[test]
+    fn treat_as_withdraw_moves_every_announcement() {
+        let mut announcements = vec![1, 2];
+        let mut withdrawals = vec![3];
+        apply_update_treatment(
+            UpdateTreatment::TreatAsWithdraw,
+            &mut announcements,
+            &mut withdrawals,
+        );
+        assert!(announcements.is_empty());
+        assert_eq!(withdrawals, vec![3, 1, 2]);
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn processor_should_abort_on_unit_termination() {
