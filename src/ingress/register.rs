@@ -663,24 +663,6 @@ impl Register {
         None
     }
 
-    /// Find a stable ADD-PATH child without changing its lifecycle state.
-    ///
-    /// MRT imports use this to reuse `(peer, path_id)` identity across a RIB
-    /// dump and subsequent update files. Unlike live-session reconnects, an
-    /// offline import has no `Disconnected` -> `Connected` claim transition.
-    pub fn find_existing_path_child(
-        &self,
-        parent: IngressId,
-        path_id: u32,
-    ) -> Option<IngressId> {
-        self.info.read().unwrap().iter().find_map(|(id, info)| {
-            (info.ingress_type == Some(IngressType::BgpPath)
-                && info.parent_ingress == Some(parent)
-                && info.path_id == Some(path_id))
-            .then_some(*id)
-        })
-    }
-
     /// Search existing [`IngressId`] on the BMP router leven
     ///
     /// For the BMP router level, the comparison is based on the parent
@@ -1157,20 +1139,6 @@ mod tests {
             res.find_existing_path_child_and_claim(other_session, 8),
             None
         );
-    }
-
-    #[test]
-    fn stable_path_child_lookup_preserves_non_network_state() {
-        let res = Register::new();
-        let parent = res.register();
-        let child = mk_path_child(&res, parent, 42, IngressState::NonNetwork);
-
-        assert_eq!(res.find_existing_path_child(parent, 42), Some(child));
-        assert_eq!(
-            res.get(child).unwrap().state,
-            Some(IngressState::NonNetwork)
-        );
-        assert_eq!(res.find_existing_path_child(parent, 43), None);
     }
 
     #[test]

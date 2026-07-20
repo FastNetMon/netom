@@ -161,7 +161,7 @@ async fn ingest_mrtgen_routes_json(
 ) -> Arc<RibUnitRunner> {
     use crate::comms::{DirectLink, Gate};
     use crate::ingress;
-    use crate::units::mrt_file_in::unit::MrtInRunner;
+    use crate::units::mrt_file_in::unit::{MrtImportState, MrtInRunner};
     use mrtgen::{generate_from_routes, routes_from_json};
     use std::io::Write;
 
@@ -223,6 +223,7 @@ async fn ingest_mrtgen_routes_json(
         ingresses,
         parent_id,
         path.clone(),
+        &mut MrtImportState::default(),
     )
     .await;
     let _ = std::fs::remove_file(path);
@@ -230,6 +231,183 @@ async fn ingest_mrtgen_routes_json(
 
     result.expect("MRT input should reach the RIB through the gate");
     rib_runner
+}
+
+fn mrt_bgp4mp_v4_update(
+    path_id: Option<u32>,
+    prefix: [u8; 3],
+    announce: bool,
+) -> Vec<u8> {
+    let mut nlri = Vec::new();
+    if let Some(path_id) = path_id {
+        nlri.extend_from_slice(&path_id.to_be_bytes());
+    }
+    nlri.push(24);
+    nlri.extend_from_slice(&prefix);
+
+    let attrs = if announce {
+        vec![
+            0x40, 1, 1, 0, // ORIGIN IGP
+            0x40, 2, 6, 2, 1, 0, 0, 0xfc, 0x00, // AS_PATH 64512
+            0x40, 3, 4, 192, 0, 2, 1, // NEXT_HOP
+        ]
+    } else {
+        Vec::new()
+    };
+    let withdrawn = (!announce).then_some(nlri.as_slice()).unwrap_or(&[]);
+    let announced = announce.then_some(nlri.as_slice()).unwrap_or(&[]);
+
+    let bgp_len =
+        19 + 2 + withdrawn.len() + 2 + attrs.len() + announced.len();
+    let mut bgp = vec![0xff; 16];
+    bgp.extend_from_slice(&(bgp_len as u16).to_be_bytes());
+    bgp.push(2);
+    bgp.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(withdrawn);
+    bgp.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(&attrs);
+    bgp.extend_from_slice(announced);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&[10, 0, 0, 1]);
+    body.extend_from_slice(&[10, 0, 0, 2]);
+    body.extend_from_slice(&bgp);
+
+    mrt_record(16, if path_id.is_some() { 9 } else { 4 }, &body)
+}
+
+fn mrt_bgp4mp_established_to_idle() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&[10, 0, 0, 1]);
+    body.extend_from_slice(&[10, 0, 0, 2]);
+    body.extend_from_slice(&6u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    mrt_record(16, 5, &body)
+}
+
+fn mrt_bgp4mp_v6_multicast_update(
+    path_id: Option<u32>,
+    announce: bool,
+) -> Vec<u8> {
+    let mut nlri = Vec::new();
+    if let Some(path_id) = path_id {
+        nlri.extend_from_slice(&path_id.to_be_bytes());
+    }
+    nlri.push(48);
+    nlri.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 1]);
+
+    let mut mp_value = vec![0, 2, 2]; // AFI IPv6, SAFI multicast
+    if announce {
+        mp_value.push(16);
+        mp_value.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        mp_value.push(0);
+    }
+    mp_value.extend_from_slice(&nlri);
+
+    let mut attrs = vec![
+        0x40,
+        1,
+        1,
+        0, // ORIGIN IGP
+        0x40,
+        2,
+        6,
+        2,
+        1,
+        0,
+        0,
+        0xfc,
+        0x00, // AS_PATH 64512
+        0x80,
+        if announce { 14 } else { 15 },
+        mp_value.len() as u8,
+    ];
+    attrs.extend_from_slice(&mp_value);
+
+    let bgp_len = 19 + 2 + 2 + attrs.len();
+    let mut bgp = vec![0xff; 16];
+    bgp.extend_from_slice(&(bgp_len as u16).to_be_bytes());
+    bgp.push(2);
+    bgp.extend_from_slice(&0u16.to_be_bytes());
+    bgp.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(&attrs);
+
+    let peer = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let local = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&peer);
+    body.extend_from_slice(&local);
+    body.extend_from_slice(&bgp);
+    mrt_record(16, if path_id.is_some() { 9 } else { 4 }, &body)
+}
+
+fn mrt_record(mrt_type: u16, subtype: u16, body: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(12 + body.len());
+    record.extend_from_slice(&1_700_000_000u32.to_be_bytes());
+    record.extend_from_slice(&mrt_type.to_be_bytes());
+    record.extend_from_slice(&subtype.to_be_bytes());
+    record.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    record.extend_from_slice(body);
+    record
+}
+
+async fn ingest_mrt_byte_files(
+    files: &[Vec<u8>],
+) -> (Arc<RibUnitRunner>, Arc<crate::ingress::Register>) {
+    use crate::comms::{DirectLink, Gate};
+    use crate::units::mrt_file_in::unit::{MrtImportState, MrtInRunner};
+
+    static TMP_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    let (mrt_gate, mut mrt_gate_agent) = Gate::new(0);
+    let update_gate = mrt_gate.clone();
+    let gate_task =
+        tokio::spawn(
+            async move { while mrt_gate.process().await.is_ok() {} },
+        );
+    let (rib_runner, _rib_gate_agent) = RibUnitRunner::mock("").unwrap();
+    let rib_runner = Arc::new(rib_runner);
+    let mut link: DirectLink = mrt_gate_agent.create_link().into();
+    link.connect(rib_runner.clone(), false).await.unwrap();
+
+    let ingresses = Arc::new(crate::ingress::Register::new());
+    let parent_id = ingresses.register();
+    let mut import_state = MrtImportState::default();
+    for bytes in files {
+        let path = std::env::temp_dir().join(format!(
+            "netom-mrt-lifecycle-{}-{}.mrt",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, SeqCst),
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let result = MrtInRunner::process_file(
+            update_gate.clone(),
+            ingresses.clone(),
+            parent_id,
+            path.clone(),
+            &mut import_state,
+        )
+        .await;
+        let _ = std::fs::remove_file(path);
+        result.expect("MRT input should reach the RIB through the gate");
+    }
+    gate_task.abort();
+    (rib_runner, ingresses)
 }
 
 fn assert_e2e_prefixes(runner: &RibUnitRunner) {
@@ -361,6 +539,136 @@ async fn ingests_mrtgen_addpath_paths_without_collapsing() {
             "ADD-PATH routes collapsed for {format:?}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_mrt_addpath_withdrawal_allocates_no_child_or_route() {
+    let withdrawal = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false);
+    let (runner, ingresses) = ingest_mrt_byte_files(&[withdrawal]).await;
+
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        0
+    );
+    assert!(!ingresses.cloned_info().values().any(|info| {
+        info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_addpath_announcement_and_withdrawal_reuse_child() {
+    let mut bytes = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], true);
+    bytes.extend(mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false));
+    let (runner, ingresses) = ingest_mrt_byte_files(&[bytes]).await;
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    let children: Vec<_> = ingresses
+        .cloned_info()
+        .into_iter()
+        .filter(|(_, info)| {
+            info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+        })
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].1.path_id, Some(77));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_addpath_child_identity_survives_sequential_files() {
+    let announce = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], true);
+    let withdraw = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false);
+    let (runner, ingresses) =
+        ingest_mrt_byte_files(&[announce, withdraw]).await;
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    assert_eq!(
+        ingresses
+            .cloned_info()
+            .values()
+            .filter(|info| {
+                info.ingress_type
+                    == Some(crate::ingress::IngressType::BgpPath)
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_established_to_idle_withdraws_peer_and_path_children() {
+    let mut bytes = mrt_bgp4mp_v4_update(None, [203, 0, 113], true);
+    bytes.extend(mrt_bgp4mp_v4_update(Some(11), [198, 51, 100], true));
+    bytes.extend(mrt_bgp4mp_v4_update(Some(22), [198, 51, 100], true));
+    bytes.extend(mrt_bgp4mp_established_to_idle());
+    let (runner, ingresses) = ingest_mrt_byte_files(&[bytes]).await;
+
+    for prefix in ["203.0.113.0/24", "198.51.100.0/24"] {
+        let prefix = Prefix::from_str(prefix).unwrap();
+        let result = runner
+            .rib()
+            .match_prefix(&prefix, &match_options())
+            .unwrap();
+        assert!(!result.records.is_empty());
+        assert!(result
+            .records
+            .iter()
+            .all(|record| record.status == RouteStatus::Withdrawn));
+    }
+    assert_eq!(
+        ingresses
+            .cloned_info()
+            .values()
+            .filter(|info| {
+                info.ingress_type
+                    == Some(crate::ingress::IngressType::BgpPath)
+            })
+            .count(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_multicast_records_create_no_routes_children_or_capabilities() {
+    use mrtgen::{generate, GeneratorConfig};
+
+    let corpus = generate(&GeneratorConfig {
+        include_skip: false,
+        include_combo: false,
+        include_attr_errors: false,
+        ..GeneratorConfig::default()
+    });
+    let mut table_dump = Vec::new();
+    for record in &corpus.manifest.records {
+        if record.kind == "peer_index_table"
+            || record.kind.contains("multicast")
+        {
+            let start = record.offset as usize;
+            let end = start + record.size as usize;
+            table_dump.extend_from_slice(&corpus.bytes[start..end]);
+        }
+    }
+
+    let mut bgp4mp = mrt_bgp4mp_v6_multicast_update(Some(9), true);
+    bgp4mp.extend(mrt_bgp4mp_v6_multicast_update(Some(9), false));
+    bgp4mp.extend(mrt_bgp4mp_v6_multicast_update(None, true));
+    let (runner, ingresses) =
+        ingest_mrt_byte_files(&[table_dump, bgp4mp]).await;
+
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        0
+    );
+    let infos = ingresses.cloned_info();
+    assert!(!infos.values().any(|info| {
+        info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+    }));
+    assert!(!infos.values().any(|info| {
+        info.addpath_families.as_deref().is_some_and(|families| {
+            families.chunks_exact(4).any(|quad| quad[2] == 2)
+        })
+    }));
 }
 
 /// End-to-end FlowSpec via MRT: a mrtgen-generated BGP4MP file with diverse
