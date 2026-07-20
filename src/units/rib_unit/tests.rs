@@ -69,6 +69,21 @@ const MRTGEN_E2E_ROUTES: &str = r#"[
     }
 ]"#;
 
+const MRTGEN_ADDPATH_ROUTES: &str = r#"[
+    {
+        "prefix": "198.51.100.0/24",
+        "nexthop": "192.0.2.1",
+        "as_path": [64500],
+        "path_id": 11
+    },
+    {
+        "prefix": "198.51.100.0/24",
+        "nexthop": "192.0.2.2",
+        "as_path": [64501],
+        "path_id": 22
+    }
+]"#;
+
 /// Diverse FlowSpec rules (RFC 8955/8956) covering every component type,
 /// both address families, rules with and without a destination prefix, and
 /// every traffic action mrtgen can encode. The unicast route comes first so
@@ -319,6 +334,33 @@ async fn ingests_mrtgen_bgp4mp_updates() {
     let runner =
         ingest_mrtgen_routes(mrtgen::RouteFormat::Bgp4mp, "mrt").await;
     assert_e2e_prefixes(&runner);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_addpath_paths_without_collapsing() {
+    for format in [
+        mrtgen::RouteFormat::TableDumpV2,
+        mrtgen::RouteFormat::Bgp4mp,
+    ] {
+        let runner =
+            ingest_mrtgen_routes_json(MRTGEN_ADDPATH_ROUTES, format, "mrt")
+                .await;
+        let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+        let options = MatchOptions {
+            match_type: MatchType::ExactMatch,
+            include_withdrawn: false,
+            include_less_specifics: false,
+            include_more_specifics: false,
+            mui: None,
+            include_history: IncludeHistory::None,
+        };
+        let result = runner.rib().match_prefix(&prefix, &options).unwrap();
+        assert_eq!(
+            result.records.len(),
+            2,
+            "ADD-PATH routes collapsed for {format:?}"
+        );
+    }
 }
 
 /// End-to-end FlowSpec via MRT: a mrtgen-generated BGP4MP file with diverse

@@ -663,6 +663,24 @@ impl Register {
         None
     }
 
+    /// Find a stable ADD-PATH child without changing its lifecycle state.
+    ///
+    /// MRT imports use this to reuse `(peer, path_id)` identity across a RIB
+    /// dump and subsequent update files. Unlike live-session reconnects, an
+    /// offline import has no `Disconnected` -> `Connected` claim transition.
+    pub fn find_existing_path_child(
+        &self,
+        parent: IngressId,
+        path_id: u32,
+    ) -> Option<IngressId> {
+        self.info.read().unwrap().iter().find_map(|(id, info)| {
+            (info.ingress_type == Some(IngressType::BgpPath)
+                && info.parent_ingress == Some(parent)
+                && info.path_id == Some(path_id))
+            .then_some(*id)
+        })
+    }
+
     /// Search existing [`IngressId`] on the BMP router leven
     ///
     /// For the BMP router level, the comparison is based on the parent
@@ -734,12 +752,12 @@ pub enum IngressType {
     Bgp,
     Mrt,
     Rtr,
-    /// Per-path child of a BGP session with ADD-PATH (RFC 7911) enabled.
+    /// Per-path child of a BGP peer with ADD-PATH (RFC 7911) enabled.
     ///
-    /// Each distinct `(session, path_id)` pair gets its own ingress id so
+    /// Each distinct `(peer, path_id)` pair gets its own ingress id so
     /// the RIB (keyed on `(prefix, mui)`) can hold multiple paths for one
-    /// prefix from one peer. `parent_ingress` is the session's ingress id —
-    /// a `BgpViaBmp` or `Bgp` entry, whose own type disambiguates origin —
+    /// prefix from one peer. `parent_ingress` is the peer's ingress id — a
+    /// `BgpViaBmp`, `Bgp`, or `Mrt` entry whose own type disambiguates origin —
     /// and `path_id` holds the RFC 7911 path identifier. Children are never
     /// downstream peers themselves: bmp-out resolves them back to the parent
     /// session for the per-peer header and re-attaches the path id when
@@ -1139,6 +1157,20 @@ mod tests {
             res.find_existing_path_child_and_claim(other_session, 8),
             None
         );
+    }
+
+    #[test]
+    fn stable_path_child_lookup_preserves_non_network_state() {
+        let res = Register::new();
+        let parent = res.register();
+        let child = mk_path_child(&res, parent, 42, IngressState::NonNetwork);
+
+        assert_eq!(res.find_existing_path_child(parent, 42), Some(child));
+        assert_eq!(
+            res.get(child).unwrap().state,
+            Some(IngressState::NonNetwork)
+        );
+        assert_eq!(res.find_existing_path_child(parent, 43), None);
     }
 
     #[test]

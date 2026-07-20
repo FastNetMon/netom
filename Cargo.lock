@@ -2138,7 +2138,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2759,7 +2759,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git#ae622051b36bf233cea1f2c5463e939b69cae679"
+source = "git+https://github.com/nuclearcat/routecore.git#c8bde9c96dde2cb80ad9191eac1cebf4518d5631"
 dependencies = [
  "bytes",
  "chrono",
@@ -2903,7 +2903,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3308,7 +3308,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

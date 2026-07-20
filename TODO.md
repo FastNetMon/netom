@@ -119,11 +119,14 @@ consumers). Remaining work:
       bgp_id, so rules under child muis were falsely Invalid), closing a
       pre-existing hole for unicast ADD-PATH too. Covered by unit tests and
       a flowspec leg in `scripts/e2e-addpath-bmp.sh`.
-- [ ] MRT ADD-PATH (RFC 8050): blocked on routecore — its MRT layer has no
-      `RIB_*_ADDPATH` subtypes (8–11) and `RibEntry::parse` reads no path
-      id. Once added there: extend `supported_rib_records` and the RIB-entry
-      match in `src/units/mrt_file_in/unit.rs`, and drop the permanent
-      path-id filter on its BGP4MP path.
+- [x] MRT ADD-PATH (done 2026-07-20): updated to routecore's RFC 8050
+      support for TABLE_DUMP_V2 subtypes 8–12 and BGP4MP subtypes 8–11.
+      `mrt-file-in` now admits those RIB records, retains path identifiers
+      from both snapshots and UPDATEs, and stores each `(peer, path_id)`
+      under a stable `BgpPath` child ingress so paths for one NLRI coexist
+      and bmp-out can reattach the identifier. Observed families are saved
+      on the MRT peer for synthesized cap-69 advertisement. The mrtgen
+      corpus regression covers both TABLE_DUMP_V2 and BGP4MP ADD-PATH.
 - [ ] exabgp e2e variant for BGP-in ADD-PATH (`add-path send/receive`
       toward `bgp-tcp-in`, two paths for one prefix, asserted via bmp-out) —
       the crafted-bytes harness covers the BMP pipeline only; Step 4's
