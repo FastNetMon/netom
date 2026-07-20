@@ -137,11 +137,11 @@ consumers). Remaining work:
       family (see the commented-out `inverse_addpaths` idea in
       `src/common/routecore_extra.rs`), the stored families and the
       advertised cap-69 value must be refreshed alongside.
-- [ ] Multicast family collapse: bmp-out folds multicast NLRI into the
-      unicast NLRI space (pre-existing quirk, now inherited by ADD-PATH —
-      multicast paths are emitted with path ids inside the unicast family).
-      A proper MP_REACH SAFI-2 encoder would remove the collapse; document
-      or fix.
+- [ ] Proper multicast MRT/BMP support. `mrt-file-in` currently drops SAFI-2
+      TABLE_DUMP_V2 and BGP4MP routes, including ADD-PATH, rather than folding
+      them into unicast. Supporting them requires consistent SAFI-2 BMP
+      capability advertisement, UPDATE encoding, aggregation, and EoR
+      handling.
 - [x] Flaky `ingests_mrtgen_*` tests (fixed 2026-07-19): the temp-file name
       was derived from (pid, corpus length, extension), so the TableDumpV2
       and BGP4MP tests over the same corpus collided on one path in the

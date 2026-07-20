@@ -481,7 +481,7 @@ impl RibUnitRunner {
     }
 
     #[cfg(test)]
-    pub(super) fn rib(&self) -> Arc<Rib> {
+    pub(crate) fn rib(&self) -> Arc<Rib> {
         self.rib.load().clone()
     }
 

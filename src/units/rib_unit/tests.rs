@@ -218,12 +218,16 @@ async fn ingest_mrtgen_routes_json(
 
     let ingresses = Arc::new(ingress::Register::new());
     let parent_id = ingresses.register();
+    let mut import_state = MrtImportState::default();
+    import_state
+        .preflight_file(&path)
+        .expect("MRT preflight should succeed");
     let result = MrtInRunner::process_file(
         update_gate,
         ingresses,
         parent_id,
         path.clone(),
-        &mut MrtImportState::default(),
+        &mut import_state,
     )
     .await;
     let _ = std::fs::remove_file(path);
