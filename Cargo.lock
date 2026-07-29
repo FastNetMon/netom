@@ -2737,7 +2737,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/nuclearcat/rotonda-store?branch=fnm-gc#836c6af6af6624c6db30772ff7cce536460fa87d"
+source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#141e6d3ccba3daa94a1cdc3854f4883be36ce406"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2759,7 +2759,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/nuclearcat/routecore.git#c8bde9c96dde2cb80ad9191eac1cebf4518d5631"
+source = "git+https://github.com/FastNetMon/routecore.git#c8bde9c96dde2cb80ad9191eac1cebf4518d5631"
 dependencies = [
  "bytes",
  "chrono",
