@@ -1708,8 +1708,7 @@ dependencies = [
 [[package]]
 name = "inetnum"
 version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "03940df8ac11c9903291f4e50567a070902e77b1be42305280b91b23d3ccac19"
+source = "git+https://github.com/FastNetMon/inetnum.git?tag=v0.1.1#1f8a285aff36d85eeb345e59bcbe9b9e552eec5d"
 dependencies = [
  "arbitrary",
  "serde",
@@ -2708,8 +2707,7 @@ dependencies = [
 [[package]]
 name = "roto"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ee5220bfbd67bb9c38ab319afa7d0f6725d6c328a5d8712a1a2bf604242df41"
+source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm1#14883d6c1e89b06f6e1aafee9bd8cafe7864796e"
 dependencies = [
  "ariadne",
  "clap",
@@ -2726,8 +2724,7 @@ dependencies = [
 [[package]]
 name = "roto-macros"
 version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae8d040f43c44038effddea660407220649dd19db26d9c4a78dba27809b6fcbf"
+source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm1#14883d6c1e89b06f6e1aafee9bd8cafe7864796e"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2737,7 +2734,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#141e6d3ccba3daa94a1cdc3854f4883be36ce406"
+source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#9e4eb6d2bb9649ecc783909417851a2cfd86dc40"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2759,7 +2756,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/FastNetMon/routecore.git#c8bde9c96dde2cb80ad9191eac1cebf4518d5631"
+source = "git+https://github.com/FastNetMon/routecore.git#56f7fe057bd46d6d17582247f3fe0473ca52bdea"
 dependencies = [
  "bytes",
  "chrono",
@@ -2777,8 +2774,7 @@ dependencies = [
 [[package]]
 name = "rpki"
 version = "0.19.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99010980abb0aee7a5c4b1c04d0f42f74f57ac168adb5d38a99b3517a4d72df9"
+source = "git+https://github.com/FastNetMon/rpki.git?tag=v0.19.2#be91bfb1413e9e06a141da8b270040b8228bbbea"
 dependencies = [
  "base64 0.22.1",
  "bcder",

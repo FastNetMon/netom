@@ -30,7 +30,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 
 [workspace.dependencies]
 routecore          = { git = "https://github.com/FastNetMon/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
-inetnum            = { version = "0.1.1", features = ["arbitrary", "serde"] }
+inetnum            = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1", features = ["arbitrary", "serde"] }
 rotonda-store      = { git = "https://github.com/FastNetMon/netom-store.git", branch = "fnm-gc" }   # fork: Layer A remove_mui
 log                = "0.4"
 
@@ -71,7 +71,7 @@ libc               = "0.2"
 mqtt               = { version = "0.23.0", package = "rumqttc", default-features = false }
 memmap2            = "0.9.9"
 non-empty-vec      = { version = "0.2", features = ["serde"]}
-roto               = { version = "0.7" } # 0.8 available, requires changes
+roto               = { git = "https://github.com/FastNetMon/roto.git", tag = "v0.7.1-fnm1" }
 rotonda-store      = { workspace = true }
 serde_with         = "3"
 smallvec           = { version = "1.15", features = ["const_generics", "const_new", "union"] }
@@ -82,7 +82,7 @@ sha2               = "0.10"
 csv                = "1.4"
 bzip2              = "0.6"
 tokio-stream       = "0.1.18"
-rpki               = { version = "0.19.2", features = ["crypto", "rtr"] }
+rpki               = { git = "https://github.com/FastNetMon/rpki.git", tag = "v0.19.2", features = ["crypto", "rtr"] }
 rustls             = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 tokio-rustls       = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
 rustls-pemfile     = "2"
