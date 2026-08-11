@@ -19,7 +19,7 @@ name = "print_netom_std_doc"
 path = "doc/bin/print_netom_std_doc.rs"
 
 [workspace.package]
-version = "0.6.0-fnm10"
+version = "0.6.0-fnm11"
 edition = "2021"
 rust-version = "1.88"
 authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fastnetmon.com>"]
