@@ -10,6 +10,8 @@ pub struct BgpTcpInMetrics {
     gate: Option<Arc<GateMetrics>>,
     pub listener_bound_count: Arc<AtomicUsize>,
     pub connection_accepted_count: Arc<AtomicUsize>,
+    pub connection_initiated_count: Arc<AtomicUsize>,
+    pub connect_error_count: Arc<AtomicUsize>,
     #[allow(dead_code)]
     pub established_session_count: Arc<AtomicUsize>,
     pub connection_lost_count: Arc<AtomicUsize>,
@@ -56,6 +58,18 @@ impl BgpTcpInMetrics {
         MetricType::Counter,
         MetricUnit::Total,
     );
+    const CONNECTION_INITIATED_COUNT_METRIC: Metric = Metric::new(
+        "bgp_tcp_in_connection_initiated_count",
+        "the number of times a connection to a peer was established by us",
+        MetricType::Counter,
+        MetricUnit::Total,
+    );
+    const CONNECT_ERROR_COUNT_METRIC: Metric = Metric::new(
+        "bgp_tcp_in_connect_error_count",
+        "the number of failed attempts to connect to a peer",
+        MetricType::Counter,
+        MetricUnit::Total,
+    );
     const CONNECTION_LOST_COUNT_METRIC: Metric = Metric::new(
         "bgp_tcp_in_connection_lost_count",
         "the number of times the connection to a peer was lost",
@@ -86,6 +100,18 @@ impl metrics::Source for BgpTcpInMetrics {
             &Self::CONNECTION_ACCEPTED_COUNT_METRIC,
             Some(unit_name),
             self.connection_accepted_count.load(SeqCst),
+        );
+
+        target.append_simple(
+            &Self::CONNECTION_INITIATED_COUNT_METRIC,
+            Some(unit_name),
+            self.connection_initiated_count.load(SeqCst),
+        );
+
+        target.append_simple(
+            &Self::CONNECT_ERROR_COUNT_METRIC,
+            Some(unit_name),
+            self.connect_error_count.load(SeqCst),
         );
 
         target.append_simple(

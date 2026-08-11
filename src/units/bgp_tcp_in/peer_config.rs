@@ -15,6 +15,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::net::IpAddr;
+use std::time::Duration;
 
 use inetnum::addr::Prefix;
 use inetnum::asn::Asn;
@@ -24,6 +25,19 @@ use serde::Deserialize;
 
 const fn default_extended_messages() -> bool {
     true
+}
+
+/// Default TCP port to connect to in active mode (RFC 4271 section 8.2.2).
+const fn default_remote_port() -> u16 {
+    179
+}
+
+/// Default interval between outbound connection attempts, in seconds.
+///
+/// RFC 4271 suggests 120s for the ConnectRetryTimer, which is unhelpfully
+/// slow in practice; we retry more eagerly and jitter each attempt.
+const fn default_connect_retry_secs() -> u64 {
+    30
 }
 
 /// Enum carrying either a exact IP address, or a `Prefix`.
@@ -130,6 +144,31 @@ pub struct PeerConfig {
     addpath: Vec<AfiSafiType>,
     #[serde(default = "default_extended_messages")]
     extended_messages: bool,
+
+    /// Actively establish the TCP connection to this peer, instead of only
+    /// waiting for the peer to connect to our listener.
+    ///
+    /// Only meaningful for peers keyed on an exact IP address: a peer keyed
+    /// on a prefix has no single address to dial. The listener keeps
+    /// accepting connections from this peer regardless of this setting, so
+    /// whichever side connects first wins.
+    #[serde(default)]
+    connect: bool,
+
+    /// Port to connect to in active mode. Ignored unless `connect` is set.
+    #[serde(default = "default_remote_port")]
+    remote_port: u16,
+
+    /// Local address to bind outgoing connections to, e.g. to source the
+    /// session from a loopback the peer expects. Ignored unless `connect`
+    /// is set.
+    #[serde(default)]
+    source_addr: Option<IpAddr>,
+
+    /// Interval between outbound connection attempts, in seconds. Ignored
+    /// unless `connect` is set.
+    #[serde(default = "default_connect_retry_secs")]
+    connect_retry_secs: u64,
 }
 
 impl fmt::Debug for PeerConfig {
@@ -142,6 +181,10 @@ impl fmt::Debug for PeerConfig {
             .field("addpath", &self.addpath)
             .field("extended_messages", &self.extended_messages)
             .field("md5_key", &self.md5_key.as_ref().map(|_| "<redacted>"))
+            .field("connect", &self.connect)
+            .field("remote_port", &self.remote_port)
+            .field("source_addr", &self.source_addr)
+            .field("connect_retry_secs", &self.connect_retry_secs)
             .finish()
     }
 }
@@ -157,6 +200,10 @@ impl PeerConfig {
             protocols: vec![],
             addpath: vec![],
             extended_messages: true,
+            connect: false,
+            remote_port: default_remote_port(),
+            source_addr: None,
+            connect_retry_secs: default_connect_retry_secs(),
         }
     }
 
@@ -180,6 +227,26 @@ impl PeerConfig {
     pub fn md5_key(&self) -> Option<&str> {
         self.md5_key.as_deref().filter(|value| !value.is_empty())
     }
+
+    /// Whether we actively connect to this peer.
+    pub fn connect(&self) -> bool {
+        self.connect
+    }
+
+    /// The port to connect to in active mode.
+    pub fn remote_port(&self) -> u16 {
+        self.remote_port
+    }
+
+    /// The local address to bind outgoing connections to, if any.
+    pub fn source_addr(&self) -> Option<IpAddr> {
+        self.source_addr
+    }
+
+    /// The interval between outbound connection attempts.
+    pub fn connect_retry(&self) -> Duration {
+        Duration::from_secs(self.connect_retry_secs.max(1))
+    }
 }
 
 impl PartialEq for PeerConfig {
@@ -188,6 +255,10 @@ impl PartialEq for PeerConfig {
             && self.hold_time == other.hold_time
             && self.md5_key == other.md5_key
             && self.extended_messages == other.extended_messages
+            && self.connect == other.connect
+            && self.remote_port == other.remote_port
+            && self.source_addr == other.source_addr
+            && self.connect_retry_secs == other.connect_retry_secs
     }
 }
 
@@ -390,6 +461,13 @@ extended_messages = false
         );
         assert!(!cfg5.1.extended_messages);
 
+        // Active mode is off unless asked for, and then defaults to the
+        // well-known BGP port with no source address pinned.
+        assert!(!cfg5.1.connect());
+        assert_eq!(cfg5.1.remote_port(), 179);
+        assert_eq!(cfg5.1.source_addr(), None);
+        assert_eq!(cfg5.1.connect_retry(), Duration::from_secs(30));
+
         let combined = CombinedConfig {
             my_asn: cfg.my_asn,
             my_bgp_id: cfg.my_bgp_id,
@@ -397,5 +475,63 @@ extended_messages = false
             peer_config: cfg5.1.clone(),
         };
         assert!(!combined.extended_messages());
+    }
+
+    #[test]
+    fn active_mode_config() {
+        let toml = r#"
+
+type = "bgp-tcp-in"
+listen = "10.1.0.254:11179"
+my_asn = 65001
+my_bgp_id = [1, 2, 3, 4]
+
+[peers."2.3.4.9"]
+name = "Active-peer"
+remote_asn = 100
+connect = true
+remote_port = 1179
+source_addr = "10.1.0.254"
+connect_retry_secs = 5
+md5_key = "s3cr3t"
+
+[peers."2.3.4.10"]
+name = "Active-peer-defaults"
+remote_asn = 100
+connect = true
+"#;
+
+        let Unit::BgpTcpIn(cfg) = toml::from_str::<Unit>(toml).unwrap()
+        else {
+            unreachable!()
+        };
+
+        let peer = cfg
+            .peer_configs
+            .get(IpAddr::from_str("2.3.4.9").unwrap())
+            .unwrap()
+            .1;
+        assert!(peer.connect());
+        assert_eq!(peer.remote_port(), 1179);
+        assert_eq!(
+            peer.source_addr(),
+            Some(IpAddr::from_str("10.1.0.254").unwrap())
+        );
+        assert_eq!(peer.connect_retry(), Duration::from_secs(5));
+        assert_eq!(peer.md5_key(), Some("s3cr3t"));
+
+        let defaults = cfg
+            .peer_configs
+            .get(IpAddr::from_str("2.3.4.10").unwrap())
+            .unwrap()
+            .1;
+        assert!(defaults.connect());
+        assert_eq!(defaults.remote_port(), 179);
+        assert_eq!(defaults.source_addr(), None);
+        assert_eq!(defaults.connect_retry(), Duration::from_secs(30));
+
+        // Connect parameters take part in equality, so a reconfigure that
+        // only changes them still restarts the peer's connector.
+        assert_ne!(peer, defaults);
     }
 }

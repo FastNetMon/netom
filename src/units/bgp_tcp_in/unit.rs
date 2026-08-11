@@ -49,6 +49,7 @@ use crate::roto_runtime::{Ctx, MutIngressInfoCache};
 use crate::units::rib_unit::rpki::RtrCache;
 use crate::units::{Gate, Unit};
 
+use super::connector;
 use super::metrics::BgpTcpInMetrics;
 use super::router_handler::handle_connection;
 use super::status_reporter::BgpTcpInStatusReporter;
@@ -207,6 +208,62 @@ trait ConfigAcceptor {
         peer_stats: Arc<BgpPeerStatsRegistry>,
         connector_ingress_id: ingress::IngressId,
     );
+}
+
+/// Spawn the task that runs a BGP session over an established TCP connection.
+///
+/// Direction-agnostic: `tcp_stream` may come from our listener or from an
+/// outbound connect (see [`super::connector`]). Any TCP MD5 key must already
+/// be installed on the socket by the caller — for outbound connections that
+/// has to happen before `connect()`.
+///
+/// The returned handle resolves when the session ends, which the connector
+/// uses to decide when to dial again.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn spawn_session(
+    child_name: String,
+    roto_function: Option<RotoFunc>,
+    roto_context: Arc<Mutex<Ctx>>,
+    gate: &Gate,
+    bgp: &BgpTcpIn,
+    tcp_stream: tokio::net::TcpStream,
+    // Whether we established this connection ourselves.
+    active: bool,
+    cfg: &super::peer_config::PeerConfig,
+    remote_net: super::peer_config::PrefixOrExact,
+    child_status_reporter: Arc<BgpTcpInStatusReporter>,
+    live_sessions: Arc<Mutex<LiveSessions>>,
+    ingresses: Arc<ingress::Register>,
+    peer_stats: Arc<BgpPeerStatsRegistry>,
+    connector_ingress_id: ingress::IngressId,
+) -> tokio::task::JoinHandle<()> {
+    let (cmds_tx, cmds_rx) = mpsc::channel(10 * 10); //XXX this is limiting and
+                                                     //causes loss
+    let abort_handle: Arc<Mutex<Option<AbortHandle>>> =
+        Arc::new(Mutex::new(None));
+    let abort_handle_clone = abort_handle.clone();
+    let jh = crate::tokio::spawn(
+        &child_name,
+        handle_connection(
+            roto_function,
+            roto_context,
+            gate.clone(),
+            bgp.clone(),
+            tcp_stream,
+            CombinedConfig::new(bgp.clone(), cfg.clone(), remote_net),
+            active,
+            cmds_tx.clone(),
+            cmds_rx,
+            child_status_reporter,
+            live_sessions,
+            ingresses,
+            peer_stats,
+            connector_ingress_id,
+            abort_handle_clone,
+        ),
+    );
+    *abort_handle.lock().unwrap() = Some(jh.abort_handle());
+    jh
 }
 
 pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -382,6 +439,25 @@ impl BgpTcpInRunner {
         }
 
         let roto_context = Arc::new(Mutex::new(roto_context));
+
+        // Peers configured with `connect = true` are dialed by this
+        // supervisor, independently of the accept loop below. It reads the
+        // peer configs from the same ArcSwap, so it also picks up peers
+        // added or removed by a reconfigure. The guard stops it (and, with
+        // it, the per-peer dialers) when this unit terminates.
+        let _connectors = connector::AbortOnDrop::new(crate::tokio::spawn(
+            "bgp-in-connector-supervisor",
+            connector::run_connectors(connector::ConnectorContext {
+                bgp: arc_self.bgp.clone(),
+                gate: arc_self.gate.clone(),
+                status_reporter: status_reporter.clone(),
+                live_sessions: arc_self.live_sessions.clone(),
+                ingresses: arc_self.ingresses.clone(),
+                peer_stats: arc_self.peer_stats.clone(),
+                roto_function: roto_function.clone(),
+                roto_context: roto_context.clone(),
+            }),
+        ));
 
         loop {
             let listen_addr = arc_self.bgp.load().listen.clone();
@@ -705,8 +781,6 @@ impl ConfigAcceptor for BgpTcpInRunner {
         peer_stats: Arc<BgpPeerStatsRegistry>,
         connector_ingress_id: ingress::IngressId,
     ) {
-        let (cmds_tx, cmds_rx) = mpsc::channel(10 * 10); //XXX this is limiting and
-                                                         //causes loss
         let tcp_stream = tcp_stream.into_inner().unwrap(); // SAFETY: StandardTcpStream::into_inner() always returns Ok(...)
         if let Some(md5_key) = cfg.md5_key() {
             match tcp_stream.peer_addr() {
@@ -730,29 +804,22 @@ impl ConfigAcceptor for BgpTcpInRunner {
                 }
             }
         }
-        let abort_handle: Arc<Mutex<Option<AbortHandle>>> =
-            Arc::new(Mutex::new(None));
-        let abort_handle_clone = abort_handle.clone();
-        let jh = crate::tokio::spawn(
-            &child_name,
-            handle_connection(
-                roto_function,
-                roto_context,
-                gate.clone(),
-                bgp.clone(),
-                tcp_stream,
-                CombinedConfig::new(bgp.clone(), cfg.clone(), remote_net),
-                cmds_tx.clone(),
-                cmds_rx,
-                child_status_reporter,
-                live_sessions,
-                ingresses,
-                peer_stats,
-                connector_ingress_id,
-                abort_handle_clone,
-            ),
+        spawn_session(
+            child_name,
+            roto_function,
+            roto_context,
+            gate,
+            bgp,
+            tcp_stream,
+            false, // accepted from the peer
+            cfg,
+            remote_net,
+            child_status_reporter,
+            live_sessions,
+            ingresses,
+            peer_stats,
+            connector_ingress_id,
         );
-        *abort_handle.lock().unwrap() = Some(jh.abort_handle());
     }
 }
 
@@ -768,6 +835,9 @@ mod tests {
 
     use futures::Future;
     use inetnum::asn::Asn;
+    use tokio::io::AsyncReadExt;
+
+    use crate::units::Unit;
 
     use crate::{
         common::{net::TcpStreamWrapper, status_reporter::AnyStatusReporter},
@@ -900,6 +970,95 @@ mod tests {
 
         gate_agent.terminate().await;
 
+        let res = join_handle.await.unwrap();
+        assert_eq!(res, Err(Terminated));
+    }
+
+    /// A peer configured with `connect = true` is dialed by us, and we send
+    /// the OPEN ourselves rather than waiting for the peer to speak first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_mode_connects_and_sends_open() {
+        active_mode_open_test("remote_asn = 65002").await;
+    }
+
+    /// Same, for a peer allowed to use any ASN. Passively such a peer runs
+    /// with DelayOpen — we wait for its OPEN to learn which ASN it is — but
+    /// on a connection we opened we are the active side and must not wait.
+    /// DelayOpenTime is 10s, so the 5s budget below fails if we do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn active_mode_sends_open_without_delayopen_for_asn_set_peer() {
+        active_mode_open_test("remote_asn = []").await;
+    }
+
+    async fn active_mode_open_test(remote_asn: &str) {
+        let peer_listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_port = peer_listener.local_addr().unwrap().port();
+
+        let toml = format!(
+            r#"
+type = "bgp-tcp-in"
+listen = "dummy-listen-address"
+my_asn = 65001
+my_bgp_id = [1, 2, 3, 4]
+
+[peers."127.0.0.1"]
+name = "ActivePeer"
+{remote_asn}
+connect = true
+remote_port = {peer_port}
+connect_retry_secs = 1
+"#
+        );
+        let Unit::BgpTcpIn(unit_settings) =
+            toml::from_str::<Unit>(&toml).unwrap()
+        else {
+            unreachable!()
+        };
+
+        // This test is only about the outbound direction, so the listener
+        // never yields a connection.
+        let mock_listener_factory =
+            MockTcpListenerFactory::new(|_addr: String| {
+                Ok(MockTcpListener::new(|| {
+                    std::future::pending::<
+                        std::io::Result<(MockTcpStreamWrapper, SocketAddr)>,
+                    >()
+                }))
+            });
+
+        let (runner, gate_agent) = BgpTcpInRunner::mock(unit_settings);
+        let runner_fut = runner.run::<_, _, _, NoOpConfigAcceptor>(
+            vec![],
+            mock_listener_factory.into(),
+        );
+        let join_handle =
+            crate::tokio::spawn("mock_bgp_tcp_in_runner", runner_fut);
+
+        let (mut stream, _addr) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            peer_listener.accept(),
+        )
+        .await
+        .expect("no outbound connection was made")
+        .unwrap();
+
+        // A BGP message header: 16 marker bytes, u16 length, u8 type.
+        // The budget is well under routecore's 10s DelayOpenTime, so an
+        // outbound session that waited for the peer's OPEN would fail here.
+        let mut hdr = [0u8; 19];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stream.read_exact(&mut hdr),
+        )
+        .await
+        .expect("no OPEN was sent")
+        .unwrap();
+
+        assert_eq!(&hdr[..16], &[0xff; 16]);
+        assert_eq!(hdr[18], 1, "expected an OPEN (type 1), got {}", hdr[18]);
+
+        gate_agent.terminate().await;
         let res = join_handle.await.unwrap();
         assert_eq!(res, Err(Terminated));
     }

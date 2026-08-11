@@ -929,6 +929,9 @@ pub async fn handle_connection(
     unit_config: BgpTcpIn,
     tcp_stream: TcpStream,
     candidate_config: CombinedConfig,
+    // Whether we established this connection ourselves, rather than having
+    // accepted it from the peer.
+    active: bool,
     cmds_tx: mpsc::Sender<Command>,
     cmds_rx: mpsc::Receiver<Command>,
     status_reporter: Arc<BgpTcpInStatusReporter>,
@@ -963,7 +966,12 @@ pub async fn handle_connection(
     //  We do not want to put this logic in BgpSession itself, because this
     //  all looks a bit to netom-unit specific.
 
-    let delay_open = !candidate_config.is_exact();
+    // DelayOpen exists to let the *peer* send its OPEN first, which only
+    // helps a passive session whose peer identity we still have to learn
+    // (a peer matched on a prefix, or one allowed to use any of several
+    // ASNs). On a connection we opened ourselves we are the active side and
+    // always speak first.
+    let delay_open = !active && !candidate_config.is_exact();
     debug!(
         "delay_open for {}: {}",
         candidate_config.peer_config().name(),

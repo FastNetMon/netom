@@ -27,6 +27,17 @@ Released yyyy-mm-dd.
 
 ### New
 
+* Active mode for `bgp-tcp-in` peers: set `connect = true` on a peer to have
+  netom initiate the TCP connection instead of only waiting for the peer to
+  connect to the listener, for peers that will not accept us as a passive
+  neighbour. Optional `remote_port` (default 179), `source_addr`, and
+  `connect_retry_secs` (default 30) tune the outbound connection; `md5_key`
+  works in this direction too, installed on the socket before connecting.
+  Requires a peer keyed on an exact address; the listener stays active for
+  these peers as well, so whichever side connects first wins. New metrics:
+  `bgp_tcp_in_connection_initiated_count` and
+  `bgp_tcp_in_connect_error_count`. See `docs/bgp-active-mode.md`.
+
 * ADD-PATH (RFC 7911) support. Routes from ADD-PATH sessions (BMP-monitored
   and direct BGP) are no longer dropped: each `(session, path_id)` is stored
   under its own path-child ingress (`bgpPath` in the `/ingresses` output,
