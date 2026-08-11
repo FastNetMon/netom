@@ -1,7 +1,7 @@
 use std::io;
 use std::net::IpAddr;
 
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 
 #[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
@@ -167,6 +167,19 @@ pub fn configure_tcp_md5(
     configure_md5_fd(stream.as_raw_fd(), addr, None, key)
 }
 
+/// Install a TCP MD5 key on a socket we are about to connect out of.
+///
+/// This must happen before `connect()`: the SYN itself carries the option,
+/// so a key installed on the resulting stream would be too late.
+#[cfg(target_os = "linux")]
+pub fn configure_tcp_md5_socket(
+    socket: &TcpSocket,
+    addr: IpAddr,
+    key: &[u8],
+) -> io::Result<()> {
+    configure_md5_fd(socket.as_raw_fd(), addr, None, key)
+}
+
 #[cfg(target_os = "linux")]
 pub fn configure_tcp_md5_listener(
     listener: &TcpListener,
@@ -182,6 +195,18 @@ pub fn configure_tcp_md5_listener(
 #[cfg(not(target_os = "linux"))]
 pub fn configure_tcp_md5(
     _stream: &TcpStream,
+    _addr: IpAddr,
+    _key: &[u8],
+) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "TCP MD5 is only supported on Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn configure_tcp_md5_socket(
+    _socket: &TcpSocket,
     _addr: IpAddr,
     _key: &[u8],
 ) -> io::Result<()> {
