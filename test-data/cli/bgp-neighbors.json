@@ -1,0 +1,6 @@
+{"data":[
+{"peerAddress":"10.1.0.1","peerAsn":null,"source":"bgp","state":"Idle","configured":true,"name":"PeerA","updatesReceived":0,"notificationsReceived":0},
+{"peerAddress":"10.1.0.2","peerAsn":65002,"source":"bgp","state":"Established","configured":true,"name":"PeerB","ingressId":4,"upSeconds":8073,"holdTimeConfigured":90,"updatesReceived":13980,"notificationsReceived":1,"prefixesReceived":84211,"prefixesRejected":12},
+{"peerAddress":"127.0.0.9","peerAsn":65003,"source":"bgp","state":"Active","configured":true,"connectMode":true,"name":"PeerDead","updatesReceived":0,"notificationsReceived":0,"lastError":"Connection refused (os error 111)"},
+{"peerAddress":"192.0.2.7","peerAsn":65100,"source":"bmp","state":"Established","configured":false,"routerId":"192.0.2.7","ingressId":3,"upSeconds":3731,"viaRouter":"10.99.0.1","viaIngressId":2,"peerRibType":"InPre"}
+]}
