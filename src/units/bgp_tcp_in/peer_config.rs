@@ -215,6 +215,19 @@ impl PeerConfig {
         self.remote_asn.is_single()
     }
 
+    /// The peer's ASN when the config pins exactly one, so it can be shown
+    /// before the session comes up. `None` when the config accepts several
+    /// ASNs (or any), where only negotiation can tell us.
+    pub fn configured_asn(&self) -> Option<Asn> {
+        match &self.remote_asn {
+            OneOrManyAsns::One(asn) => Some(*asn),
+            OneOrManyAsns::Many(asns) => match asns.as_slice() {
+                [asn] => Some(*asn),
+                _ => None,
+            },
+        }
+    }
+
     fn accept_remote_asn(&self, remote: Asn) -> bool {
         if let OneOrManyAsns::Many(ref asns) = self.remote_asn {
             if asns.is_empty() {

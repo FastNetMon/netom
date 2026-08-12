@@ -797,9 +797,8 @@ async fn flowspec_validation_spans_addpath_child_muis() {
     );
 
     // Covering unicast route under the SESSION mui.
-    let ann =
-        Announcements::from_str("e [64500] 10.0.0.1 none 192.0.2.0/24")
-            .unwrap();
+    let ann = Announcements::from_str("e [64500] 10.0.0.1 none 192.0.2.0/24")
+        .unwrap();
     let bgp_update_bytes = mk_bgp_update(&Prefixes::default(), &ann, &[]);
     let update_msg = UpdateMessage::from_octets(
         bgp_update_bytes,
@@ -2086,12 +2085,9 @@ async fn gc_reclaims_path_children_then_session() {
     let rib = runner.rib();
     let reg = &rib.ingress_register;
 
-    let mk = |typ: IngressType,
-              state: IngressState,
-              parent: Option<u32>| {
-        let mut info = IngressInfo::new()
-            .with_ingress_type(typ)
-            .with_state(state);
+    let mk = |typ: IngressType, state: IngressState, parent: Option<u32>| {
+        let mut info =
+            IngressInfo::new().with_ingress_type(typ).with_state(state);
         if let Some(parent) = parent {
             info = info.with_parent_ingress(parent);
         }

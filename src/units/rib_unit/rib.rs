@@ -190,6 +190,20 @@ pub struct Rib {
 #[derive(Copy, Clone, Debug)]
 struct Multicast(bool);
 
+/// Prefix and route counts for one of the RIB's backing stores.
+///
+/// `routes` counts stored records — one per `(prefix, mui)` — so it exceeds
+/// `prefixes` whenever several peers announce the same prefix.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreCounts {
+    pub name: &'static str,
+    pub prefixes: usize,
+    pub prefixes_v4: usize,
+    pub prefixes_v6: usize,
+    pub routes: usize,
+}
+
 impl Rib {
     pub fn new(
         ingress_register: Arc<ingress::Register>,
@@ -220,6 +234,38 @@ impl Rib {
         } else {
             Err(PrefixStoreError::StoreNotReadyError)
         }
+    }
+
+    /// Per-store prefix and route counts, for `/api/v1/status`.
+    ///
+    /// Cheap — the store counters are atomic loads, the same ones
+    /// `log_memory_stats` reads.
+    pub fn store_counts(&self) -> Vec<StoreCounts> {
+        let mut res = Vec::with_capacity(3);
+        for (name, store) in [
+            ("unicast", self.unicast.as_ref()),
+            ("multicast", self.multicast.as_ref()),
+        ] {
+            if let Some(store) = store {
+                res.push(StoreCounts {
+                    name,
+                    prefixes: store.prefixes_count().in_memory(),
+                    prefixes_v4: store.prefixes_v4_count().in_memory(),
+                    prefixes_v6: store.prefixes_v6_count().in_memory(),
+                    routes: store.routes_count().in_memory(),
+                });
+            }
+        }
+        if let Some(store) = self.flowspec.as_ref() {
+            res.push(StoreCounts {
+                name: "flowspec",
+                prefixes: store.prefixes_count().in_memory(),
+                prefixes_v4: store.prefixes_v4_count().in_memory(),
+                prefixes_v6: store.prefixes_v6_count().in_memory(),
+                routes: store.routes_count().in_memory(),
+            });
+        }
+        res
     }
 
     /// Emit a consolidated snapshot of the main memory consumers to the log,
@@ -583,11 +629,8 @@ impl Rib {
         metrics.note_update(is_v4, false);
 
         let flow_originator = self.flowspec_identity(pamap, mui).0;
-        let validity = self.validate_flowspec(
-            nlri_raw,
-            flow_originator,
-            is_v4,
-        );
+        let validity =
+            self.validate_flowspec(nlri_raw, flow_originator, is_v4);
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         let report = store.insert(&key, pubrec, None);
@@ -805,11 +848,9 @@ impl Rib {
         // bgp_id of their own; resolve to the parent session so every
         // path of one peer yields the same identity.
         let session_id = self.ingress_register.session_for(ingress_id);
-        let (attr_id, path_neighbor) =
-            self.flowspec_validation_attrs(pamap);
-        let (peer_id, remote_asn) = self
-            .ingress_register
-            .bgp_id_and_remote_asn(session_id);
+        let (attr_id, path_neighbor) = self.flowspec_validation_attrs(pamap);
+        let (peer_id, remote_asn) =
+            self.ingress_register.bgp_id_and_remote_asn(session_id);
         let originator = attr_id
             .or(peer_id)
             .map(FlowSpecOriginator::BgpId)
@@ -1546,8 +1587,7 @@ impl Rib {
         let mut peers: HashSet<IngressId> = HashSet::new();
         let mut childless_routers: HashSet<IngressId> = HashSet::new();
         for (id, i) in &info {
-            if i.state
-                != Some(ingress::register::IngressState::Disconnected)
+            if i.state != Some(ingress::register::IngressState::Disconnected)
             {
                 continue;
             }
@@ -1749,10 +1789,7 @@ impl Rib {
     ///
     /// A [`DUMP_MAX_DURATION`] wall-clock backstop stops a pathologically long
     /// dump early (logged; partial count returned).
-    pub fn stream_prefix_records<F>(
-        &self,
-        mut f: F,
-    ) -> Result<usize, String>
+    pub fn stream_prefix_records<F>(&self, mut f: F) -> Result<usize, String>
     where
         F: FnMut(PrefixRecord<RotondaPaMap>) -> bool,
     {
@@ -1888,46 +1925,45 @@ impl Rib {
 
         let mut rows: Vec<FlowSpecQueryRow> = Vec::new();
         let mut raw_bytes = 0usize;
-        let mut push_records =
-            |rows: &mut Vec<FlowSpecQueryRow>,
-             key: Prefix,
-             records: Vec<Record<FlowSpecRuleSet>>|
-             -> Result<(), String> {
-                for r in records {
-                    if r.status == RouteStatus::Withdrawn {
+        let mut push_records = |rows: &mut Vec<FlowSpecQueryRow>,
+                                key: Prefix,
+                                records: Vec<Record<FlowSpecRuleSet>>|
+         -> Result<(), String> {
+            for r in records {
+                if r.status == RouteStatus::Withdrawn {
+                    continue;
+                }
+                if let Some(want) = ingress_id {
+                    if r.multi_uniq_id != want {
                         continue;
                     }
-                    if let Some(want) = ingress_id {
-                        if r.multi_uniq_id != want {
-                            continue;
-                        }
-                    }
-                    for rule in r.meta.iter() {
-                        if let Some((max_rows, max_raw_bytes)) = limits {
-                            let rule_bytes = rule
-                                .nlri
-                                .len()
-                                .saturating_add(rule.pamap.as_ref().len());
-                            if rows.len() >= max_rows
-                                || raw_bytes.saturating_add(rule_bytes)
-                                    > max_raw_bytes
-                            {
-                                return Err(format!(
+                }
+                for rule in r.meta.iter() {
+                    if let Some((max_rows, max_raw_bytes)) = limits {
+                        let rule_bytes = rule
+                            .nlri
+                            .len()
+                            .saturating_add(rule.pamap.as_ref().len());
+                        if rows.len() >= max_rows
+                            || raw_bytes.saturating_add(rule_bytes)
+                                > max_raw_bytes
+                        {
+                            return Err(format!(
                                     "FlowSpec query exceeds the response limit \
                                      ({max_rows} rules or {max_raw_bytes} raw bytes)"
                                 ));
-                            }
-                            raw_bytes += rule_bytes;
                         }
-                        rows.push(FlowSpecQueryRow {
-                            key_prefix: key,
-                            ingress_id: r.multi_uniq_id,
-                            rule: rule.clone(),
-                        });
+                        raw_bytes += rule_bytes;
                     }
+                    rows.push(FlowSpecQueryRow {
+                        key_prefix: key,
+                        ingress_id: r.multi_uniq_id,
+                        rule: rule.clone(),
+                    });
                 }
-                Ok(())
-            };
+            }
+            Ok(())
+        };
 
         match prefix {
             None => {
@@ -1947,7 +1983,8 @@ impl Rib {
             Some(prefix) => {
                 let guard = &epoch::pin();
                 let match_options = MatchOptions {
-                    match_type: rotonda_store::match_options::MatchType::ExactMatch,
+                    match_type:
+                        rotonda_store::match_options::MatchType::ExactMatch,
                     include_withdrawn: false,
                     include_less_specifics,
                     include_more_specifics,
@@ -1966,11 +2003,7 @@ impl Rib {
                     .flatten()
                 {
                     for pr in set.iter() {
-                        push_records(
-                            &mut rows,
-                            pr.prefix,
-                            pr.meta.clone(),
-                        )?;
+                        push_records(&mut rows, pr.prefix, pr.meta.clone())?;
                     }
                 }
             }
@@ -1990,13 +2023,14 @@ impl Rib {
             let flow_originator =
                 self.flowspec_identity(&row.rule.pamap, row.ingress_id).0;
             let cache_key = (row.key_prefix, flow_originator);
-            let validity = *validity_cache.entry(cache_key).or_insert_with(|| {
-                self.validate_flowspec(
-                    &row.rule.nlri,
-                    flow_originator,
-                    family_v4,
-                )
-            });
+            let validity =
+                *validity_cache.entry(cache_key).or_insert_with(|| {
+                    self.validate_flowspec(
+                        &row.rule.nlri,
+                        flow_originator,
+                        family_v4,
+                    )
+                });
             row.rule.validity = validity;
         }
         Ok(rows)
@@ -3487,12 +3521,8 @@ mod tests {
     // ------------ FlowSpec store ------------------------------------------
 
     fn test_rib() -> Rib {
-        Rib::new(
-            Default::default(),
-            None,
-            Arc::new(Mutex::new(Ctx::empty())),
-        )
-        .unwrap()
+        Rib::new(Default::default(), None, Arc::new(Mutex::new(Ctx::empty())))
+            .unwrap()
     }
 
     /// Wrap raw v4 flowspec component bytes into a RotondaRoute.
@@ -3520,11 +3550,23 @@ mod tests {
         RotondaRoute::Ipv4FlowSpec(nlri.into(), pamap)
     }
 
-    fn validation_pamap(originator: [u8; 4], neighbor_asn: u32) -> RotondaPaMap {
+    fn validation_pamap(
+        originator: [u8; 4],
+        neighbor_asn: u32,
+    ) -> RotondaPaMap {
         RotondaPaMap::from(vec![
-            0x80, 9, 4, originator[0], originator[1], originator[2],
+            0x80,
+            9,
+            4,
+            originator[0],
+            originator[1],
+            originator[2],
             originator[3], // ORIGINATOR_ID
-            0x40, 2, 6, 2, 1, // AS_PATH, one AS_SEQUENCE entry
+            0x40,
+            2,
+            6,
+            2,
+            1, // AS_PATH, one AS_SEQUENCE entry
             (neighbor_asn >> 24) as u8,
             (neighbor_asn >> 16) as u8,
             (neighbor_asn >> 8) as u8,
@@ -3533,11 +3575,9 @@ mod tests {
     }
 
     // {dst 10.0.1.0/24, proto =17}
-    const FS_DST_PROTO: &[u8] =
-        &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+    const FS_DST_PROTO: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
     // {dst 10.0.1.0/24, dport =53}
-    const FS_DST_DPORT: &[u8] =
-        &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
+    const FS_DST_DPORT: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
     // {proto =17, sport =53} — no destination prefix component
     const FS_NO_DST: &[u8] = &[0x03, 0x81, 0x11, 0x06, 0x81, 0x35];
 
@@ -3587,10 +3627,7 @@ mod tests {
 
         let rows = flowspec_rows(&rib);
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].key_prefix,
-            Prefix::new_v4(0.into(), 0).unwrap()
-        );
+        assert_eq!(rows[0].key_prefix, Prefix::new_v4(0.into(), 0).unwrap());
         assert_eq!(rows[0].ingress_id, mui);
         assert_eq!(rows[0].rule.nlri, FS_NO_DST);
 
@@ -3784,10 +3821,7 @@ mod tests {
             .iter()
             .find(|r| r.key_prefix.len() == 0)
             .expect("no-dst rule stored");
-        assert_eq!(
-            nodst_row.rule.validity,
-            FlowSpecValidity::Unvalidatable
-        );
+        assert_eq!(nodst_row.rule.validity, FlowSpecValidity::Unvalidatable);
 
         // (b) violated: a more-specific unicast route from a different
         // neighboring AS invalidates the existing rule on the next query.
@@ -3904,11 +3938,7 @@ mod tests {
         assert_eq!(flowspec_rows(&rib).len(), 1);
 
         // Peer-down: mark the whole mui withdrawn for the flowspec family.
-        rib.withdraw_for_ingress(
-            mui,
-            Some(AfiSafiType::Ipv4FlowSpec),
-            true,
-        );
+        rib.withdraw_for_ingress(mui, Some(AfiSafiType::Ipv4FlowSpec), true);
         assert!(flowspec_rows(&rib).is_empty());
 
         // Re-announcement reactivates the mui (withdrawn-mui bitmap

@@ -204,9 +204,7 @@ impl StreamResponseWriter {
         // (channel stays full). A closed channel — client disconnected — still
         // maps to BrokenPipe exactly as the previous blocking_send did.
         self.handle
-            .block_on(
-                self.sender.send_timeout(Ok(chunk), STREAM_WRITE_STALL),
-            )
+            .block_on(self.sender.send_timeout(Ok(chunk), STREAM_WRITE_STALL))
             .map_err(|e| match e {
                 mpsc::error::SendTimeoutError::Timeout(_) => io::Error::new(
                     io::ErrorKind::TimedOut,
@@ -470,11 +468,10 @@ fn build_flowspec_response(
 
     let body = serde_json::to_vec(&serde_json::json!({ "data": out }))
         .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-    Ok((
-        [("content-type", OutputFormat::Json.content_type())],
-        body,
+    Ok(
+        ([("content-type", OutputFormat::Json.content_type())], body)
+            .into_response(),
     )
-        .into_response())
 }
 
 async fn flowspec_response(

@@ -202,6 +202,21 @@ impl BgpPeerStatsRegistry {
     }
 }
 
+static REGISTRY: std::sync::LazyLock<Arc<BgpPeerStatsRegistry>> =
+    std::sync::LazyLock::new(|| Arc::new(BgpPeerStatsRegistry::new()));
+
+/// The process-wide peer-stats registry.
+///
+/// Global for two reasons: the HTTP API has to read these counters without
+/// reaching inside a unit, and a per-runner registry would be rebuilt on a
+/// live reconfiguration, silently resetting every peer's counters on SIGHUP.
+/// Keys are [`IngressId`]s, which are process-wide unique, so one map stays
+/// correct with several `bgp-tcp-in` units configured. Entries are removed
+/// on session teardown, so the map does not grow without bound.
+pub fn registry() -> Arc<BgpPeerStatsRegistry> {
+    REGISTRY.clone()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

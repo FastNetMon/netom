@@ -97,10 +97,9 @@ async fn resolve_emit_target(
         return target;
     }
     let target = match ingress_register.get(ingress_id) {
-        Some(info) if info.ingress_type == Some(IngressType::BgpPath) => (
-            info.parent_ingress.unwrap_or(ingress_id),
-            info.path_id,
-        ),
+        Some(info) if info.ingress_type == Some(IngressType::BgpPath) => {
+            (info.parent_ingress.unwrap_or(ingress_id), info.path_id)
+        }
         Some(_) => (ingress_id, None),
         None => return (ingress_id, None),
     };
@@ -310,8 +309,7 @@ pub async fn perform_initial_dump(
                                     == Some(IngressType::BgpPath) =>
                             {
                                 (
-                                    info.parent_ingress
-                                        .unwrap_or(record_mui),
+                                    info.parent_ingress.unwrap_or(record_mui),
                                     info.path_id,
                                 )
                             }
@@ -364,9 +362,9 @@ pub async fn perform_initial_dump(
                 }
                 let pamap = &route_record.meta;
                 *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
-                if !aggregator.add(
-                    ingress_id, path_id, prefix, pamap, &mut sink,
-                ) {
+                if !aggregator
+                    .add(ingress_id, path_id, prefix, pamap, &mut sink)
+                {
                     // Consumer dropped (client disconnected). Bail out of the
                     // iteration so the walk stops promptly.
                     client_gone = true;
@@ -391,30 +389,29 @@ pub async fn perform_initial_dump(
                     // unicast walk above: rules under ADD-PATH path-children
                     // emit under their parent session's per-peer header with
                     // the path id re-attached to the NLRI.
-                    let (ingress_id, path_id) = match emit_targets
-                        .get(&record_mui)
-                    {
-                        Some(t) => *t,
-                        None => {
-                            let t = match ingress_register_for_walk
-                                .get(record_mui)
-                            {
-                                Some(info)
-                                    if info.ingress_type
-                                        == Some(IngressType::BgpPath) =>
+                    let (ingress_id, path_id) =
+                        match emit_targets.get(&record_mui) {
+                            Some(t) => *t,
+                            None => {
+                                let t = match ingress_register_for_walk
+                                    .get(record_mui)
                                 {
-                                    (
-                                        info.parent_ingress
-                                            .unwrap_or(record_mui),
-                                        info.path_id,
-                                    )
-                                }
-                                _ => (record_mui, None),
-                            };
-                            emit_targets.insert(record_mui, t);
-                            t
-                        }
-                    };
+                                    Some(info)
+                                        if info.ingress_type
+                                            == Some(IngressType::BgpPath) =>
+                                    {
+                                        (
+                                            info.parent_ingress
+                                                .unwrap_or(record_mui),
+                                            info.path_id,
+                                        )
+                                    }
+                                    _ => (record_mui, None),
+                                };
+                                emit_targets.insert(record_mui, t);
+                                t
+                            }
+                        };
                     let mut sink = |msg: Vec<u8>, n: usize| {
                         msg_tx.blocking_send((msg, n)).is_ok()
                     };
@@ -457,9 +454,8 @@ pub async fn perform_initial_dump(
                     }
                     let is_v4 = key_prefix.is_v4();
                     for rule in record.meta.iter() {
-                        *routes_per_ingress
-                            .entry(ingress_id)
-                            .or_insert(0) += 1;
+                        *routes_per_ingress.entry(ingress_id).or_insert(0) +=
+                            1;
                         if !aggregator.add_flowspec(
                             ingress_id,
                             path_id,
@@ -1015,12 +1011,9 @@ async fn send_payload_to_client(
     // header, with their path id re-attached to the NLRI. Everything below
     // (known_peers, PeerInfo cache, lazy Peer Up) keys on the emit id, so
     // sibling paths share one downstream peer.
-    let (ingress_id, path_id) = resolve_emit_target(
-        client,
-        ingress_register,
-        payload.ingress_id,
-    )
-    .await;
+    let (ingress_id, path_id) =
+        resolve_emit_target(client, ingress_register, payload.ingress_id)
+            .await;
 
     // Fast path: PeerInfo is constant per peer for the session, so once it is
     // cached (Peer Up already sent, header already built) every subsequent
@@ -1223,8 +1216,7 @@ mod tests {
                 let withdrawn_len =
                     u16::from_be_bytes([bgp[19], bgp[20]]) as usize;
                 let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
-                let has_nlri =
-                    bgp.len() > 23 + withdrawn_len + pa_len;
+                let has_nlri = bgp.len() > 23 + withdrawn_len + pa_len;
                 if withdrawn_len == 0 && pa_len == 0 {
                     return if has_nlri {
                         MsgKind::Route(1, 1)
@@ -1233,7 +1225,8 @@ mod tests {
                     };
                 }
                 // Walk attributes for MP_REACH (14) / MP_UNREACH (15).
-                let pas = &bgp[23 + withdrawn_len..23 + withdrawn_len + pa_len];
+                let pas =
+                    &bgp[23 + withdrawn_len..23 + withdrawn_len + pa_len];
                 let mut pos = 0;
                 while pos + 2 < pas.len() {
                     let flags = pas[pos];
@@ -1307,8 +1300,7 @@ mod tests {
 
         let register: Arc<register::Register> = Default::default();
         let ctx = Arc::new(Mutex::new(Ctx::empty()));
-        let rib =
-            Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
+        let rib = Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
 
         // Peer 1: unicast + flowspec. Peer 2: flowspec-only.
         let peer1 = register.register();
@@ -1350,10 +1342,8 @@ mod tests {
         ));
         let gate = crate::comms::Gate::default();
         let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
-        let status_reporter = Arc::new(BmpTcpOutStatusReporter::new(
-            "test",
-            metrics.clone(),
-        ));
+        let status_reporter =
+            Arc::new(BmpTcpOutStatusReporter::new("test", metrics.clone()));
 
         let ok = perform_initial_dump(
             &client,
@@ -1378,8 +1368,7 @@ mod tests {
                 // Extract the MP_REACH NLRI: value[5..] after afi(2),
                 // safi(1), nh_len(1)=0, reserved(1).
                 let bgp = &msg[48..];
-                let pa_len =
-                    u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+                let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
                 let pas = &bgp[23..23 + pa_len];
                 let mut pos = 0;
                 while pos + 2 < pas.len() {
@@ -1387,10 +1376,8 @@ mod tests {
                     let type_code = pas[pos + 1];
                     let (attr_len, header_len) = if flags & 0x10 != 0 {
                         (
-                            u16::from_be_bytes([
-                                pas[pos + 2],
-                                pas[pos + 3],
-                            ]) as usize,
+                            u16::from_be_bytes([pas[pos + 2], pas[pos + 3]])
+                                as usize,
                             4,
                         )
                     } else {
@@ -1434,8 +1421,10 @@ mod tests {
             .position(|k| matches!(k, MsgKind::Eor(..)))
             .unwrap();
         assert!(last_route < first_eor);
-        let last_unicast_route =
-            kinds.iter().rposition(|k| *k == MsgKind::Route(1, 1)).unwrap();
+        let last_unicast_route = kinds
+            .iter()
+            .rposition(|k| *k == MsgKind::Route(1, 1))
+            .unwrap();
         let first_fs_route = kinds
             .iter()
             .position(|k| *k == MsgKind::Route(1, 133))
@@ -1450,10 +1439,7 @@ mod tests {
             })
             .collect();
         assert_eq!(eors.len(), 4);
-        assert_eq!(
-            eors.iter().filter(|(_, safi)| *safi == 133).count(),
-            2
-        );
+        assert_eq!(eors.iter().filter(|(_, safi)| *safi == 133).count(), 2);
     }
 
     /// Full dump with an ADD-PATH session (two path-children holding one
@@ -1498,9 +1484,7 @@ mod tests {
                     .with_parent_ingress(session)
                     .with_path_id(path_id)
                     .with_state(IngressState::Connected)
-                    .with_remote_addr(
-                        "10.9.9.1".parse::<IpAddr>().unwrap(),
-                    )
+                    .with_remote_addr("10.9.9.1".parse::<IpAddr>().unwrap())
                     .with_remote_asn(Asn::from_u32(65001)),
             );
             children.push(child);
@@ -1586,9 +1570,7 @@ mod tests {
             let kind = classify(&msg);
             if kind == MsgKind::PeerUp {
                 peer_up_cap69_counts.push(
-                    msg.windows(cap69.len())
-                        .filter(|w| *w == cap69)
-                        .count(),
+                    msg.windows(cap69.len()).filter(|w| *w == cap69).count(),
                 );
             }
             if kind == MsgKind::Route(1, 1) {
@@ -1617,9 +1599,8 @@ mod tests {
                 if let Some(anns) = parsed_addpath {
                     for n in anns {
                         if let Nlri::Ipv4UnicastAddpath(a) = n {
-                            addpath_pids.extend(
-                                IsPrefix::path_id(&a).map(|p| p.0),
-                            );
+                            addpath_pids
+                                .extend(IsPrefix::path_id(&a).map(|p| p.0));
                         }
                     }
                 } else {

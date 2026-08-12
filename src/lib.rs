@@ -6,6 +6,7 @@ pub mod cli;
 pub mod common;
 pub mod comms;
 pub mod config;
+pub mod daemon_info;
 pub mod http_ng;
 pub mod ingress;
 pub mod log;

@@ -393,14 +393,12 @@ impl ConfigFile {
         // this expansion capability to give at least some verification that
         // it is not obviously broken, but it's not enough.
         let config_str = String::from_utf8_lossy(&bytes);
-        let toml: Value = if let Ok(toml) = toml::de::from_str(&config_str) {
-            toml
-        } else {
-            return Err(io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Cannot parse config file",
-            ));
-        };
+        let toml: Value = toml::de::from_str(&config_str).map_err(|err| {
+            // Keep the TOML parser's diagnostic: it includes the reason for
+            // the failure, its line and column, and the relevant source
+            // excerpt. The caller adds the configuration file's path.
+            io::Error::new(io::ErrorKind::InvalidInput, err)
+        })?;
 
         let config_str = toml::to_string(&toml).unwrap();
 
@@ -605,5 +603,20 @@ mod tests {
         let nl = bytes.find('\n').unwrap();
         let lc = cf.resolve_pos(nl + 1);
         assert_eq!((lc.line, lc.col), (2, 1));
+    }
+
+    #[test]
+    fn syntax_error_preserves_toml_diagnostic() {
+        let invalid = "valid = true\nbroken = [\n";
+        let expected = toml::de::from_str::<Value>(invalid)
+            .unwrap_err()
+            .to_string();
+
+        let err =
+            ConfigFile::new(invalid.as_bytes().to_vec(), Source::default())
+                .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), expected);
     }
 }

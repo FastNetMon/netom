@@ -5,6 +5,9 @@ use crate::comms::{
     DirectLink, Gate, GateAgent, GraphStatus, Link, DEF_UPDATE_QUEUE_LEN,
 };
 use crate::config::{Config, ConfigFile, Marked};
+use crate::daemon_info::{
+    redact_toml, ComponentInfo, ConfigSnapshot, DaemonInfo,
+};
 use crate::http_ng;
 use crate::log::Terminate;
 use crate::roto_runtime::create_runtime;
@@ -355,6 +358,10 @@ pub struct Manager {
     ingresses: Arc<ingress::Register>,
 
     http_ng_api: Arc<Mutex<http_ng::Api>>,
+
+    /// Version, uptime and a redacted snapshot of the running config, for
+    /// the read-only inspection endpoints.
+    daemon_info: Arc<DaemonInfo>,
 }
 
 impl Default for Manager {
@@ -405,10 +412,12 @@ impl Manager {
                 &crate::units::rib_unit::flowspec::flowspec_metrics(),
             ) as Weak<dyn metrics::Source>,
         );
+        let daemon_info = Arc::new(DaemonInfo::new());
         let http_ng_api = Arc::new(Mutex::new(http_ng::Api::new(
             Vec::with_capacity(1), // interfaces come from config, later on
             ingresses.clone(),
             metrics.clone(),
+            daemon_info.clone(),
         )));
 
         #[allow(
@@ -427,9 +436,69 @@ impl Manager {
             tracer,
             ingresses,
             http_ng_api,
+            daemon_info,
         };
 
         manager
+    }
+
+    pub fn daemon_info(&self) -> Arc<DaemonInfo> {
+        self.daemon_info.clone()
+    }
+
+    /// Capture the running config for the read-only inspection API.
+    ///
+    /// Redaction failing is not fatal to the daemon — it only means the
+    /// config endpoint has nothing to serve — but it must never fall back to
+    /// serving the unredacted text, so a redaction failure drops the TOML
+    /// and keeps the rest of the snapshot.
+    fn snapshot_config(
+        &self,
+        config: &Config,
+        file: &ConfigFile,
+        roto_script: Option<std::path::PathBuf>,
+    ) {
+        let toml = match redact_toml(&file.to_string()) {
+            Some(toml) => toml,
+            None => {
+                error!(
+                    "Could not redact the config for the inspection API; \
+                     /api/v1/config will report it as unavailable"
+                );
+                String::new()
+            }
+        };
+
+        let mut units: Vec<_> = config
+            .units
+            .units()
+            .iter()
+            .map(|(name, unit)| ComponentInfo {
+                name: name.clone(),
+                type_name: unit.type_name(),
+            })
+            .collect();
+        units.sort_by(|a, b| a.name.cmp(&b.name));
+
+        let mut targets: Vec<_> = config
+            .targets
+            .targets()
+            .iter()
+            .map(|(name, target)| ComponentInfo {
+                name: name.clone(),
+                type_name: target.type_name(),
+            })
+            .collect();
+        targets.sort_by(|a, b| a.name.cmp(&b.name));
+
+        self.daemon_info.set_config(ConfigSnapshot {
+            path: file.path().map(|p| p.to_path_buf()),
+            toml,
+            units,
+            targets,
+            roto_script,
+            http_listen: config.http_ng_listen.clone().unwrap_or_default(),
+        });
     }
 
     #[cfg(test)]
@@ -596,6 +665,11 @@ impl Manager {
             error!("{msg}");
             Err(Terminate::error())?
         }
+
+        // Snapshot the config for the inspection API. This runs on the
+        // initial load and on every SIGHUP reload, so what the API serves
+        // always describes the config actually in effect.
+        self.snapshot_config(config, file, roto_script.clone());
 
         // Drain the singleton static GATES contents to a local variable.
         let gates = GATES

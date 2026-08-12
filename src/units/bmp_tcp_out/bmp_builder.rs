@@ -199,8 +199,7 @@ impl PeerInfo {
         // triple is advertised. Direction is forced to SendReceive so the
         // two OPENs negotiate cleanly downstream.
         let mut addpath_cap_value = Vec::new();
-        for quad in
-            info.addpath_families.as_deref().unwrap_or(&[]).chunks(4)
+        for quad in info.addpath_families.as_deref().unwrap_or(&[]).chunks(4)
         {
             if let [afi_hi, afi_lo, safi, _dir] = *quad {
                 if (afi_hi, afi_lo) == (0, 1) || (afi_hi, afi_lo) == (0, 2) {
@@ -1479,8 +1478,7 @@ impl RouteAggregator {
         let peer = &peer;
         let raw = pamap.as_ref();
         let blob = raw.get(2..).unwrap_or(&[]);
-        let key =
-            (ingress_id, is_v4, path_id.is_some(), hash_pa_blob(blob));
+        let key = (ingress_id, is_v4, path_id.is_some(), hash_pa_blob(blob));
         let nlri_len = flowspec_nlri_encoded_len(nlri_raw, path_id.is_some());
 
         let mut group = match self.fs_groups.remove(&key) {
@@ -1582,10 +1580,7 @@ impl RouteAggregator {
                 self.fs_groups.keys().copied().collect();
             fs_keys.sort_unstable_by_key(|k| {
                 std::cmp::Reverse(
-                    self.fs_groups
-                        .get(k)
-                        .map(|g| g.nlris.len())
-                        .unwrap_or(0),
+                    self.fs_groups.get(k).map(|g| g.nlris.len()).unwrap_or(0),
                 )
             });
             for k in fs_keys {
@@ -2770,10 +2765,8 @@ mod tests {
 
         let msg = build_peer_up(&peer, true);
         let needle = [69u8, 4, 0, 1, 1, 3];
-        let occurrences = msg
-            .windows(needle.len())
-            .filter(|w| *w == needle)
-            .count();
+        let occurrences =
+            msg.windows(needle.len()).filter(|w| *w == needle).count();
         assert_eq!(
             occurrences, 2,
             "cap 69 must appear in both the sent and received OPEN"
@@ -2788,10 +2781,9 @@ mod tests {
         let msg = build_peer_up(&peer, true);
         let sent_start =
             BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + 16 + 2 + 2;
-        let sent_len = u16::from_be_bytes([
-            msg[sent_start + 16],
-            msg[sent_start + 17],
-        ]) as usize;
+        let sent_len =
+            u16::from_be_bytes([msg[sent_start + 16], msg[sent_start + 17]])
+                as usize;
         let received_start = sent_start + sent_len;
 
         let count_cap6 = |open: &[u8]| {
@@ -2825,7 +2817,8 @@ mod tests {
                 0, 1, 2, 3, // v4 multicast -> dropped (family collapse)
                 0, 2, 1, 3, // v6 unicast -> kept
                 0, 1, 133, 3, // v4 flowspec -> kept
-                0, 2, 133, 1, // v6 flowspec, Receive -> kept, forced to 3
+                0, 2, 133,
+                1, // v6 flowspec, Receive -> kept, forced to 3
                 0, 1, 128, 3, // v4 MPLS-VPN -> dropped (not re-encoded)
             ]);
         let peer = PeerInfo::from_ingress_info(&info);
@@ -2951,17 +2944,15 @@ mod tests {
             // The ADD-PATH message parses with the addpath config into
             // exactly the two path ids; the plain one with the modern
             // config into the single prefix.
-            let addpath_parse = UpdateMessage::from_octets(
-                bgp.clone(),
-                &sc_addpath,
-            )
-            .ok()
-            .and_then(|upd| {
-                upd.announcements()
-                    .ok()?
-                    .collect::<Result<Vec<_>, _>>()
+            let addpath_parse =
+                UpdateMessage::from_octets(bgp.clone(), &sc_addpath)
                     .ok()
-            });
+                    .and_then(|upd| {
+                        upd.announcements()
+                            .ok()?
+                            .collect::<Result<Vec<_>, _>>()
+                            .ok()
+                    });
             match addpath_parse.as_deref() {
                 Some(
                     [Nlri::Ipv4UnicastAddpath(a), Nlri::Ipv4UnicastAddpath(b)],
@@ -2977,11 +2968,9 @@ mod tests {
                 }
                 _ => {}
             }
-            let upd = UpdateMessage::from_octets(
-                bgp,
-                &SessionConfig::modern(),
-            )
-            .expect("plain UPDATE must parse");
+            let upd =
+                UpdateMessage::from_octets(bgp, &SessionConfig::modern())
+                    .expect("plain UPDATE must parse");
             let anns: Vec<_> =
                 upd.announcements().unwrap().map(|n| n.unwrap()).collect();
             assert_eq!(anns.len(), 1);
@@ -3357,7 +3346,7 @@ mod tests {
         assert_eq!(value[2], 133); // SAFI
         assert_eq!(value[3], 0); // next hop length 0
         assert_eq!(value[4], 0); // reserved
-        // length header + raw NLRI, byte-for-byte
+                                 // length header + raw NLRI, byte-for-byte
         assert_eq!(value[5] as usize, FS_NLRI_A.len());
         assert_eq!(&value[6..], FS_NLRI_A);
         // nothing after the attributes
@@ -3432,18 +3421,16 @@ mod tests {
     #[test]
     fn flowspec_eor_bytes() {
         let peer = agg_test_peer();
-        let msg =
-            build_end_of_rib_marker(&peer, AfiSafiType::Ipv4FlowSpec)
-                .unwrap();
+        let msg = build_end_of_rib_marker(&peer, AfiSafiType::Ipv4FlowSpec)
+            .unwrap();
         let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
         let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
         let pas = &bgp[23..23 + pa_len];
         // Empty MP_UNREACH: AFI 1, SAFI 133, no NLRI.
         assert_eq!(pas, &[0x80, 15, 3, 0x00, 0x01, 133]);
         // And the v6 variant carries AFI 2.
-        let msg =
-            build_end_of_rib_marker(&peer, AfiSafiType::Ipv6FlowSpec)
-                .unwrap();
+        let msg = build_end_of_rib_marker(&peer, AfiSafiType::Ipv6FlowSpec)
+            .unwrap();
         let bgp = &msg[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
         let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
         assert_eq!(&bgp[23..23 + pa_len], &[0x80, 15, 3, 0x00, 0x02, 133]);
@@ -3489,10 +3476,7 @@ mod tests {
     #[test]
     fn peer_afisafis_follow_received_mp_capabilities() {
         let mut peer = agg_test_peer();
-        assert_eq!(
-            peer.supported_afisafis(),
-            vec![AfiSafiType::Ipv4Unicast]
-        );
+        assert_eq!(peer.supported_afisafis(), vec![AfiSafiType::Ipv4Unicast]);
 
         peer.peer_capabilities = vec![
             1, 4, 0, 2, 0, 1, // IPv6 unicast
@@ -3531,19 +3515,15 @@ mod tests {
     fn flowspec_aggregation_packs_rules() {
         let peer = agg_test_peer();
         let pamap = fs_pamap();
-        let mut agg = RouteAggregator::new(
-            1024 * 1024,
-            HashMap::from([(1u32, peer)]),
-        );
+        let mut agg =
+            RouteAggregator::new(1024 * 1024, HashMap::from([(1u32, peer)]));
         let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
         let mut sink = |msg: Vec<u8>, n: usize| {
             messages.push((msg, n));
             true
         };
-        assert!(agg
-            .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
-        assert!(agg
-            .add_flowspec(1, None, true, FS_NLRI_B, &pamap, &mut sink));
+        assert!(agg.add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg.add_flowspec(1, None, true, FS_NLRI_B, &pamap, &mut sink));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 1);
         let (msg, n) = &messages[0];
@@ -3559,7 +3539,7 @@ mod tests {
         let value = &mp[4..4 + value_len];
         assert_eq!(value[2], 133);
         assert_eq!(value[3], 0); // nh_len 0
-        // both NLRI present, each with its length header
+                                 // both NLRI present, each with its length header
         let nlri = &value[5..];
         assert_eq!(nlri[0] as usize, FS_NLRI_A.len());
         assert_eq!(&nlri[1..1 + FS_NLRI_A.len()], FS_NLRI_A);
@@ -3572,10 +3552,8 @@ mod tests {
     fn flowspec_aggregation_uses_extended_messages() {
         let peer = agg_test_peer();
         let pamap = fs_pamap();
-        let mut agg = RouteAggregator::new(
-            1024 * 1024,
-            HashMap::from([(1u32, peer)]),
-        );
+        let mut agg =
+            RouteAggregator::new(1024 * 1024, HashMap::from([(1u32, peer)]));
         let nlri_a = vec![1u8; 3000];
         let nlri_b = vec![2u8; 3000];
         let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
@@ -3583,17 +3561,13 @@ mod tests {
             messages.push((msg, n));
             true
         };
-        assert!(agg.add_flowspec(
-            1, None, true, &nlri_a, &pamap, &mut sink,
-        ));
-        assert!(agg.add_flowspec(
-            1, None, true, &nlri_b, &pamap, &mut sink,
-        ));
+        assert!(agg.add_flowspec(1, None, true, &nlri_a, &pamap, &mut sink,));
+        assert!(agg.add_flowspec(1, None, true, &nlri_b, &pamap, &mut sink,));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].1, 2);
-        let bgp = &messages[0].0
-            [BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
+        let bgp =
+            &messages[0].0[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..];
         let bgp_len = u16::from_be_bytes([bgp[16], bgp[17]]) as usize;
         assert_eq!(bgp_len, bgp.len());
         assert!(bgp_len > 4096);
@@ -3606,10 +3580,8 @@ mod tests {
     fn flowspec_and_unicast_never_share_an_update() {
         let peer = agg_test_peer();
         let pamap = RotondaPaMap::from(vec![0x40, 1, 1, 0]);
-        let mut agg = RouteAggregator::new(
-            1024 * 1024,
-            HashMap::from([(1u32, peer)]),
-        );
+        let mut agg =
+            RouteAggregator::new(1024 * 1024, HashMap::from([(1u32, peer)]));
         let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
         let mut sink = |msg: Vec<u8>, n: usize| {
             messages.push((msg, n));
@@ -3619,8 +3591,7 @@ mod tests {
             Prefix::new(IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 1, 0)), 24)
                 .unwrap();
         assert!(agg.add(1, None, prefix, &pamap, &mut sink));
-        assert!(agg
-            .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
+        assert!(agg.add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
         assert!(agg.flush_all(&mut sink));
         assert_eq!(messages.len(), 2);
     }
@@ -3694,10 +3665,8 @@ mod tests {
     fn flowspec_aggregator_separates_and_encodes_path_ids() {
         let peer = agg_test_peer();
         let pamap = fs_pamap();
-        let mut agg = RouteAggregator::new(
-            1024 * 1024,
-            HashMap::from([(1u32, peer)]),
-        );
+        let mut agg =
+            RouteAggregator::new(1024 * 1024, HashMap::from([(1u32, peer)]));
         let mut messages: Vec<(Vec<u8>, usize)> = Vec::new();
         {
             let mut sink = |msg: Vec<u8>, n: usize| {
@@ -3722,8 +3691,9 @@ mod tests {
                 &pamap,
                 &mut sink
             ));
-            assert!(agg
-                .add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink));
+            assert!(
+                agg.add_flowspec(1, None, true, FS_NLRI_A, &pamap, &mut sink)
+            );
             assert!(agg.flush_all(&mut sink));
         }
         assert_eq!(
@@ -3781,10 +3751,7 @@ mod tests {
         let mut buf = Vec::new();
         append_flowspec_nlri(&mut buf, &long_nlri, None);
         assert_eq!(buf.len(), 2 + 300);
-        assert_eq!(
-            u16::from_be_bytes([buf[0], buf[1]]),
-            0xf000 | 300u16
-        );
+        assert_eq!(u16::from_be_bytes([buf[0], buf[1]]), 0xf000 | 300u16);
         assert_eq!(&buf[2..], &long_nlri[..]);
         assert_eq!(flowspec_nlri_encoded_len(&long_nlri, false), 302);
     }

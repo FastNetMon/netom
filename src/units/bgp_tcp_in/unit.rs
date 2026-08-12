@@ -268,6 +268,38 @@ pub(super) fn spawn_session(
 
 pub static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Record the configured peers in the session registry.
+///
+/// Without this a peer that has never established has no ingress entry and
+/// no session, and so would simply be missing from `show ip bgp summary` —
+/// which is exactly the row an operator is looking for when a peer is down.
+///
+/// Only exactly-configured peers can be listed: a peer matched by a prefix
+/// has no single address to show until it connects.
+fn publish_peer_roster(peers: &super::peer_config::PeerConfigs) {
+    use super::peer_config::PrefixOrExact;
+
+    let registry = super::session_status::registry();
+    // Re-mark from scratch so that a peer dropped from the config stops
+    // being reported as configured.
+    registry.clear_configured_marks();
+
+    for (key, cfg) in peers.iter() {
+        let PrefixOrExact::Exact(addr) = key else {
+            continue;
+        };
+        let status = registry.get_or_create(*addr);
+        status.set_configured(true);
+        status.set_name(cfg.name().clone());
+        status.set_connect_mode(cfg.connect());
+        if let Some(asn) = cfg.configured_asn() {
+            status.set_remote_asn(asn.into_u32());
+        }
+    }
+
+    registry.forget_unconfigured_idle();
+}
+
 pub type LiveSessions = HashMap<
     (IpAddr, Asn),
     (
@@ -329,7 +361,10 @@ impl BgpTcpInRunner {
             roto_metrics,
             live_sessions: Arc::new(Mutex::new(HashMap::new())),
             ingresses,
-            peer_stats: Arc::new(BgpPeerStatsRegistry::new()),
+            // Shared process-wide rather than owned here, so counters
+            // survive a live reconfiguration and the HTTP API can read
+            // them. See `ingress::peer_stats::registry`.
+            peer_stats: crate::ingress::peer_stats::registry(),
         }
     }
 
@@ -372,6 +407,8 @@ impl BgpTcpInRunner {
         for link in sources.iter_mut() {
             link.connect(arc_self.clone(), false).await.unwrap();
         }
+
+        publish_peer_roster(&arc_self.bgp.load().peer_configs);
 
         // Spawn the per-peer Stats Report emitter, if enabled.
         // Reads only Arc-shared state, so it's independent of the
@@ -588,6 +625,9 @@ impl BgpTcpInRunner {
                                 self.bgp.load().listen != new_unit.listen;
 
                             self.bgp.store(new_unit.into());
+                            publish_peer_roster(
+                                &self.bgp.load().peer_configs,
+                            );
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.

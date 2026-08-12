@@ -129,8 +129,7 @@ impl FlowSpecRuleSet {
         self.raw.push(validity as u8);
         self.raw
             .extend_from_slice(&(nlri.len() as u16).to_be_bytes());
-        self.raw
-            .extend_from_slice(&(pa.len() as u32).to_be_bytes());
+        self.raw.extend_from_slice(&(pa.len() as u32).to_be_bytes());
         self.raw.extend_from_slice(nlri);
         self.raw.extend_from_slice(&pa);
         replaced
@@ -146,8 +145,8 @@ impl FlowSpecRuleSet {
         let body_start = 1;
         let body = &self.raw[body_start..];
         while body.len() - pos >= ENTRY_HEADER {
-            let nlri_len = u16::from_be_bytes([body[pos + 1], body[pos + 2]])
-                as usize;
+            let nlri_len =
+                u16::from_be_bytes([body[pos + 1], body[pos + 2]]) as usize;
             let pa_len = u32::from_be_bytes([
                 body[pos + 3],
                 body[pos + 4],
@@ -472,14 +471,8 @@ impl metrics::Source for FlowSpecMetrics {
 
         target.append(&RULES_METRIC, None, |records| {
             let (v4, v6) = self.rules();
-            records.label_value(
-                &[("afi", "ipv4")],
-                v4,
-            );
-            records.label_value(
-                &[("afi", "ipv6")],
-                v6,
-            );
+            records.label_value(&[("afi", "ipv4")], v4);
+            records.label_value(&[("afi", "ipv6")], v6);
         });
     }
 }

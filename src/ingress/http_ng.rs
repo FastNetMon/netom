@@ -54,7 +54,9 @@ impl IngressApi {
                 raw.push(b'}');
                 raw
             }
-            OutputFormat::Jsonl => state.ingress_register.search_jsonl(filter),
+            OutputFormat::Jsonl => {
+                state.ingress_register.search_jsonl(filter)
+            }
         };
         Ok(([("content-type", format.content_type())], body))
     }

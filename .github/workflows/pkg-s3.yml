@@ -111,6 +111,52 @@ jobs:
           name: deb-noble
           path: target/debian/*.deb
 
+  build-resolute:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: ubuntu:26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          apt-get install -y build-essential curl pkg-config libssl-dev
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install cargo-deb
+        run: |
+          . "$HOME/.cargo/env"
+          cargo install cargo-deb --locked
+
+      - name: Generate changelog
+        run: |
+          mkdir -p target/debian
+          cat > target/debian/changelog << EOF
+          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
+
+            * Release ${{ needs.prepare.outputs.version }}
+
+           -- Package Builder <builder@localhost>  $(date -R)
+          EOF
+
+      - name: Build package
+        run: |
+          . "$HOME/.cargo/env"
+          cargo deb
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-resolute
+          path: target/debian/*.deb
+
   build-trixie:
     needs: prepare
     runs-on: ubuntu-latest
@@ -158,7 +204,7 @@ jobs:
           path: target/debian/*.deb
 
   upload:
-    needs: [build-jammy, build-noble, build-trixie]
+    needs: [build-jammy, build-noble, build-resolute, build-trixie]
     runs-on: ubuntu-latest
     steps:
       - name: Install deb-s3
@@ -204,6 +250,15 @@ jobs:
             --visibility private \
             $ENDPOINT_FLAG \
             packages/deb-noble/*.deb
+
+          deb-s3 upload \
+            --bucket ${{ secrets.DEB_S3_BUCKET }} \
+            --codename resolute \
+            --component main \
+            --arch amd64 \
+            --visibility private \
+            $ENDPOINT_FLAG \
+            packages/deb-resolute/*.deb
 
           deb-s3 upload \
             --bucket ${{ secrets.DEB_S3_BUCKET }} \
