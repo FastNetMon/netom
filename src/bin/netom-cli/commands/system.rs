@@ -1,14 +1,31 @@
-//! `show version`, `show status`, `show running-config`, `show filters`.
+//! `help`, `show version`, `show status`, `show running-config`,
+//! `show filters`.
 
 use std::io::Write;
 
 use crate::error::CliError;
 use crate::render::{fmt, left, right, Col, Table};
 use crate::session::Session;
-use crate::tree::Captures;
+use crate::tree::{command_list, Captures};
 
 pub fn exit(session: &mut Session, _c: &Captures) -> Result<(), CliError> {
     session.should_exit = true;
+    Ok(())
+}
+
+/// The whole command tree at once, for people who do not yet know what to
+/// press `?` after.
+pub fn help(session: &mut Session, _c: &Captures) -> Result<(), CliError> {
+    let mut out = session.writer();
+    writeln!(out, "Commands:\n")?;
+    writeln!(out, "{}", command_list())?;
+    writeln!(
+        out,
+        "\nKeywords may be abbreviated to any unambiguous prefix, so \
+         'sh ip b sum' is\n'show ip bgp summary'. Type ? at any point for \
+         the keywords that may follow.",
+    )?;
+    out.finish()?;
     Ok(())
 }
 

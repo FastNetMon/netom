@@ -99,6 +99,13 @@ cli show version | grep -q "^netom " || fail "show version"
 cli sh ver | grep -q "^netom " || fail "abbreviated show version"
 cli show status | grep -q "^Units:" || fail "show status units"
 
+# `help` lists the whole tree, and `?` lists what may follow — including
+# when only one keyword does, which must be listed and not auto-completed.
+cli help | grep -q "show ip bgp summary bmp" || fail "help command list"
+cli 'show ip ?' | grep -q "bgp" || fail "? with a single continuation"
+cli 'show ip bgp ?' | grep -q "^  <cr>$" \
+    || fail "? did not mark a runnable command with <cr>"
+
 # The API is unauthenticated, so a leaked MD5 key would be readable by
 # anyone who can reach the port.
 if cli show running-config | grep -q "e2e-secret-must-not-leak"; then

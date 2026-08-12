@@ -25,8 +25,16 @@ is
 .BR "show ip bgp summary" .
 A
 .B ?
-at the end of a line lists the keywords that may follow it; in interactive
-mode, TAB completes them.
+at the end of a line lists the keywords that may follow it, always as a
+list even when only one keyword matches, and ends the listing with
+.B <cr>
+when the line is already a command that can be run. In interactive mode TAB
+completes instead, and
+.B ?
+may be pressed at any point in the line without disturbing what has been
+typed. The
+.B help
+command lists every command at once.
 
 This tool is read-only. It issues only GET requests and cannot change the
 daemon's state or configuration.
@@ -101,6 +109,9 @@ tried after it. This keeps discovery from ever directing queries off-box on
 its own initiative.
 
 .SH COMMANDS
+.TP
+.B help
+Every command in the tree, one per line, with what it shows.
 .TP
 .B show version
 Daemon and CLI versions, uptime and start time.
