@@ -190,6 +190,20 @@ pub struct Rib {
 #[derive(Copy, Clone, Debug)]
 struct Multicast(bool);
 
+/// Prefix and route counts for one of the RIB's backing stores.
+///
+/// `routes` counts stored records — one per `(prefix, mui)` — so it exceeds
+/// `prefixes` whenever several peers announce the same prefix.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreCounts {
+    pub name: &'static str,
+    pub prefixes: usize,
+    pub prefixes_v4: usize,
+    pub prefixes_v6: usize,
+    pub routes: usize,
+}
+
 impl Rib {
     pub fn new(
         ingress_register: Arc<ingress::Register>,
@@ -220,6 +234,38 @@ impl Rib {
         } else {
             Err(PrefixStoreError::StoreNotReadyError)
         }
+    }
+
+    /// Per-store prefix and route counts, for `/api/v1/status`.
+    ///
+    /// Cheap — the store counters are atomic loads, the same ones
+    /// `log_memory_stats` reads.
+    pub fn store_counts(&self) -> Vec<StoreCounts> {
+        let mut res = Vec::with_capacity(3);
+        for (name, store) in [
+            ("unicast", self.unicast.as_ref()),
+            ("multicast", self.multicast.as_ref()),
+        ] {
+            if let Some(store) = store {
+                res.push(StoreCounts {
+                    name,
+                    prefixes: store.prefixes_count().in_memory(),
+                    prefixes_v4: store.prefixes_v4_count().in_memory(),
+                    prefixes_v6: store.prefixes_v6_count().in_memory(),
+                    routes: store.routes_count().in_memory(),
+                });
+            }
+        }
+        if let Some(store) = self.flowspec.as_ref() {
+            res.push(StoreCounts {
+                name: "flowspec",
+                prefixes: store.prefixes_count().in_memory(),
+                prefixes_v4: store.prefixes_v4_count().in_memory(),
+                prefixes_v6: store.prefixes_v6_count().in_memory(),
+                routes: store.routes_count().in_memory(),
+            });
+        }
+        res
     }
 
     /// Emit a consolidated snapshot of the main memory consumers to the log,

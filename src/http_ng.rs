@@ -8,6 +8,7 @@ use tokio::{sync::mpsc, task::JoinHandle};
 use tower_http::compression::CompressionLayer;
 
 use crate::{
+    daemon_info::DaemonInfo,
     ingress::{self, http_ng::IngressApi},
     units::rib_unit::rib::Rib,
     webui::WebUI,
@@ -30,6 +31,9 @@ pub struct Api {
     /// The metrics collection
     metrics: crate::metrics::Collection,
 
+    /// Version, uptime and the running config snapshot
+    daemon_info: Arc<DaemonInfo>,
+
     /// The axum Router, populated with endpoints
     router: axum::Router<ApiState>,
 
@@ -51,6 +55,9 @@ pub struct ApiState {
     // roto::Compiled: < >
     /// The metrics collection
     pub(crate) metrics: crate::metrics::Collection,
+
+    /// Version, uptime and the running config snapshot
+    pub(crate) daemon_info: Arc<DaemonInfo>,
 }
 
 impl Api {
@@ -61,11 +68,13 @@ impl Api {
         interfaces: Vec<SocketAddr>,
         ingress_register: Arc<ingress::Register>,
         metrics: crate::metrics::Collection,
+        daemon_info: Arc<DaemonInfo>,
     ) -> Self {
         let state = ApiState {
             store: Default::default(),
             ingress_register: ingress_register.clone(),
             metrics: metrics.clone(),
+            daemon_info: daemon_info.clone(),
         };
 
         let router = axum::Router::<ApiState>::new()
@@ -78,6 +87,7 @@ impl Api {
             interfaces,
             ingress_register,
             metrics,
+            daemon_info,
             router,
             signal_txs: vec![],
             serve_handles: vec![],
@@ -92,6 +102,7 @@ impl Api {
         res.api_root = "/api/v1".into();
 
         IngressApi::register_routes(&mut res);
+        crate::daemon_info::http_ng::register_routes(&mut res);
 
         res
     }
@@ -114,6 +125,7 @@ impl Api {
             store: self.store.clone(),
             ingress_register: self.ingress_register.clone(),
             metrics: self.metrics.clone(),
+            daemon_info: self.daemon_info.clone(),
         }
     }
 
