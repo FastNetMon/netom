@@ -114,10 +114,17 @@ surfacing, so a total-message counter would be a guess and a sent-message
 counter would always read zero.
 
 **`State/PfxRcd` shows `-` for BMP-observed peers.** For a session netom
-terminates itself the prefix count is maintained as routes arrive. For a
-session observed through a BMP feed, getting the same number would mean
-scanning the whole RIB once per peer — far too expensive for a command
-people run repeatedly. A dash means "not counted", not "zero".
+terminates itself the prefix count is maintained as routes enter and leave
+the RIB. For a session observed through a BMP feed, getting the same number
+would mean scanning the whole RIB once per peer — far too expensive for a
+command people run repeatedly. A dash means "not counted", not "zero".
+
+**`PfxRcd` is the current table size, not a running total.** It counts the
+prefixes the peer currently has in the RIB, so re-advertisements do not
+inflate it: a peer that keeps re-announcing the same prefix with a new AS
+path is performing BGP's implicit withdraw, and the count stays put. If you
+want the churn instead, it is the `dupPrefixAdvertisements` counter on
+`/bgp/neighbors` and in the peer's BMP Statistics Report.
 
 **The hold time is the configured one.** `show ip bgp neighbors` reports the
 hold time netom was configured with. The negotiated value —

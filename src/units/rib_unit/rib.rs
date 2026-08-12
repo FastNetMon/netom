@@ -35,7 +35,12 @@ use serde::{
 };
 
 use crate::{
-    ingress::{self, register::IdAndInfo, IngressId, IngressInfo},
+    ingress::{
+        self,
+        peer_stats::{self, AfiSafiKey},
+        register::IdAndInfo,
+        IngressId, IngressInfo,
+    },
     payload::{
         PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter,
         RotondaRoute, RouterId,
@@ -189,6 +194,60 @@ pub struct Rib {
 
 #[derive(Copy, Clone, Debug)]
 struct Multicast(bool);
+
+/// The Adj-RIB-In gauge for the peer that owns `mui`, if it is a peer we
+/// keep per-peer stats for.
+///
+/// Only native BGP sessions have an entry (BMP-observed peers deliberately
+/// have none — see `bgp_tcp_in::http_ng::Neighbor::prefixes_received`), so
+/// this is `None` for most muis in a BMP collector and the caller skips the
+/// extra store probes that maintaining the gauge costs. ADD-PATH
+/// path-children resolve to their parent session's entry via the registry
+/// alias installed in `router_handler::get_or_create_path_child`.
+fn peer_gauge(mui: IngressId) -> Option<Arc<peer_stats::BgpPeerStats>> {
+    let registry = peer_stats::registry();
+    if registry.is_empty() {
+        return None;
+    }
+    registry.get(mui)
+}
+
+/// RFC 7854 §4.8 per-AFI/SAFI key for a stored unicast/multicast prefix.
+fn prefix_afi_safi(prefix: &Prefix, multicast: Multicast) -> AfiSafiKey {
+    let afi = if prefix.is_v4() { 1 } else { 2 };
+    let safi = if multicast.0 { 2 } else { 1 };
+    (afi, safi)
+}
+
+/// Zero the Adj-RIB-In gauge for `mui` because every route it owns has just
+/// been withdrawn or removed in bulk. `family` scopes it to one AFI/SAFI;
+/// `None` clears the peer entirely.
+///
+/// Bulk teardown is the one case where the per-prefix transition tracking in
+/// `insert_prefix` is bypassed — the store flips a whole-mui bit rather than
+/// walking prefixes — so the gauge has to be reset explicitly here or it
+/// would keep reporting a table for a peer that has none.
+fn reset_peer_gauge(mui: IngressId, family: Option<AfiSafiType>) {
+    let Some(gauge) = peer_gauge(mui) else {
+        return;
+    };
+    match family {
+        None => gauge.reset_adj_rib_in(),
+        Some(f) => {
+            let key: AfiSafiKey = match f {
+                AfiSafiType::Ipv4Unicast => (1, 1),
+                AfiSafiType::Ipv6Unicast => (2, 1),
+                AfiSafiType::Ipv4Multicast => (1, 2),
+                AfiSafiType::Ipv6Multicast => (2, 2),
+                AfiSafiType::Ipv4FlowSpec => (1, 133),
+                AfiSafiType::Ipv6FlowSpec => (2, 133),
+                // Families we never store; nothing was ever counted.
+                _ => return,
+            };
+            gauge.reset_adj_rib_in_afi_safi(key);
+        }
+    }
+}
 
 /// Prefix and route counts for one of the RIB's backing stores.
 ///
@@ -587,6 +646,17 @@ impl Rib {
         {
             // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
             self.reset_flowspec_family(store, mui, key.is_v4())?;
+            // The retained rules just went away, so the gauge for this
+            // family has to follow them down before the new session's
+            // first rule is counted.
+            reset_peer_gauge(
+                mui,
+                Some(if key.is_v4() {
+                    AfiSafiType::Ipv4FlowSpec
+                } else {
+                    AfiSafiType::Ipv6FlowSpec
+                }),
+            );
             self.ingress_register.update_info(
                 mui,
                 ingress::IngressInfo::new()
@@ -608,11 +678,21 @@ impl Rib {
         let metrics = super::flowspec::flowspec_metrics();
         let is_v4 = key.is_v4();
 
+        // Per-peer Adj-RIB-In for SAFI 133 counts rules, and `upsert` /
+        // `remove` on the rule set already report whether the rule was
+        // actually added or actually removed — the same not-present ->
+        // present transition the unicast path has to derive from the store.
+        let gauge = peer_gauge(mui);
+        let afi_safi: AfiSafiKey = (if is_v4 { 1 } else { 2 }, 133);
+
         if route_status == RouteStatus::Withdrawn {
             metrics.note_update(is_v4, true);
             if !ruleset.remove(nlri_raw) {
                 // Unknown rule (or peer) — nothing to withdraw.
                 return Ok(no_op);
+            }
+            if let Some(gauge) = &gauge {
+                gauge.sub_adj_rib_in(afi_safi, 1);
             }
             let (status, ltime) = if ruleset.is_empty() {
                 (RouteStatus::Withdrawn, ltime)
@@ -634,8 +714,17 @@ impl Rib {
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         let report = store.insert(&key, pubrec, None);
-        if report.is_ok() && !replaced {
-            self.flowspec_rule_counts.add(is_v4, 1);
+        if report.is_ok() {
+            if !replaced {
+                self.flowspec_rule_counts.add(is_v4, 1);
+            }
+            if let Some(gauge) = &gauge {
+                if replaced {
+                    gauge.inc_dup_prefix_advertisements(1);
+                } else {
+                    gauge.add_adj_rib_in(afi_safi, 1);
+                }
+            }
         }
         report
     }
@@ -930,7 +1019,44 @@ impl Rib {
 
         let mui = ingress_id;
 
+        // Adj-RIB-In is a gauge, so it may only move on a transition of this
+        // (prefix, mui) between "active" and "not active". Counting raw NLRIs
+        // instead inflates it without bound, because BGP's implicit withdraw
+        // re-advertises a prefix that is already in the RIB with no matching
+        // UNREACH to balance it. `was_active` is the pre-state; it costs a
+        // store probe, so it is only computed for peers we report on.
+        let gauge = peer_gauge(mui);
+        let afi_safi = prefix_afi_safi(prefix, multicast);
+        let was_active = gauge.as_ref().map(|_| {
+            // A globally withdrawn mui (peer down, records retained for a
+            // possible reconnect) owns nothing, but its individual records
+            // keep their Active status — `mark_mui_as_withdrawn` only sets
+            // the store-wide bitmap, and a mui-scoped record lookup does not
+            // consult it. Check the bitmap first, or every prefix of a
+            // reconnecting peer would look like a re-advertisement and the
+            // gauge would never climb back up. This is a roaring-bitmap
+            // lookup, cheaper than the tree descents below.
+            if store.mui_is_withdrawn_v4(mui)
+                || store.mui_is_withdrawn_v6(mui)
+            {
+                return false;
+            }
+            // `contains` is a bitmap check with no record-map read: false
+            // means no record at all, which is the overwhelmingly common
+            // case while a peer is loading its table. Only when a record
+            // does exist do we pay for reading its status, which is the
+            // churn path and runs orders of magnitude less often.
+            store.contains(prefix, Some(mui))
+                && store
+                    .get_records_for_prefix(prefix, Some(mui), false)
+                    .is_ok_and(|r| r.is_some_and(|recs| !recs.is_empty()))
+        });
+
         if route_status == RouteStatus::Withdrawn {
+            if let (Some(gauge), Some(true)) = (&gauge, was_active) {
+                gauge.sub_adj_rib_in(afi_safi, 1);
+            }
+
             if !retain_withdrawn_attributes {
                 if !store.contains(prefix, Some(mui)) {
                     return Ok(UpsertReport {
@@ -996,9 +1122,26 @@ impl Rib {
             },
         );
 
-        store.insert(
+        let report = store.insert(
             prefix, pubrec, None, // Option<TBI>
-        )
+        );
+
+        // Only a not-active -> active transition grows the Adj-RIB-In. A
+        // re-advertisement of a prefix the peer already has is an implicit
+        // withdraw: the RIB replaces the record, the gauge does not move,
+        // and the announcement is counted as a duplicate instead (RFC 7854
+        // §4.8 stat type 1) so the churn stays visible.
+        if let (Some(gauge), Some(was_active)) = (&gauge, was_active) {
+            if report.is_ok() && route_status == RouteStatus::Active {
+                if was_active {
+                    gauge.inc_dup_prefix_advertisements(1);
+                } else {
+                    gauge.add_adj_rib_in(afi_safi, 1);
+                }
+            }
+        }
+
+        report
     }
 
     pub fn withdraw_for_ingress(
@@ -1044,6 +1187,7 @@ impl Rib {
 
         for (ingress_id, specific_afisafi) in ids {
             debug!("withdraw_for_ingress for {ingress_id}");
+            reset_peer_gauge(*ingress_id, *specific_afisafi);
             match specific_afisafi {
                 None => {
                     // Set all address families to withdrawn.
@@ -1193,6 +1337,7 @@ impl Rib {
         let count_mutation = self.flowspec_rule_counts.begin_mutation();
 
         for &id in ids {
+            reset_peer_gauge(id, None);
             if let Some(store) = (*self.unicast).as_ref() {
                 match store.remove_mui(id) {
                     Ok((records, emptied)) => debug!(

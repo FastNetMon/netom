@@ -91,6 +91,22 @@ Released yyyy-mm-dd.
 
 ### Bug fixes
 
+* The per-peer prefix count — `State/PfxRcd` in `netom-cli show ip bgp
+  summary`, `prefixesReceived` in the HTTP API, and the Adj-RIB-In gauges
+  (RFC 7854 §4.8 stat types 7 and 9) in synthesized BMP Statistics
+  Reports — counted every accepted NLRI instead of tracking the size of
+  the peer's Adj-RIB-In. BGP's implicit withdraw re-advertises a prefix
+  that is already in the RIB as a plain announcement, with no matching
+  UNREACH to balance it, so the value climbed with churn and never
+  converged: a full-view peer read roughly 3.4M prefixes after six hours
+  on a table of about 1M.
+
+  The gauge is now maintained by the RIB, which moves it only on a real
+  transition of a `(prefix, peer)` into or out of the store. Announcements
+  that replace an existing route are counted as
+  `dupPrefixAdvertisements` (stat type 1) instead, which was previously
+  always zero — that counter is what makes the churn visible now that it
+  no longer distorts the table size.
 
 ### Other changes
 

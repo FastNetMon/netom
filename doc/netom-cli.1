@@ -183,6 +183,14 @@ For a session observed through BMP it shows
 .BR \- ,
 because that count would require scanning the whole RIB once per peer.
 
+The count is the number of prefixes the peer currently has in the RIB, not
+a running total of announcements, so re-advertisements do not inflate it.
+A peer re-announcing a prefix it already announced is performing BGP's
+implicit withdraw; those are counted separately, as
+.B Duplicates
+under the prefix statistics of
+.BR "show ip bgp neighbors" .
+
 The hold time reported by
 .B show ip bgp neighbors
 is the configured one, not the negotiated one, which the BGP library keeps

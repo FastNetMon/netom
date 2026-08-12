@@ -34,9 +34,7 @@ use routecore::bgp::nlri::common::PathId;
 
 use crate::common::routecore_extra::encode_addpath_families;
 use crate::comms::{Gate, GateStatus, Terminated};
-use crate::ingress::peer_stats::{
-    AfiSafiKey, BgpPeerStats, BgpPeerStatsRegistry,
-};
+use crate::ingress::peer_stats::{BgpPeerStats, BgpPeerStatsRegistry};
 use crate::ingress::register::IngressState;
 use crate::ingress::IngressType;
 use crate::payload::{Payload, RotondaRoute, Update};
@@ -139,19 +137,6 @@ struct Processor {
     // main all-encompassing RIB.
     #[allow(dead_code)]
     rtr_cache: Arc<RtrCache>,
-}
-
-/// IANA AFI/SAFI wire codes for the [`RotondaRoute`] variants we
-/// currently support — used as the key for per-AFI/SAFI stat TLVs.
-fn rotonda_route_afi_safi(rr: &RotondaRoute) -> AfiSafiKey {
-    match rr {
-        RotondaRoute::Ipv4Unicast(..) => (1, 1),
-        RotondaRoute::Ipv6Unicast(..) => (2, 1),
-        RotondaRoute::Ipv4Multicast(..) => (1, 2),
-        RotondaRoute::Ipv6Multicast(..) => (2, 2),
-        RotondaRoute::Ipv4FlowSpec(..) => (1, 133),
-        RotondaRoute::Ipv6FlowSpec(..) => (2, 133),
-    }
 }
 
 impl Processor {
@@ -476,7 +461,6 @@ impl Processor {
                                         received,
                                         bgp_msg,
                                         session_ingress_id,
-                                        peer_stats_handle.as_deref(),
                                     ).await;
                                     match update {
                                         Ok(update) => {
@@ -819,9 +803,11 @@ impl Processor {
                 // Clean up the ingress register entry so it doesn't leak.
                 self.ingresses.remove(session_ingress_id);
                 // Its ADD-PATH path-children reference the removed session
-                // as parent and can never be claimed again; drop them too.
+                // as parent and can never be claimed again; drop them too,
+                // along with the stats aliases pointing at the session.
                 for child in self.path_children.values() {
                     self.ingresses.remove(*child);
+                    self.peer_stats.remove(*child);
                 }
                 // And the per-peer stats — the periodic emitter would
                 // otherwise keep publishing a stale Stats Report for a
@@ -856,7 +842,6 @@ impl Processor {
         received: std::time::Instant,
         bgp_msg: UpdateMessage<bytes::Bytes>,
         ingress_id: ingress::IngressId,
-        peer_stats: Option<&BgpPeerStats>,
     ) -> Result<Update, session::Error> {
         // When sending both v4 and v6 nlri using exabgp, exa sends a v4
         // NextHop in a v6 MP_REACH_NLRI, which is invalid.
@@ -891,28 +876,14 @@ impl Processor {
         let rr_reach = explode_announcements(&bgp_msg)?;
         let rr_unreach = explode_withdrawals(&bgp_msg)?;
 
-        // Update per-AFI/SAFI Adj-RIB-In counters before consuming
-        // the route lists. Bucket by AFI/SAFI so we take the
-        // per-peer write-lock at most once per (AFI, SAFI) per
-        // UPDATE message even when the message contains many NLRIs.
-        if let Some(ps) = peer_stats {
-            use std::collections::HashMap;
-            let mut adds: HashMap<AfiSafiKey, u64> = HashMap::new();
-            for (rr, _) in &rr_reach {
-                *adds.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
-            }
-            for (k, v) in adds {
-                ps.add_adj_rib_in(k, v);
-            }
-
-            let mut subs: HashMap<AfiSafiKey, u64> = HashMap::new();
-            for (rr, _) in &rr_unreach {
-                *subs.entry(rotonda_route_afi_safi(rr)).or_insert(0) += 1;
-            }
-            for (k, v) in subs {
-                ps.sub_adj_rib_in(k, v);
-            }
-        }
+        // The Adj-RIB-In gauge is *not* maintained here. Counting NLRIs as
+        // they arrive cannot see BGP's implicit withdraw — a re-advertised
+        // prefix arrives as a plain announcement with no matching UNREACH —
+        // so the count grew with churn instead of tracking the table size
+        // (a full-view peer read several times its real prefix count after
+        // a few hours). The gauge is maintained in `Rib::insert_prefix`
+        // instead, which can tell an announcement from a replacement by
+        // looking at what is already stored for this peer.
 
         for (rr, path_id) in rr_reach {
             // Plain NLRI store under the session's mui; ADD-PATH NLRI under
@@ -1001,6 +972,12 @@ impl Processor {
             }
         }
         self.ingresses.update_info(child_id, info);
+        // Routes for this path id are stored under the child mui, so the RIB
+        // would look up per-peer stats under an id that has no entry and skip
+        // the Adj-RIB-In gauge. Point the child at the session's counters:
+        // an ADD-PATH peer then reports one gauge covering all its paths,
+        // matching how `show ip bgp summary` lists it as a single neighbor.
+        self.peer_stats.alias(child_id, session_id);
         self.path_children.insert(path_id, child_id);
         child_id
     }

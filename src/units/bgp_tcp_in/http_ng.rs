@@ -86,6 +86,12 @@ pub struct Neighbor {
 
     /// Prefixes currently in this peer's Adj-RIB-In.
     ///
+    /// A gauge, not a running total of announcements: the RIB maintains it
+    /// as prefixes enter and leave the store (see `Rib::insert_prefix`), so
+    /// a re-advertisement — BGP's implicit withdraw, which arrives as a
+    /// plain announcement with no matching UNREACH — leaves it unchanged and
+    /// is counted in `dup_prefix_advertisements` instead.
+    ///
     /// Only known for peers netom terminates itself. For BMP-observed peers
     /// the counter would require a full RIB scan per peer, so it is absent
     /// rather than wrong.
@@ -93,6 +99,14 @@ pub struct Neighbor {
     pub prefixes_received: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prefixes_rejected: Option<u64>,
+
+    /// Announcements that replaced a route this peer already had, rather
+    /// than adding one (RFC 7854 §4.8 stat type 1).
+    ///
+    /// This is where a full feed's churn shows up. `prefixesReceived` plus
+    /// this is the total number of NLRIs accepted from the peer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dup_prefix_advertisements: Option<u64>,
 
     /// The BMP router this peer was observed through.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,6 +160,9 @@ fn native_bgp_neighbors() -> Vec<Neighbor> {
                 prefixes_rejected: snapshot
                     .as_ref()
                     .map(|s| s.prefixes_rejected),
+                dup_prefix_advertisements: snapshot
+                    .as_ref()
+                    .map(|s| s.dup_prefix_advertisements),
                 last_error: status.last_error(),
                 ..Default::default()
             }

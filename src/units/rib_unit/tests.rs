@@ -2179,3 +2179,265 @@ async fn gc_spares_router_that_reconnected_since_snapshot() {
         "reconnected (Connected) router was reclaimed"
     );
 }
+
+//------------ Adj-RIB-In gauge ----------------------------------------------
+
+/// `show ip bgp summary`'s prefix count is a gauge of what the peer currently
+/// has in the RIB, so it must survive BGP's implicit withdraw: a
+/// re-advertisement of a prefix the peer already announced arrives as a plain
+/// announcement with no matching UNREACH. Counting NLRIs as they arrived made
+/// a full-view peer report several times its real table size after a few
+/// hours of churn.
+mod adj_rib_in_gauge {
+    use super::*;
+    use crate::ingress::peer_stats;
+
+    /// Register a native-BGP-style stats entry, which is what makes the RIB
+    /// maintain a gauge for this mui at all. Ids are per-test so the
+    /// process-wide registry can't leak state between them.
+    fn peer(
+        ingress_id: crate::ingress::IngressId,
+    ) -> Arc<peer_stats::BgpPeerStats> {
+        let reg = peer_stats::registry();
+        reg.remove(ingress_id);
+        reg.get_or_create(ingress_id)
+    }
+
+    fn v4(prefix: &str) -> Prefix {
+        Prefix::from_str(prefix).unwrap()
+    }
+
+    #[tokio::test]
+    async fn readvertisement_does_not_inflate_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9001);
+        let prefix = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111,222]"),
+                9001,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        // Same prefix, different AS path: an implicit withdraw. The RIB
+        // replaces the record, so the peer still holds exactly one prefix.
+        for _ in 0..5 {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &prefix,
+                    Some("[111,333]"),
+                    9001,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.adj_rib_in_routes, 1,
+            "gauge grew with churn instead of tracking table size"
+        );
+        // The churn itself stays visible, just not as table size.
+        assert_eq!(snap.dup_prefix_advertisements, 5);
+        assert_eq!(snap.adj_rib_in_per_afi_safi, vec![((1, 1), 1)]);
+    }
+
+    #[tokio::test]
+    async fn distinct_prefixes_each_count_once() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9002);
+
+        for p in ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &v4(p),
+                    Some("[111]"),
+                    9002,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 3);
+        assert_eq!(snap.dup_prefix_advertisements, 0);
+    }
+
+    #[tokio::test]
+    async fn withdraw_decrements_once_and_only_for_held_prefixes() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9003);
+        let held = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &held,
+                Some("[111]"),
+                9003,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        // A withdrawal for a prefix this peer never announced must not
+        // move the gauge (and must not underflow it).
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("198.51.100.0/24"),
+                None,
+                9003,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        runner
+            .process_update(mk_route_update_with_ingress(&held, None, 9003))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+
+        // Repeating the withdrawal is a no-op, not a second decrement.
+        runner
+            .process_update(mk_route_update_with_ingress(&held, None, 9003))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+    }
+
+    #[tokio::test]
+    async fn reannounce_after_withdraw_counts_again() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9004);
+        let prefix = v4("192.0.2.0/24");
+
+        for as_path in [Some("[111]"), None, Some("[111]")] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &prefix, as_path, 9004,
+                ))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            stats.snapshot().adj_rib_in_routes,
+            1,
+            "a flapping prefix must be counted again once it is back"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_down_zeroes_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9005);
+
+        for p in ["192.0.2.0/24", "198.51.100.0/24"] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &v4(p),
+                    Some("[111]"),
+                    9005,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 2);
+
+        runner.rib().withdraw_for_ingress(9005, None, true);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 0);
+        assert!(snap.adj_rib_in_per_afi_safi.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_peer_down_rebuilds_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9006);
+        let prefix = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111]"),
+                9006,
+            ))
+            .await
+            .unwrap();
+        // Retain attributes: the record survives peer-down with its Active
+        // status intact and only the store-wide withdrawn bit set.
+        runner.rib().withdraw_for_ingress(9006, None, true);
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111]"),
+                9006,
+            ))
+            .await
+            .unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.adj_rib_in_routes, 1,
+            "re-announce after peer-down was mistaken for a duplicate"
+        );
+        assert_eq!(snap.dup_prefix_advertisements, 0);
+    }
+
+    #[tokio::test]
+    async fn families_are_counted_separately() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9007);
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("192.0.2.0/24"),
+                Some("[111]"),
+                9007,
+            ))
+            .await
+            .unwrap();
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &Prefix::from_str("2001:db8::/32").unwrap(),
+                Some("[111]"),
+                9007,
+            ))
+            .await
+            .unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 2);
+        let by_key: std::collections::HashMap<_, _> =
+            snap.adj_rib_in_per_afi_safi.iter().cloned().collect();
+        assert_eq!(by_key[&(1u16, 1u8)], 1);
+        assert_eq!(by_key[&(2u16, 1u8)], 1);
+    }
+
+    #[tokio::test]
+    async fn peers_without_stats_entries_are_untouched() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9008);
+
+        // A BMP-observed peer has no registry entry; its routes must not
+        // land on someone else's gauge.
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("192.0.2.0/24"),
+                Some("[111]"),
+                9009,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+        assert!(peer_stats::registry().get(9009).is_none());
+    }
+}

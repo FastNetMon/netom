@@ -230,15 +230,24 @@ pub fn render_neighbors<W: Write>(
 
         if n["prefixesReceived"].is_u64() || n["prefixesRejected"].is_u64() {
             writeln!(out, "  Prefix statistics:")?;
+            // "Current" and not "Accepted": this is the size of the peer's
+            // Adj-RIB-In right now, which is what an operator comparing it
+            // against a full-table figure expects. The announcements that
+            // did not change it are on the next line.
             writeln!(
                 out,
-                "    Accepted: {}",
+                "    Current:    {}",
                 opt_count(&n["prefixesReceived"]),
             )?;
             writeln!(
                 out,
-                "    Rejected: {}",
+                "    Rejected:   {}",
                 opt_count(&n["prefixesRejected"]),
+            )?;
+            writeln!(
+                out,
+                "    Duplicates: {}",
+                opt_count(&n["dupPrefixAdvertisements"]),
             )?;
         }
 
@@ -496,6 +505,18 @@ mod tests {
         assert!(out.contains("KEEPALIVEs"), "{out}");
         // A BMP-learned peer names the router it was seen through.
         assert!(out.contains("Monitored router: 10.99.0.1"), "{out}");
+    }
+
+    /// The prefix count is a table size and the churn is a separate
+    /// counter, so an operator can see both a plausible full-view figure
+    /// and the re-advertisement volume that used to be folded into it.
+    #[test]
+    fn neighbor_detail_separates_table_size_from_churn() {
+        let mut buf = Vec::new();
+        render_neighbors(&mut buf, NEIGHBORS).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("Current:    84,211"), "{out}");
+        assert!(out.contains("Duplicates: 2,410,338"), "{out}");
     }
 
     #[test]
