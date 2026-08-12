@@ -1,0 +1,43 @@
+# Toolchain image for building netom .deb packages.
+#
+# This is deliberately split out of Dockerfile.deb so the expensive parts --
+# the Rust toolchain download and the cargo-deb build -- live in an image that
+# is built once per distro and then reused, instead of being a layer that any
+# edit to the packaging Dockerfile can invalidate.
+#
+#   docker build --build-arg DISTRO_VERSION=24.04 \
+#       -f pkg/Dockerfile.base -t netom-build-base:ubuntu-24-04 pkg
+ARG DISTRO_VERSION=24.04
+FROM ubuntu:${DISTRO_VERSION}
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        curl \
+        libssl-dev \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:${PATH}
+
+# Keep in sync with rust-version in the workspace Cargo.toml.
+ARG RUST_VERSION=stable
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y \
+            --profile minimal \
+            --default-toolchain "${RUST_VERSION}" \
+            --no-modify-path
+
+# cargo-deb publishes no release binaries of its own, but binstall resolves a
+# prebuilt one via quickinstall in seconds instead of compiling it. Compilation
+# is left enabled as a fallback for versions quickinstall has not built yet.
+ARG CARGO_DEB_VERSION=3.7.0
+RUN curl --proto '=https' --tlsv1.2 -sSf \
+        https://raw.githubusercontent.com/cargo-bins/cargo-binstall/main/install-from-binstall-release.sh \
+        | bash \
+    && cargo binstall --no-confirm --locked "cargo-deb@${CARGO_DEB_VERSION}"
+
+RUN cargo --version && cargo deb --version
