@@ -1,0 +1,226 @@
+.TH "netom\-cli" "1" "FastNetMon Inc"
+.SH NAME
+netom\-cli \- operational CLI for the netom BGP/BMP engine
+
+.SH SYNOPSIS
+
+.B netom\-cli
+[options] [command ...]
+
+.SH DESCRIPTION
+Inspects a running
+.BR netom (1)
+daemon using router-style commands over its HTTP API. Commands may be given
+on the command line, repeated with
+.BR \-e ,
+piped in on standard input one per line, or typed at an interactive
+.B netom>
+prompt when
+.B netom\-cli
+is run with no command and a terminal on standard input.
+
+Keywords may be abbreviated to any unambiguous prefix, so
+.B sh ip b sum
+is
+.BR "show ip bgp summary" .
+A
+.B ?
+at the end of a line lists the keywords that may follow it; in interactive
+mode, TAB completes them.
+
+This tool is read-only. It issues only GET requests and cannot change the
+daemon's state or configuration.
+
+.SH OPTIONS
+.TP
+.BI \-u\  URL \fR,\ \fB\-\-url= URL
+API endpoint, for example
+.BR http://127.0.0.1:8080 .
+Accepts a bare host or host:port; the port defaults to 8080.
+
+.TP
+.BI \-c\  path \fR,\ \fB\-\-config= path
+Read the endpoint from a netom configuration file's
+.B http_listen
+setting.
+
+.TP
+.BI \-e\  command \fR,\ \fB\-\-execute= command
+Run a command. May be given more than once; commands run in order.
+
+.TP
+.B \-\-json
+Emit the raw API response instead of a rendered table. Whole-table route
+dumps are newline-delimited JSON (one object per line), not a JSON array.
+
+.TP
+.BI \-\-timeout\  seconds
+Read timeout. Defaults to 120 seconds, which allows for the pauses between
+chunks of a large table dump on a busy daemon.
+
+.TP
+.B \-h\fR,\ \fB\-\-help
+Prints help information
+
+.TP
+.B \-V\fR,\ \fB\-\-version
+Prints version information
+
+.SH ENDPOINT DISCOVERY
+The endpoint is chosen from the first of these that is set:
+.BR \-\-url ,
+the
+.B NETOM_URL
+environment variable,
+.BR \-c ,
+.BR ./netom.conf ,
+.BR /etc/netom/netom.conf ,
+and finally
+.BR http://127.0.0.1:8080 .
+
+A configuration file named explicitly with
+.B \-c
+that cannot be read, or that sets no usable
+.BR http_listen ,
+is an error rather than a silent fallback.
+
+netom's shipped default is
+.BR "http_listen = [\(dq[::]:8080\(dq]" ,
+which is a wildcard and not connectable. Wildcards are rewritten to
+loopback:
+.B 0.0.0.0
+becomes
+.BR 127.0.0.1 ,
+and
+.B ::
+becomes
+.B ::1
+with
+.B 127.0.0.1
+tried after it. This keeps discovery from ever directing queries off-box on
+its own initiative.
+
+.SH COMMANDS
+.TP
+.B show version
+Daemon and CLI versions, uptime and start time.
+.TP
+.B show status
+Configured units and targets, ingress counts, RIB sizes and memory use.
+.TP
+.B show running\-config
+The running configuration, with secrets redacted.
+.TP
+.B show filters
+The Roto script path and source, and the entrypoints netom calls.
+.TP
+.B show ip bgp summary [bgp|bmp]
+One row per neighbor. Add
+.B bgp
+or
+.B bmp
+to show only sessions netom terminates itself, or only those observed
+through BMP.
+.TP
+.B show ip bgp neighbors [\fIaddress\fB]
+Detailed neighbor information.
+.TP
+.B show ip bgp [\fIprefix\fB]
+Routes for one prefix, or the whole table when no prefix is given.
+.TP
+.B show ip bgp flowspec [\fIprefix\fB]
+FlowSpec rules.
+.TP
+.B show ipv6 bgp ...
+As above, for IPv6.
+.TP
+.B show bmp routers
+Monitored routers feeding BMP to this daemon.
+.TP
+.B show bmp router \fIid\fB
+One monitored router and its BGP sessions.
+.TP
+.B show ingresses
+The raw ingress and session registry.
+
+.SH OUTPUT FILTERS
+A command may be followed by
+.BR "| include " \fItext\fR,
+.BR "| exclude " \fItext\fR,
+.BR "| begin " \fItext\fR
+or
+.BR "| count" .
+Matching is case-insensitive substring, not a regular expression.
+
+.SH REPORTED COUNTERS
+The counters netom can report are narrower than a router's, and are named
+for what they actually are rather than for their Cisco equivalents.
+
+.B UpdRcvd
+and
+.B NotifRcvd
+count UPDATE and NOTIFICATION messages received. There is no sent-message
+or total-message counter: netom is a collector and never originates
+UPDATEs, and KEEPALIVEs are handled inside the BGP state machine without
+being visible to netom. A
+.BR MsgRcvd / MsgSent
+pair would therefore be fiction.
+
+.B State/PfxRcd
+shows the prefix count for an established session netom terminates itself.
+For a session observed through BMP it shows
+.BR \- ,
+because that count would require scanning the whole RIB once per peer.
+
+The hold time reported by
+.B show ip bgp neighbors
+is the configured one, not the negotiated one, which the BGP library keeps
+private.
+
+.SH PAGING
+Output is not paged. Piping a whole-table dump into a pager is inadvisable:
+the daemon aborts a dump whose reader stops draining, so a pager that stops
+at the first screen will truncate it. When that happens
+.B netom\-cli
+reports the truncation and exits non-zero rather than presenting a partial
+table as a complete one.
+
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+The command could not be parsed.
+.TP
+.B 2
+The daemon could not be reached, or the response was truncated.
+.TP
+.B 3
+The daemon returned an error.
+
+.SH SECURITY
+netom's HTTP API is unauthenticated and unencrypted. Pointing
+.B \-\-url
+at a non-loopback host sends queries, and receives configuration and
+routing data, in the clear.
+.B show running\-config
+redacts secrets (BGP TCP-MD5 keys and MQTT passwords) but still exposes
+topology: peer addresses, ASNs and listen ports.
+
+.SH FILES
+.TP
+.B /etc/netom/netom.conf
+Consulted for the endpoint when no
+.B \-\-url
+or
+.B \-c
+is given.
+.TP
+.B $XDG_STATE_HOME/netom/cli_history
+Interactive command history. Falls back to
+.B $HOME/.local/state/netom/cli_history
+and, where neither is writable, to memory only.
+
+.SH SEE ALSO
+.BR netom (1)

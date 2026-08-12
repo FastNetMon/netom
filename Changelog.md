@@ -27,6 +27,39 @@ Released yyyy-mm-dd.
 
 ### New
 
+* `netom-cli`, a read-only operational CLI speaking router-style commands
+  over the HTTP API: `show ip bgp summary`, `show ip bgp neighbors [<ip>]`,
+  `show ip bgp [<prefix>]`, `show bmp routers`, `show bmp router <id>`,
+  `show ingresses`, `show version`, `show status`, `show running-config` and
+  `show filters`, for IPv4 and IPv6, unicast and FlowSpec. Keywords may be
+  abbreviated to any unambiguous prefix (`sh ip b sum`); `?` lists the
+  keywords that may follow. Runs one-shot, from repeated `-e` flags, from
+  piped stdin, or at an interactive `netom>` prompt with history and
+  tab-completion. `--json` emits the raw API response, and Cisco-style
+  `| include`/`| exclude`/`| begin`/`| count` filters are supported. The
+  endpoint comes from `--url`, `$NETOM_URL`, a config file's `http_listen`,
+  or `http://127.0.0.1:8080`, with wildcard listen addresses rewritten to
+  loopback. See `netom-cli(1)`.
+
+* New read-only HTTP API endpoints backing the CLI: `/api/v1/status`
+  (version, uptime, configured units and targets, RIB sizes, memory),
+  `/api/v1/config` (the running configuration as TOML, with BGP TCP-MD5
+  keys and MQTT passwords redacted), `/api/v1/filters` (Roto script and
+  entrypoints), and `/api/v1/bgp/neighbors[/{addr}]`.
+
+* Per-peer BGP session status. `/api/v1/bgp/neighbors` reports the RFC 4271
+  FSM state (Idle, Connect, Active, OpenSent, OpenConfirm, Established) for
+  `bgp-tcp-in` peers, alongside session uptime, UPDATE and NOTIFICATION
+  counts, prefix counts, and the last error. Configured peers that have
+  never established are now reported too — previously they had no ingress
+  entry and so appeared nowhere. Peers observed through BMP are included in
+  the same response, carrying the monitored router they were seen through.
+
+* Native BGP sessions now record `session_up_time` in the ingress register.
+  Besides giving those peers an uptime, this fixes the per-peer header of
+  the Peer Up that `bmp-tcp-out` synthesizes for restreamed native
+  sessions, which previously carried a zero timestamp.
+
 * Active mode for `bgp-tcp-in` peers: set `connect = true` on a peer to have
   netom initiate the TCP connection instead of only waiting for the peer to
   connect to the listener, for peers that will not accept us as a passive

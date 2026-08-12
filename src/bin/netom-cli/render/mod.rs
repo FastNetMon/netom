@@ -80,10 +80,7 @@ impl<'a, W: Write> Table<'a, W> {
         match &mut self.mode {
             Mode::Fit(rows) => {
                 rows.push(
-                    cells
-                        .iter()
-                        .map(|c| c.as_ref().to_string())
-                        .collect(),
+                    cells.iter().map(|c| c.as_ref().to_string()).collect(),
                 );
                 Ok(())
             }

@@ -833,11 +833,7 @@ impl crate::metrics::Source for Register {
     /// (a runaway disconnected count means GC is not keeping up), and the
     /// ADD-PATH path-child population (each holds RIB records under its
     /// own mui, so this scales route memory).
-    fn append(
-        &self,
-        unit_name: &str,
-        target: &mut crate::metrics::Target,
-    ) {
+    fn append(&self, unit_name: &str, target: &mut crate::metrics::Target) {
         use crate::metrics::{Metric, MetricType, MetricUnit};
 
         const TOTAL: Metric = Metric::new(

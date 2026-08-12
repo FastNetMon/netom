@@ -291,11 +291,8 @@ pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
     }
 }
 
-static ROUTE_COLS: &[Col] = &[
-    left("Network", 20),
-    left("Next Hop", 20),
-    left("Path", 20),
-];
+static ROUTE_COLS: &[Col] =
+    &[left("Network", 20), left("Next Hop", 20), left("Path", 20)];
 
 /// Render the routes for one prefix.
 pub fn render_prefix<W: Write>(

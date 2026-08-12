@@ -142,8 +142,7 @@ where
         // broker that was slow/unreachable grew it without limit -> OOM).
         // Size it from `queue_size`, the same knob that bounds rumqttc's
         // request channel; clamp to >= 1 since channel(0) panics.
-        let pub_q_capacity =
-            (self.config.load().queue_size as usize).max(1);
+        let pub_q_capacity = (self.config.load().queue_size as usize).max(1);
         let (pub_q_tx, pub_q_rx) = mpsc::channel(pub_q_capacity);
         self.pub_q_tx = Some(pub_q_tx);
 

@@ -71,7 +71,11 @@ impl<W: Write> LineFilter<W> {
             self.emit_line(&line)?;
         }
         if self.pipe.op == PipeOp::Count {
-            writeln!(self.inner, "Number of lines which match: {}", self.count)?;
+            writeln!(
+                self.inner,
+                "Number of lines which match: {}",
+                self.count
+            )?;
         }
         self.inner.flush()?;
         Ok(self.inner)

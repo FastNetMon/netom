@@ -288,9 +288,7 @@ async fn connect_loop(ctx: ConnectorContext, remote_addr: IpAddr) {
                 // configured but not answering.
                 let status = super::session_status::registry()
                     .get_or_create(remote_addr);
-                status.set_state(
-                    super::session_status::FsmState::Active,
-                );
+                status.set_state(super::session_status::FsmState::Active);
                 status.set_last_error(err.to_string());
             }
         }

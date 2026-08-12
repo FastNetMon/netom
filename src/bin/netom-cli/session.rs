@@ -48,8 +48,8 @@ impl Session {
         path: &str,
     ) -> Result<serde_json::Value, CliError> {
         let body = self.get(path)?.body_string()?;
-        let value: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| {
+        let value: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| {
                 CliError::transport(format!(
                     "Malformed JSON from {path}: {e}",
                 ))

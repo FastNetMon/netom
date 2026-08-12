@@ -221,9 +221,7 @@ pub fn resolve(line: &str) -> Result<(Handler, Captures), MatchErr> {
     resolve_tokens(&tokens)
 }
 
-fn resolve_tokens(
-    tokens: &[Token],
-) -> Result<(Handler, Captures), MatchErr> {
+fn resolve_tokens(tokens: &[Token]) -> Result<(Handler, Captures), MatchErr> {
     let mut level: &'static [Node] = ROOT;
     let mut captures = Captures::default();
     let mut run: Option<Handler> = None;
@@ -595,10 +593,7 @@ mod tests {
 
     #[test]
     fn rejects_incomplete_commands() {
-        assert!(matches!(
-            resolve("show"),
-            Err(MatchErr::Incomplete)
-        ));
+        assert!(matches!(resolve("show"), Err(MatchErr::Incomplete)));
     }
 
     #[test]
@@ -724,8 +719,7 @@ mod tests {
 
     #[test]
     fn completion_at_root_offers_top_level_commands() {
-        let words: Vec<_> =
-            candidates("").iter().map(|c| c.insert).collect();
+        let words: Vec<_> = candidates("").iter().map(|c| c.insert).collect();
         assert!(words.contains(&"show"));
         assert!(words.contains(&"exit"));
     }

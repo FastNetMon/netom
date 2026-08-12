@@ -332,9 +332,7 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
     let (session_id, session_info) = register
         .cloned_info()
         .into_iter()
-        .find(|(_, info)| {
-            info.ingress_type == Some(IngressType::BgpViaBmp)
-        })
+        .find(|(_, info)| info.ingress_type == Some(IngressType::BgpViaBmp))
         .expect("PeerUp must register a session ingress");
     let fams = session_info
         .addpath_families
@@ -346,14 +344,15 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
     // payloads under two distinct path-child ingresses...
     let announce = mk_addpath_v4_route_monitoring_msg(&pph, &[1, 2]);
     let res = processor.process_msg(Instant::now(), announce, None);
-    let MessageType::RoutingUpdate { update, raw } = res.message_type
-    else {
+    let MessageType::RoutingUpdate { update, raw } = res.message_type else {
         panic!("expected RoutingUpdate");
     };
     // ...and a raw fastpath copy attributed to the SESSION id (bmp-out
     // advertises cap 69 downstream, so verbatim path-id NLRI parse fine;
     // its duplicate check maps the payloads' child ids back to this id).
-    let Some(Update::RouteMonitoringRaw { ingress_id: raw_id, .. }) = raw
+    let Some(Update::RouteMonitoringRaw {
+        ingress_id: raw_id, ..
+    }) = raw
     else {
         panic!("ADD-PATH session must emit raw fastpath copies");
     };
@@ -362,8 +361,7 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
         panic!("expected Update::Bulk");
     };
     assert_eq!(payloads.len(), 2);
-    let child_ids: Vec<_> =
-        payloads.iter().map(|p| p.ingress_id).collect();
+    let child_ids: Vec<_> = payloads.iter().map(|p| p.ingress_id).collect();
     assert_ne!(child_ids[0], child_ids[1]);
     for (payload, expected_pid) in payloads.iter().zip([1u32, 2u32]) {
         assert_ne!(payload.ingress_id, session_id);
@@ -376,11 +374,8 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
 
     // A withdrawal for an announced path id resolves to the same child.
     let withdraw = mk_addpath_v4_withdrawal_msg(&pph, 1);
-    let res = res
-        .next_state
-        .process_msg(Instant::now(), withdraw, None);
-    let MessageType::RoutingUpdate { update, .. } = res.message_type
-    else {
+    let res = res.next_state.process_msg(Instant::now(), withdraw, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!("expected RoutingUpdate");
     };
     let Update::Bulk(payloads) = update else {
@@ -391,11 +386,10 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
 
     // A withdrawal for a never-announced path id is dropped, not minted.
     let bogus_withdraw = mk_addpath_v4_withdrawal_msg(&pph, 9);
-    let res = res
-        .next_state
-        .process_msg(Instant::now(), bogus_withdraw, None);
-    let MessageType::RoutingUpdate { update, .. } = res.message_type
-    else {
+    let res =
+        res.next_state
+            .process_msg(Instant::now(), bogus_withdraw, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!("expected RoutingUpdate");
     };
     let Update::Bulk(payloads) = update else {
@@ -410,11 +404,10 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
     // PeerDown withdraws and disconnects the session AND all its
     // path-children in one WithdrawBulk.
     let peer_down_msg_buf = mk_peer_down_notification_msg(&pph);
-    let res = res
-        .next_state
-        .process_msg(Instant::now(), peer_down_msg_buf, None);
-    let MessageType::RoutingUpdate { update, .. } = res.message_type
-    else {
+    let res =
+        res.next_state
+            .process_msg(Instant::now(), peer_down_msg_buf, None);
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!("expected RoutingUpdate");
     };
     let Update::WithdrawBulk(entries) = update else {
@@ -442,8 +435,7 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
         .next_state;
     let announce = mk_addpath_v4_route_monitoring_msg(&pph, &[1]);
     let res = processor.process_msg(Instant::now(), announce, None);
-    let MessageType::RoutingUpdate { update, .. } = res.message_type
-    else {
+    let MessageType::RoutingUpdate { update, .. } = res.message_type else {
         panic!("expected RoutingUpdate");
     };
     let Update::Bulk(payloads) = update else {
@@ -486,9 +478,7 @@ fn asymmetric_addpath_send_parses_adj_rib_out_path_ids() {
     let (session_id, session_info) = register
         .cloned_info()
         .into_iter()
-        .find(|(_, info)| {
-            info.ingress_type == Some(IngressType::BgpViaBmp)
-        })
+        .find(|(_, info)| info.ingress_type == Some(IngressType::BgpViaBmp))
         .expect("PeerUp must register a session ingress");
     assert_eq!(
         session_info.addpath_families,
@@ -535,9 +525,7 @@ fn asymmetric_addpath_send_does_not_advertise_ids_for_adj_rib_in() {
     let (session_id, session_info) = register
         .cloned_info()
         .into_iter()
-        .find(|(_, info)| {
-            info.ingress_type == Some(IngressType::BgpViaBmp)
-        })
+        .find(|(_, info)| info.ingress_type == Some(IngressType::BgpViaBmp))
         .expect("PeerUp must register a session ingress");
     assert_eq!(session_info.addpath_families, Some(vec![]));
 
@@ -1858,9 +1846,7 @@ fn mk_flowspec_route_monitoring_msg(
         attrs.extend_from_slice(&[0x00, 0x01, 133, 0x00, 0x00]);
         attrs.extend_from_slice(FS_TEST_NLRI);
         // EXTENDED_COMMUNITIES: traffic-rate 0 (drop)
-        attrs.extend_from_slice(&[
-            0xc0, 16, 8, 0x80, 0x06, 0, 0, 0, 0, 0, 0,
-        ]);
+        attrs.extend_from_slice(&[0xc0, 16, 8, 0x80, 0x06, 0, 0, 0, 0, 0, 0]);
     } else {
         // MP_UNREACH_NLRI: AFI 1, SAFI 133, NLRI
         let val_len = u8::try_from(3 + FS_TEST_NLRI.len()).unwrap();
@@ -1941,10 +1927,8 @@ fn route_monitoring_flowspec_announce_and_withdraw() {
     use routecore::bgp::communities::FlowSpecEc;
     use routecore::bgp::path_attributes::PathAttributeType;
     let owned = pamap.path_attributes();
-    assert!(owned
-        .iter()
-        .any(|pa| pa.map(|pa| pa.type_code()).ok()
-            == Some(PathAttributeType::ExtendedCommunities.into())));
+    assert!(owned.iter().any(|pa| pa.map(|pa| pa.type_code()).ok()
+        == Some(PathAttributeType::ExtendedCommunities.into())));
     let ecs = pamap
         .path_attributes()
         .get::<routecore::bgp::path_attributes::ExtendedCommunitiesList>()

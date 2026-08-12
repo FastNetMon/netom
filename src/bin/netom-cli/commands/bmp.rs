@@ -79,7 +79,9 @@ pub fn router(session: &mut Session, c: &Captures) -> Result<(), CliError> {
     if session.json {
         return session.passthrough(&format!("/api/v1/ingresses/{id}"));
     }
-    let router = session.get(&format!("/api/v1/ingresses/{id}"))?.body_string()?;
+    let router = session
+        .get(&format!("/api/v1/ingresses/{id}"))?
+        .body_string()?;
     let all = session.get("/api/v1/ingresses")?.body_string()?;
 
     let mut out = session.writer();
@@ -207,10 +209,9 @@ fn uptime_from(value: &serde_json::Value) -> String {
     };
     match chrono::DateTime::parse_from_rfc3339(text) {
         Ok(when) => {
-            let secs = (chrono::Utc::now()
-                - when.with_timezone(&chrono::Utc))
-            .num_seconds()
-            .max(0) as u64;
+            let secs = (chrono::Utc::now() - when.with_timezone(&chrono::Utc))
+                .num_seconds()
+                .max(0) as u64;
             fmt::uptime(secs)
         }
         Err(_) => "-".to_string(),

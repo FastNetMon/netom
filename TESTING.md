@@ -60,6 +60,15 @@ decoded rules verified through the HTTP API
    catches duplicate delivery if the raw-coverage check fails to map
    path-children to their session) and one on a rebuild unit
    (`fastpath = false`, bmp-out re-encodes the path ids itself).
+ - `scripts/e2e-cli.sh` — `netom-cli` against a live daemon: a real BGP
+   session is driven in by `scripts/e2e-cli-speaker.py` while a second peer
+   is configured but unreachable. Asserts that the established peer is
+   reported with its prefix count, that the peer which never came up appears
+   as `Active` rather than being missing, that `show running-config` redacts
+   a configured `md5_key`, and that abbreviation, output filters, `--json`
+   (including NDJSON whole-table dumps), broken-pipe handling, batch stdin,
+   endpoint discovery via `-c`, and the exit codes all behave. Set
+   `NETOM_CLI_BIN` alongside `NETOM_BIN` to skip the build.
 
 Both scripts build netom themselves (set `NETOM_BIN` to skip that), install
 their tools (mrtgen, exabgp) into a scratch directory when missing, and clean

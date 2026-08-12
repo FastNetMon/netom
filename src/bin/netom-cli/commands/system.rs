@@ -12,10 +12,7 @@ pub fn exit(session: &mut Session, _c: &Captures) -> Result<(), CliError> {
     Ok(())
 }
 
-pub fn version(
-    session: &mut Session,
-    _c: &Captures,
-) -> Result<(), CliError> {
+pub fn version(session: &mut Session, _c: &Captures) -> Result<(), CliError> {
     if session.json {
         return session.passthrough("/api/v1/status");
     }
@@ -145,10 +142,7 @@ pub fn running_config(
     Ok(())
 }
 
-pub fn filters(
-    session: &mut Session,
-    _c: &Captures,
-) -> Result<(), CliError> {
+pub fn filters(session: &mut Session, _c: &Captures) -> Result<(), CliError> {
     if session.json {
         return session.passthrough("/api/v1/filters");
     }
@@ -162,7 +156,10 @@ pub fn filters(
     }
 
     if let Some(entrypoints) = data["entrypoints"].as_array() {
-        writeln!(out, "\nEntrypoints netom calls if the script defines them:")?;
+        writeln!(
+            out,
+            "\nEntrypoints netom calls if the script defines them:"
+        )?;
         for name in entrypoints {
             if let Some(name) = name.as_str() {
                 writeln!(out, "  {name}")?;

@@ -9,6 +9,9 @@ case $1 in
     VER=$(netom --version)
     echo $VER
 
+    echo -e "\nNETOM-CLI VERSION:"
+    netom-cli --version
+
     echo -e "\nNETOM CONF DIR:"
     ls -lR /etc/netom/
 
@@ -26,6 +29,9 @@ case $1 in
   post-upgrade)
     echo -e "\nNETOM VERSION:"
     netom --version
+
+    echo -e "\nNETOM-CLI VERSION:"
+    netom-cli --version
 
     echo -e "\nNETOM CONF DIR:"
     ls -lR /etc/netom/

@@ -54,13 +54,9 @@ fn run() -> i32 {
         .map(std::time::Duration::from_secs)
         .unwrap_or(session::DEFAULT_TIMEOUT);
 
-    let client = http::Client::new(
-        endpoint.addrs,
-        endpoint.provenance,
-        timeout,
-    );
-    let mut session =
-        Session::new(client, matches.get_flag("json"));
+    let client =
+        http::Client::new(endpoint.addrs, endpoint.provenance, timeout);
+    let mut session = Session::new(client, matches.get_flag("json"));
 
     // Explicit -e commands, then a bare trailing command, then stdin if it
     // is a pipe, then the interactive prompt.
@@ -87,7 +83,10 @@ fn run() -> i32 {
         }
         return run_lines(
             &mut session,
-            buf.lines().map(str::to_string).collect::<Vec<_>>().into_iter(),
+            buf.lines()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+                .into_iter(),
         );
     }
 
@@ -154,8 +153,10 @@ fn run_lines(
             continue;
         }
         if let Err(err) = execute(session, line) {
-            eprintln!("{err}");
-            code = err.exit_code();
+            if !err.is_silent() {
+                eprintln!("{err}");
+                code = err.exit_code();
+            }
         }
         if session.should_exit {
             break;
@@ -175,9 +176,8 @@ pub fn execute(session: &mut Session, line: &str) -> Result<(), CliError> {
         return Ok(());
     }
 
-    let (handler, captures) = tree::resolve(command).map_err(|err| {
-        CliError::Usage(err.render(command))
-    })?;
+    let (handler, captures) = tree::resolve(command)
+        .map_err(|err| CliError::Usage(err.render(command)))?;
 
     session.pipe = output_filter;
     let result = handler(session, &captures);

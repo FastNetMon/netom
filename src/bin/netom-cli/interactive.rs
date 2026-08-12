@@ -31,10 +31,8 @@ impl Completer for NetomHelper {
     ) -> rustyline::Result<(usize, Vec<Pair>)> {
         let upto = &line[..pos];
         // Replace from the start of the word under the cursor.
-        let start = upto
-            .rfind(char::is_whitespace)
-            .map(|i| i + 1)
-            .unwrap_or(0);
+        let start =
+            upto.rfind(char::is_whitespace).map(|i| i + 1).unwrap_or(0);
 
         let pairs = tree::candidates(upto)
             .into_iter()
@@ -119,8 +117,10 @@ pub fn run(session: &mut Session) -> i32 {
                 }
                 let _ = editor.add_history_entry(trimmed);
                 if let Err(err) = crate::execute(session, trimmed) {
-                    eprintln!("{err}");
-                    code = err.exit_code();
+                    if !err.is_silent() {
+                        eprintln!("{err}");
+                        code = err.exit_code();
+                    }
                 }
                 if session.should_exit {
                     break;

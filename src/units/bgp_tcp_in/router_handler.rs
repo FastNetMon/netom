@@ -51,8 +51,8 @@ use crate::units::Unit;
 use crate::{ingress, roto_runtime};
 
 use super::peer_config::{CombinedConfig, ConfigExt};
-use super::unit::BgpTcpIn;
 use super::session_status::{FsmState, SessionStatus};
+use super::unit::BgpTcpIn;
 use super::unit::RotoFunc;
 use super::unit::SESSION_ID_COUNTER;
 
@@ -129,8 +129,7 @@ struct Processor {
     /// child IngressId per distinct path id seen announced, lazily minted
     /// (`IngressType::BgpPath`, `parent_ingress` = the session's ingress).
     /// Reset on SessionNegotiated; torn down with the session.
-    path_children:
-        std::collections::HashMap<PathId, ingress::IngressId>,
+    path_children: std::collections::HashMap<PathId, ingress::IngressId>,
 
     /// Handle to abort this connection's task during collision resolution.
     /// Populated after the task is spawned.

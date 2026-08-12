@@ -539,10 +539,7 @@ impl RibUnitRunner {
     /// roaring bitmap atomic and serialises through `withdraw_lock`, so
     /// running it inline on a tokio worker can stall the pipeline while
     /// waiting for the lock and/or while doing the bitmap walk itself.
-    async fn reset_ingress_blocking(
-        &self,
-        ingress_id: ingress::IngressId,
-    ) {
+    async fn reset_ingress_blocking(&self, ingress_id: ingress::IngressId) {
         let rib = self.rib.load().clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             rib.remove_for_ingresses(&[ingress_id]);

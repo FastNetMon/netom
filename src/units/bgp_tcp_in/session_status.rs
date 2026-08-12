@@ -276,12 +276,7 @@ impl BgpSessionRegistry {
         if let Some(status) = self.inner.read().unwrap().get(&peer) {
             return status.clone();
         }
-        self.inner
-            .write()
-            .unwrap()
-            .entry(peer)
-            .or_default()
-            .clone()
+        self.inner.write().unwrap().entry(peer).or_default().clone()
     }
 
     pub fn snapshot(&self) -> Vec<(IpAddr, Arc<SessionStatus>)> {
@@ -351,14 +346,8 @@ mod tests {
         assert_eq!(FsmState::from(State::Connect), FsmState::Connect);
         assert_eq!(FsmState::from(State::Active), FsmState::Active);
         assert_eq!(FsmState::from(State::OpenSent), FsmState::OpenSent);
-        assert_eq!(
-            FsmState::from(State::OpenConfirm),
-            FsmState::OpenConfirm
-        );
-        assert_eq!(
-            FsmState::from(State::Established),
-            FsmState::Established
-        );
+        assert_eq!(FsmState::from(State::OpenConfirm), FsmState::OpenConfirm);
+        assert_eq!(FsmState::from(State::Established), FsmState::Established);
     }
 
     #[test]

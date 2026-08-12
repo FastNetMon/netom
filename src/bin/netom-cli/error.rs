@@ -19,6 +19,12 @@ pub enum CliError {
 
     /// The daemon returned a non-2xx status.
     Api { status: u16, message: String },
+
+    /// The reader on the other end of stdout went away — `| head`, a
+    /// pager quit, `grep -q` matching early. Not a failure: the user got
+    /// what they asked for. Reported separately so it exits cleanly and
+    /// silently instead of printing "Broken pipe" on every such run.
+    BrokenPipe,
 }
 
 impl CliError {
@@ -27,7 +33,13 @@ impl CliError {
             CliError::Usage(_) => EXIT_USAGE,
             CliError::Transport(_) => EXIT_TRANSPORT,
             CliError::Api { .. } => EXIT_API,
+            CliError::BrokenPipe => EXIT_OK,
         }
+    }
+
+    /// Whether this should be printed to the user at all.
+    pub fn is_silent(&self) -> bool {
+        matches!(self, CliError::BrokenPipe)
     }
 
     pub fn transport(msg: impl fmt::Display) -> Self {
@@ -75,12 +87,61 @@ impl fmt::Display for CliError {
             CliError::Usage(msg) => write!(f, "{msg}"),
             CliError::Transport(msg) => write!(f, "% {msg}"),
             CliError::Api { message, .. } => write!(f, "% {message}"),
+            CliError::BrokenPipe => Ok(()),
         }
     }
 }
 
 impl From<std::io::Error> for CliError {
     fn from(err: std::io::Error) -> Self {
+        if err.kind() == std::io::ErrorKind::BrokenPipe {
+            return CliError::BrokenPipe;
+        }
         CliError::Transport(err.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_closed_reader_is_not_a_failure() {
+        // `netom-cli show ip bgp | head -1` must exit 0 and say nothing.
+        let err = CliError::from(std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "broken pipe",
+        ));
+        assert!(matches!(err, CliError::BrokenPipe));
+        assert_eq!(err.exit_code(), EXIT_OK);
+        assert!(err.is_silent());
+        assert_eq!(err.to_string(), "");
+    }
+
+    #[test]
+    fn other_io_errors_are_transport_failures() {
+        let err = CliError::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert_eq!(err.exit_code(), EXIT_TRANSPORT);
+        assert!(!err.is_silent());
+    }
+
+    #[test]
+    fn a_404_points_at_version_skew() {
+        let err = CliError::from_http(404, "/api/v1/status", "");
+        assert_eq!(err.exit_code(), EXIT_API);
+        assert!(err.to_string().contains("older than this CLI"));
+    }
+
+    #[test]
+    fn the_daemon_error_envelope_is_unwrapped() {
+        let err = CliError::from_http(
+            500,
+            "/api/v1/ribs/ipv4unicast/routes",
+            r#"{"data":null,"error":"store unavailable"}"#,
+        );
+        assert_eq!(err.to_string(), "% store unavailable");
     }
 }

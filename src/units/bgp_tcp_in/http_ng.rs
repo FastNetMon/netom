@@ -20,9 +20,7 @@ use serde::Serialize;
 
 use crate::{
     http_ng::{Api, ApiError, ApiState},
-    ingress::{
-        peer_stats, register::IngressState, IngressId, IngressType,
-    },
+    ingress::{peer_stats, register::IngressState, IngressId, IngressType},
     units::bgp_tcp_in::session_status,
 };
 
@@ -125,8 +123,9 @@ fn native_bgp_neighbors() -> Vec<Neighbor> {
         .into_iter()
         .map(|(addr, status)| {
             let ingress_id = status.ingress_id();
-            let snapshot =
-                ingress_id.and_then(|id| stats.get(id)).map(|s| s.snapshot());
+            let snapshot = ingress_id
+                .and_then(|id| stats.get(id))
+                .map(|s| s.snapshot());
 
             Neighbor {
                 peer_address: Some(addr),
@@ -140,9 +139,7 @@ fn native_bgp_neighbors() -> Vec<Neighbor> {
                 up_seconds: status.uptime_secs(),
                 hold_time_configured: status.hold_time(),
                 updates_received: Some(status.updates_received()),
-                notifications_received: Some(
-                    status.notifications_received(),
-                ),
+                notifications_received: Some(status.notifications_received()),
                 prefixes_received: snapshot
                     .as_ref()
                     .map(|s| s.adj_rib_in_routes),
@@ -161,9 +158,7 @@ fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
     let all = state.ingress_register.cloned_info();
 
     all.iter()
-        .filter(|(_, info)| {
-            info.ingress_type == Some(IngressType::BgpViaBmp)
-        })
+        .filter(|(_, info)| info.ingress_type == Some(IngressType::BgpViaBmp))
         .map(|(id, info)| {
             // The monitored router this session was seen through.
             let via = info
@@ -193,9 +188,7 @@ fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
                 }),
                 via_router: via.as_ref().and_then(|v| v.remote_addr),
                 via_ingress_id: info.parent_ingress,
-                peer_rib_type: info
-                    .peer_rib_type
-                    .map(|t| format!("{t:?}")),
+                peer_rib_type: info.peer_rib_type.map(|t| format!("{t:?}")),
                 ..Default::default()
             }
         })

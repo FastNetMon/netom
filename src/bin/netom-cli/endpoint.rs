@@ -8,8 +8,7 @@ use crate::error::CliError;
 pub const DEFAULT_PORT: u16 = 8080;
 
 /// Config files to consult when none was named.
-const IMPLICIT_CONFIGS: &[&str] =
-    &["./netom.conf", "/etc/netom/netom.conf"];
+const IMPLICIT_CONFIGS: &[&str] = &["./netom.conf", "/etc/netom/netom.conf"];
 
 /// Where to connect, and how we decided.
 pub struct Endpoint {
@@ -38,10 +37,7 @@ pub fn resolve(
         // An explicitly named config that cannot be used is an error, not
         // something to silently fall back from.
         let addrs = http_listen_from(Path::new(path))?;
-        return Ok(endpoint_from(
-            addrs,
-            format!("from {path}: http_listen"),
-        ));
+        return Ok(endpoint_from(addrs, format!("from {path}: http_listen")));
     }
     for candidate in IMPLICIT_CONFIGS {
         let path = PathBuf::from(candidate);
@@ -303,8 +299,8 @@ sources = []
 
     #[test]
     fn reports_a_missing_config() {
-        let err =
-            http_listen_from(Path::new("/nonexistent/netom.conf")).unwrap_err();
+        let err = http_listen_from(Path::new("/nonexistent/netom.conf"))
+            .unwrap_err();
         assert!(format!("{err}").contains("Cannot read"));
     }
 
