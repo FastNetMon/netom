@@ -27,12 +27,8 @@ pub enum ArgKind {
     Prefix,
     /// A bare address.
     Ip,
-    /// `65001` or `AS65001`.
-    Asn,
     /// An ingress id.
     IngressId,
-    /// Anything else (a substring to grep for, a name).
-    Word,
 }
 
 impl ArgKind {
@@ -41,9 +37,7 @@ impl ArgKind {
         match self {
             ArgKind::Prefix => "<A.B.C.D/M>",
             ArgKind::Ip => "<A.B.C.D|X:X::X>",
-            ArgKind::Asn => "<1-4294967295>",
             ArgKind::IngressId => "<0-4294967295>",
-            ArgKind::Word => "<WORD>",
         }
     }
 
@@ -57,17 +51,7 @@ impl ArgKind {
                 (len <= max).then_some(Value::Prefix(addr, len))
             }
             ArgKind::Ip => tok.parse().ok().map(Value::Ip),
-            ArgKind::Asn => {
-                let digits = tok
-                    .strip_prefix("AS")
-                    .or_else(|| tok.strip_prefix("as"))
-                    .unwrap_or(tok);
-                digits.parse().ok().map(Value::Asn)
-            }
             ArgKind::IngressId => tok.parse().ok().map(Value::IngressId),
-            // A bare word must not swallow a `| include` or an empty token.
-            ArgKind::Word => (!tok.is_empty() && tok != "|")
-                .then(|| Value::Word(tok.to_string())),
         }
     }
 }
@@ -77,9 +61,7 @@ impl ArgKind {
 pub enum Value {
     Prefix(IpAddr, u8),
     Ip(IpAddr),
-    Asn(u32),
     IngressId(u32),
-    Word(String),
 }
 
 /// Static context a node contributes when traversed, so that one subtree can
@@ -139,23 +121,9 @@ impl Captures {
         })
     }
 
-    pub fn asn(&self) -> Option<u32> {
-        self.args.iter().find_map(|v| match v {
-            Value::Asn(a) => Some(*a),
-            _ => None,
-        })
-    }
-
     pub fn ingress_id(&self) -> Option<u32> {
         self.args.iter().find_map(|v| match v {
             Value::IngressId(a) => Some(*a),
-            _ => None,
-        })
-    }
-
-    pub fn word(&self) -> Option<&str> {
-        self.args.iter().find_map(|v| match v {
-            Value::Word(w) => Some(w.as_str()),
             _ => None,
         })
     }
@@ -199,7 +167,6 @@ pub enum MatchErr {
     /// Several keywords share the typed prefix.
     Ambiguous {
         token: String,
-        offset: usize,
         candidates: Vec<(&'static str, &'static str)>,
     },
     /// Nothing at this level matches.
@@ -316,7 +283,6 @@ fn match_one(
         _ => {
             return Err(MatchErr::Ambiguous {
                 token: tok.to_string(),
-                offset,
                 candidates: prefix_matches
                     .iter()
                     .filter_map(|n| match n.kw {
@@ -450,6 +416,21 @@ macro_rules! leaf {
     };
 }
 
+/// A node that sets a flag, runs on its own, and delegates to a shared
+/// subtree. `show ip bgp` dumps the table; `show ip bgp <prefix>` and the
+/// other children narrow it.
+macro_rules! flagged {
+    ($word:expr, $help:expr, $flag:expr, $run:expr, $children:expr) => {
+        Node {
+            kw: Kw::Lit($word),
+            help: $help,
+            set: Some($flag),
+            run: Some($run),
+            children: $children,
+        }
+    };
+}
+
 pub static ROOT: &[Node] = &[
     lit!("show", "Show running system information", SHOW),
     leaf!("exit", "Exit the CLI", commands::system::exit),
@@ -458,15 +439,128 @@ pub static ROOT: &[Node] = &[
 ];
 
 static SHOW: &[Node] = &[
+    lit!("ip", "IPv4 information", SHOW_IP),
+    lit!("ipv6", "IPv6 information", SHOW_IPV6),
+    lit!("bmp", "BMP monitoring information", SHOW_BMP),
+    leaf!(
+        "ingresses",
+        "Ingress and session registry",
+        commands::bmp::ingresses
+    ),
     leaf!("version", "Software version", commands::system::version),
-    leaf!("status", "Daemon status and resource usage", commands::system::status),
+    leaf!(
+        "status",
+        "Daemon status and resource usage",
+        commands::system::status
+    ),
     leaf!(
         "running-config",
         "Current operating configuration",
         commands::system::running_config
     ),
-    leaf!("filters", "Roto filter script and entrypoints", commands::system::filters),
+    leaf!(
+        "filters",
+        "Roto filter script and entrypoints",
+        commands::system::filters
+    ),
 ];
+
+// `show ip ...` and `show ipv6 ...` share one BGP subtree, differing only
+// in the address family they push into the captures.
+static SHOW_IP: &[Node] = &[flagged!(
+    "bgp",
+    "BGP information",
+    Flag::Afi(Afi::V4),
+    commands::bgp::routes,
+    BGP_BODY
+)];
+
+static SHOW_IPV6: &[Node] = &[flagged!(
+    "bgp",
+    "BGP information",
+    Flag::Afi(Afi::V6),
+    commands::bgp::routes,
+    BGP_BODY
+)];
+
+static BGP_BODY: &[Node] = &[
+    // Runnable *and* extendable: `show ip bgp summary` stands alone, and
+    // `show ip bgp summary bmp` narrows it.
+    Node {
+        kw: Kw::Lit("summary"),
+        help: "Summary of BGP neighbor status",
+        set: None,
+        run: Some(commands::bgp::summary),
+        children: BGP_SUMMARY,
+    },
+    Node {
+        kw: Kw::Lit("neighbors"),
+        help: "Detailed neighbor information",
+        set: None,
+        run: Some(commands::bgp::neighbors),
+        children: BGP_NEIGHBORS,
+    },
+    Node {
+        kw: Kw::Lit("flowspec"),
+        help: "FlowSpec rules",
+        set: Some(Flag::Safi(Safi::FlowSpec)),
+        run: Some(commands::bgp::routes),
+        children: BGP_FLOWSPEC,
+    },
+    Node {
+        kw: Kw::Arg(ArgKind::Prefix),
+        help: "Network in the BGP routing table",
+        set: None,
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
+];
+
+static BGP_SUMMARY: &[Node] = &[
+    Node {
+        kw: Kw::Lit("bgp"),
+        help: "Only sessions netom terminates itself",
+        set: Some(Flag::Source(PeerSource::Bgp)),
+        run: Some(commands::bgp::summary),
+        children: &[],
+    },
+    Node {
+        kw: Kw::Lit("bmp"),
+        help: "Only sessions observed through BMP",
+        set: Some(Flag::Source(PeerSource::Bmp)),
+        run: Some(commands::bgp::summary),
+        children: &[],
+    },
+];
+
+static BGP_NEIGHBORS: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::Ip),
+    help: "Neighbor address",
+    set: None,
+    run: Some(commands::bgp::neighbors),
+    children: &[],
+}];
+
+static BGP_FLOWSPEC: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::Prefix),
+    help: "Destination prefix of the rule",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: &[],
+}];
+
+static SHOW_BMP: &[Node] = &[
+    leaf!("routers", "Monitored routers", commands::bmp::routers),
+    lit!("router", "One monitored router", SHOW_BMP_ROUTER),
+];
+
+static SHOW_BMP_ROUTER: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::IngressId),
+    help: "Ingress id of the router",
+    set: None,
+    run: Some(commands::bmp::router),
+    children: &[],
+}];
 
 #[cfg(test)]
 mod tests {
@@ -580,9 +674,11 @@ mod tests {
         );
         assert_eq!(ArgKind::Ip.parse("192.0.2.1/24"), None);
 
-        assert_eq!(ArgKind::Asn.parse("65001"), Some(Value::Asn(65001)));
-        assert_eq!(ArgKind::Asn.parse("AS65001"), Some(Value::Asn(65001)));
-        assert_eq!(ArgKind::Asn.parse("bogus"), None);
+        assert_eq!(
+            ArgKind::IngressId.parse("42"),
+            Some(Value::IngressId(42))
+        );
+        assert_eq!(ArgKind::IngressId.parse("bogus"), None);
     }
 
     /// Declaration order decides which typed argument wins, so a prefix must

@@ -51,15 +51,6 @@ pub fn count(n: u64) -> String {
     out
 }
 
-/// Render a BGP identifier, which the API serializes as four bytes, as the
-/// dotted-quad router-id operators expect.
-pub fn router_id(bytes: &[u8]) -> String {
-    if bytes.len() != 4 {
-        return "-".to_string();
-    }
-    format!("{}.{}.{}.{}", bytes[0], bytes[1], bytes[2], bytes[3])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,13 +90,5 @@ mod tests {
         assert_eq!(count(1000), "1,000");
         assert_eq!(count(921034), "921,034");
         assert_eq!(count(1234567), "1,234,567");
-    }
-
-    #[test]
-    fn router_id_renders_the_byte_array_form() {
-        assert_eq!(router_id(&[10, 99, 0, 1]), "10.99.0.1");
-        // Anything else is missing data, not a router-id.
-        assert_eq!(router_id(&[1, 2]), "-");
-        assert_eq!(router_id(&[]), "-");
     }
 }

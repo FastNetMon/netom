@@ -20,13 +20,14 @@ mod commands;
 mod endpoint;
 mod error;
 mod http;
+mod interactive;
 mod lex;
 mod pipe;
 mod render;
 mod session;
 mod tree;
 
-use error::{CliError, EXIT_OK, EXIT_USAGE};
+use error::{CliError, EXIT_OK};
 use session::Session;
 
 fn main() {
@@ -90,11 +91,7 @@ fn run() -> i32 {
         );
     }
 
-    eprintln!(
-        "% Interactive mode is not available in this build; \
-         pass a command, or use -e."
-    );
-    EXIT_USAGE
+    interactive::run(&mut session)
 }
 
 fn cli() -> Command {

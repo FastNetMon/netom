@@ -106,6 +106,7 @@ cranelift-jit      = "*"
 tower-http         = { version = "0.5.2", features = ["compression-gzip"], optional = true }
 serde_qs           = "0.15.0"
 rayon = "1.11.0"
+rustyline = { version = "18.0.1", default-features = false, features = ["with-file-history", "custom-bindings"] }
 
 [target.'cfg(unix)'.dependencies]
 syslog             = "7.0"

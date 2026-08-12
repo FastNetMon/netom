@@ -116,7 +116,6 @@ pub struct SessionStatus {
 
     updates_received: AtomicU64,
     notifications_received: AtomicU64,
-    notifications_sent: AtomicU64,
 
     /// Configured name, for the display column.
     name: RwLock<Option<String>>,
@@ -136,7 +135,6 @@ impl Default for SessionStatus {
             configured: AtomicBool::new(false),
             updates_received: AtomicU64::new(0),
             notifications_received: AtomicU64::new(0),
-            notifications_sent: AtomicU64::new(0),
             name: RwLock::new(None),
             last_error: RwLock::new(None),
         }
@@ -245,14 +243,6 @@ impl SessionStatus {
         self.notifications_received.load(Ordering::Relaxed)
     }
 
-    pub fn inc_notifications_sent(&self) {
-        self.notifications_sent.fetch_add(1, Ordering::Relaxed);
-    }
-
-    pub fn notifications_sent(&self) -> u64 {
-        self.notifications_sent.load(Ordering::Relaxed)
-    }
-
     pub fn set_name(&self, name: impl Into<String>) {
         *self.name.write().unwrap() = Some(name.into());
     }
@@ -292,10 +282,6 @@ impl BgpSessionRegistry {
             .entry(peer)
             .or_default()
             .clone()
-    }
-
-    pub fn get(&self, peer: IpAddr) -> Option<Arc<SessionStatus>> {
-        self.inner.read().unwrap().get(&peer).cloned()
     }
 
     pub fn snapshot(&self) -> Vec<(IpAddr, Arc<SessionStatus>)> {

@@ -101,11 +101,6 @@ impl<'a, W: Write> Table<'a, W> {
         }
     }
 
-    /// Write a free-form line, outside the table grid.
-    pub fn note(&mut self, text: &str) -> io::Result<()> {
-        writeln!(self.out, "{text}")
-    }
-
     pub fn finish(self) -> io::Result<()> {
         let Table {
             out,

@@ -21,8 +21,7 @@ use serde::Serialize;
 use crate::{
     http_ng::{Api, ApiError, ApiState},
     ingress::{
-        peer_stats, register::IngressState, IngressId, IngressInfo,
-        IngressType,
+        peer_stats, register::IngressState, IngressId, IngressType,
     },
     units::bgp_tcp_in::session_status,
 };
@@ -171,22 +170,25 @@ fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
                 .parent_ingress
                 .and_then(|parent| state.ingress_register.get(parent));
 
+            let up = info.state == Some(IngressState::Connected);
+
             Neighbor {
                 peer_address: info.remote_addr,
                 peer_asn: info.remote_asn.map(|a| a.into_u32()),
                 source: Some(PeerSource::Bmp),
                 // A BMP feed tells us a peer is up or down; the monitored
                 // router's own FSM is not visible to us.
-                state: Some(match info.state {
-                    Some(IngressState::Connected) => "Established",
-                    _ => "Idle",
-                }),
+                state: Some(if up { "Established" } else { "Idle" }),
                 configured: false,
                 router_id: info.bgp_id.map(|id| {
                     format!("{}.{}.{}.{}", id[0], id[1], id[2], id[3])
                 }),
                 ingress_id: Some(*id),
-                up_seconds: info.session_up_time.map(|up| {
+                // `session_up_time` records when the session came up and
+                // is not cleared on peer-down, so reporting it for a
+                // disconnected peer would show a still-climbing uptime for
+                // a session that is gone.
+                up_seconds: info.session_up_time.filter(|_| up).map(|up| {
                     (chrono::Utc::now() - up).num_seconds().max(0) as u64
                 }),
                 via_router: via.as_ref().and_then(|v| v.remote_addr),
@@ -198,11 +200,6 @@ fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
             }
         })
         .collect()
-}
-
-/// True when `info` describes a peer at `addr`.
-fn matches_addr(info: &IngressInfo, addr: IpAddr) -> bool {
-    info.remote_addr == Some(addr)
 }
 
 async fn neighbors(
@@ -230,18 +227,4 @@ async fn neighbor(
 
     let body = serde_json::json!({ "data": matches }).to_string();
     Ok(([("content-type", "application/json")], body))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn addr_matching_ignores_entries_without_an_address() {
-        let mut info = IngressInfo::new();
-        assert!(!matches_addr(&info, "10.0.0.1".parse().unwrap()));
-        info.remote_addr = Some("10.0.0.1".parse().unwrap());
-        assert!(matches_addr(&info, "10.0.0.1".parse().unwrap()));
-        assert!(!matches_addr(&info, "10.0.0.2".parse().unwrap()));
-    }
 }
