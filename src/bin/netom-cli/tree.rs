@@ -369,10 +369,18 @@ pub fn candidates(line: &str) -> Vec<Candidate> {
 }
 
 /// Render `?` help: the candidate continuations, aligned in two columns.
+///
+/// A line that is already a complete command ends with `<cr>`, the way a
+/// router console says "and you may press enter here".
 pub fn help_text(line: &str) -> String {
     let cands = candidates(line);
+    let runnable = resolve(line).is_ok();
     if cands.is_empty() {
-        return "% No additional keywords at this point.".to_string();
+        return if runnable {
+            "  <cr>".to_string()
+        } else {
+            "% No additional keywords at this point.".to_string()
+        };
     }
     let width = cands.iter().map(|c| c.display.len()).max().unwrap_or(0);
     let mut out = String::new();
@@ -383,6 +391,55 @@ pub fn help_text(line: &str) -> String {
             c.help,
             width = width
         ));
+    }
+    if runnable {
+        out.push_str("  <cr>");
+    } else {
+        out.pop();
+    }
+    out
+}
+
+/// Every complete command in the tree, as the words to type and the help of
+/// the keyword that runs it.
+///
+/// Walking the same tree the parser uses means `help` can never list a
+/// command that does not exist, nor miss one that does.
+pub fn all_commands() -> Vec<(String, &'static str)> {
+    fn walk(
+        level: &'static [Node],
+        path: &mut Vec<&'static str>,
+        out: &mut Vec<(String, &'static str)>,
+    ) {
+        for node in level {
+            path.push(match node.kw {
+                Kw::Lit(word) => word,
+                Kw::Arg(kind) => kind.placeholder(),
+            });
+            if node.run.is_some() {
+                out.push((path.join(" "), node.help));
+            }
+            walk(node.children, path, out);
+            path.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    walk(ROOT, &mut Vec::new(), &mut out);
+    out
+}
+
+/// Render the full command list for `help`, aligned in two columns.
+pub fn command_list() -> String {
+    let commands = all_commands();
+    let width = commands
+        .iter()
+        .map(|(path, _)| path.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    for (path, help) in &commands {
+        out.push_str(&format!("  {path:width$}  {help}\n"));
     }
     out.pop();
     out
@@ -431,6 +488,7 @@ macro_rules! flagged {
 
 pub static ROOT: &[Node] = &[
     lit!("show", "Show running system information", SHOW),
+    leaf!("help", "List every command", commands::system::help),
     leaf!("exit", "Exit the CLI", commands::system::exit),
     leaf!("quit", "Exit the CLI", commands::system::exit),
     leaf!("end", "Exit the CLI", commands::system::exit),
@@ -729,6 +787,55 @@ mod tests {
         let help = help_text("show ");
         assert!(help.contains("version"));
         assert!(help.contains("Software version"));
+    }
+
+    /// The complaint that started this: one candidate must still be listed,
+    /// never silently completed.
+    #[test]
+    fn help_text_lists_a_lone_candidate() {
+        let help = help_text("show ip ");
+        assert!(help.contains("bgp"), "{help}");
+        assert!(help.contains("BGP information"), "{help}");
+    }
+
+    #[test]
+    fn help_text_marks_a_runnable_line_with_cr() {
+        // Runnable and extendable: both halves must show.
+        let help = help_text("show ip bgp ");
+        assert!(help.contains("summary"), "{help}");
+        assert!(help.ends_with("<cr>"), "{help}");
+
+        // Runnable with nothing to add.
+        assert_eq!(help_text("show version "), "  <cr>");
+
+        // Not runnable and nothing to add.
+        assert!(help_text("show version extra ").starts_with('%'));
+    }
+
+    #[test]
+    fn help_lists_every_runnable_command() {
+        let commands = all_commands();
+        let paths: Vec<_> =
+            commands.iter().map(|(p, _)| p.as_str()).collect();
+        assert!(paths.contains(&"show ip bgp summary bmp"));
+        assert!(paths.contains(&"show bmp router <0-4294967295>"));
+        assert!(paths.contains(&"help"));
+        assert!(paths.contains(&"exit"));
+        // Internal-only nodes are not commands in their own right.
+        assert!(!paths.contains(&"show"));
+        assert!(!paths.contains(&"show ip"));
+
+        // Every listed command made only of keywords must parse back; the
+        // ones with a placeholder need a real value in its place.
+        for (path, _) in &commands {
+            if path.contains('<') {
+                continue;
+            }
+            assert!(
+                resolve(path).is_ok(),
+                "help lists {path:?}, which does not resolve",
+            );
+        }
     }
 
     /// Every leaf must be reachable and every internal node must offer a

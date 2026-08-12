@@ -32,8 +32,9 @@ Released yyyy-mm-dd.
   `show ip bgp [<prefix>]`, `show bmp routers`, `show bmp router <id>`,
   `show ingresses`, `show version`, `show status`, `show running-config` and
   `show filters`, for IPv4 and IPv6, unicast and FlowSpec. Keywords may be
-  abbreviated to any unambiguous prefix (`sh ip b sum`); `?` lists the
-  keywords that may follow. Runs one-shot, from repeated `-e` flags, from
+  abbreviated to any unambiguous prefix (`sh ip b sum`); `help` lists every
+  command, and `?` lists the keywords that may follow, marking a line that
+  is already runnable with `<cr>`. Runs one-shot, from repeated `-e` flags, from
   piped stdin, or at an interactive `netom>` prompt with history and
   tab-completion. `--json` emits the raw API response, and Cisco-style
   `| include`/`| exclude`/`| begin`/`| count` filters are supported. The

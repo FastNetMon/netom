@@ -27,8 +27,10 @@ netom-cli                              # interactive: netom> prompt
 ```
 
 Keywords abbreviate to any unambiguous prefix, so `sh ip b sum` is
-`show ip bgp summary`. A trailing `?` lists what may follow; in interactive
-mode TAB completes.
+`show ip bgp summary`. A trailing `?` lists what may follow — always as a
+list, even when only one keyword matches — and ends with `<cr>` when the
+line is already a command you can run. In interactive mode TAB completes
+instead, and `?` works at any point in the line without disturbing it.
 
 ```
 netom> show ip bgp ?
@@ -36,6 +38,23 @@ netom> show ip bgp ?
   neighbors     Detailed neighbor information
   flowspec      FlowSpec rules
   <A.B.C.D/M>   Network in the BGP routing table
+  <cr>
+```
+
+`help` prints the whole command tree at once, which is the place to start
+if you do not yet know what to press `?` after:
+
+```
+netom> help
+Commands:
+
+  show ip bgp                               BGP information
+  show ip bgp summary                       Summary of BGP neighbor status
+  ...
+  show running-config                       Current operating configuration
+  show filters                              Roto filter script and entrypoints
+  help                                      List every command
+  exit                                      Exit the CLI
 ```
 
 ## Finding the daemon
