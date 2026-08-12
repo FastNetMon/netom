@@ -18,6 +18,13 @@ default-run = "netom"
 name = "print_netom_std_doc"
 path = "doc/bin/print_netom_std_doc.rs"
 
+# The operational CLI. Deliberately does not use the `netom` lib: keeping it
+# hermetic keeps roto/cranelift, axum and rotonda-store out of its link graph
+# and its startup fast. Enforced by a test in src/bin/netom-cli/main.rs.
+[[bin]]
+name = "netom-cli"
+path = "src/bin/netom-cli/main.rs"
+
 [workspace.package]
 version = "0.6.0-fnm11"
 edition = "2021"
@@ -38,7 +45,10 @@ log                = "0.4"
 [dependencies]
 arc-swap           = "1.8"
 chrono             = { version = "0.4", default-features = false, features = ["serde", "now"] }
-clap               = { version = "4.5", default-features = false, features = ["cargo"] }
+# "help"/"usage"/"error-context" are needed for netom-cli to render its own
+# --help. They also make the daemon honour the -h/--help that doc/netom.1 has
+# always documented but that a features = ["cargo"]-only clap never generated.
+clap               = { version = "4.5", default-features = false, features = ["cargo", "help", "usage", "error-context", "std"] }
 crossbeam-utils    = "0.8"
 dashmap            = "6.1" # O(1) concurrent map for the per-router metrics hot path
 fern               = "0.7"
@@ -148,9 +158,11 @@ section = "net"
 priority = "optional"
 assets = [
     ["target/release/netom", "usr/bin/", "755"],
+    ["target/release/netom-cli", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/netom/", "644"],
     ["NOTICE.md", "usr/share/doc/netom/", "644"],
     ["doc/netom.1", "usr/share/man/man1/netom.1", "644"],
+    ["doc/netom-cli.1", "usr/share/man/man1/netom-cli.1", "644"],
     ["etc/netom.conf", "etc/netom/netom.conf.example", "644"],
 
     ["etc/examples/filters.roto.example", "usr/share/netom/examples/filters.roto.example", "644"],
@@ -186,9 +198,11 @@ systemd-units = { unit-name = "netom", unit-scripts = "pkg/common", enable = fal
 license = "MPL-2.0"
 assets = [
     { source = "target/release/netom", dest = "/usr/bin/netom", mode = "755" },
+    { source = "target/release/netom-cli", dest = "/usr/bin/netom-cli", mode = "755" },
     { source = "target/rpm/netom.service", dest = "/lib/systemd/system/netom.service", mode = "644" },
     { source = "NOTICE.md", dest = "/usr/share/doc/netom/NOTICE.md", mode = "644", doc = true },
     { source = "doc/netom.1", dest = "/usr/share/man/man1/netom.1", mode = "644", doc = true },
+    { source = "doc/netom-cli.1", dest = "/usr/share/man/man1/netom-cli.1", mode = "644", doc = true },
     { source = "etc/netom.conf", dest = "/etc/netom/netom.conf", mode = "644", config = true },
 
     { source = "etc/examples/filters.roto.example", dest = "/usr/share/netom/examples/filters.roto.example", mode = "644", config = false },
