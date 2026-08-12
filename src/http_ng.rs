@@ -103,6 +103,7 @@ impl Api {
 
         IngressApi::register_routes(&mut res);
         crate::daemon_info::http_ng::register_routes(&mut res);
+        crate::units::bgp_tcp_in::http_ng::register_routes(&mut res);
 
         res
     }

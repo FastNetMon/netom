@@ -52,6 +52,7 @@ use crate::{ingress, roto_runtime};
 
 use super::peer_config::{CombinedConfig, ConfigExt};
 use super::unit::BgpTcpIn;
+use super::session_status::{FsmState, SessionStatus};
 use super::unit::RotoFunc;
 use super::unit::SESSION_ID_COUNTER;
 
@@ -62,6 +63,20 @@ trait BgpSession<C: BgpConfig + ConfigExt> {
     fn connected_addr(&self) -> Option<SocketAddr>;
 
     fn negotiated(&self) -> Option<&NegotiatedConfig>;
+
+    /// The FSM's current state, so the session loop can mirror it into the
+    /// session registry — see [`session_status`](super::session_status) for
+    /// why mirroring rather than querying is the only workable approach.
+    fn fsm_state(&self) -> FsmState;
+
+    /// Our *configured* hold time.
+    ///
+    /// Not the negotiated one: routecore computes
+    /// `min(peer's OPEN holdtime, ours)` into `NegotiatedConfig.hold_time`,
+    /// which is a private field with no accessor, and it never writes that
+    /// value back into the session attributes. Reporting the configured
+    /// value under an honest name beats patching the dependency.
+    fn configured_hold_time(&self) -> u16;
 
     async fn tick(&mut self) -> Result<(), session::Error>;
 }
@@ -78,6 +93,14 @@ impl BgpSession<CombinedConfig> for Session<CombinedConfig> {
 
     fn negotiated(&self) -> Option<&NegotiatedConfig> {
         self.negotiated()
+    }
+
+    fn fsm_state(&self) -> FsmState {
+        self.state().into()
+    }
+
+    fn configured_hold_time(&self) -> u16 {
+        self.hold_time()
     }
 
     #[allow(clippy::type_complexity, clippy::type_repetition_in_bounds)]
@@ -97,6 +120,7 @@ struct Processor {
     status_reporter: Arc<BgpTcpInStatusReporter>,
     ingresses: Arc<ingress::Register>,
     peer_stats: Arc<BgpPeerStatsRegistry>,
+    sessions: Arc<super::session_status::BgpSessionRegistry>,
 
     /// The 'overall' IngressId for the BGP-IN unit.
     ingress_id: ingress::IngressId,
@@ -157,6 +181,7 @@ impl Processor {
             status_reporter,
             ingresses,
             peer_stats,
+            sessions: super::session_status::registry(),
             ingress_id,
             path_children: Default::default(),
             abort_handle,
@@ -182,6 +207,7 @@ impl Processor {
             status_reporter: Default::default(),
             ingresses: Arc::new(ingress::Register::default()),
             peer_stats: Arc::new(BgpPeerStatsRegistry::default()),
+            sessions: Default::default(),
             ingress_id: 0,
             path_children: Default::default(),
             abort_handle: Arc::new(Mutex::new(None)),
@@ -214,14 +240,34 @@ impl Processor {
         // avoid removing a replacement session's live_sessions entry.
         let mut my_session_id: Option<u64> = None;
 
+        // Where to mirror this session's FSM state. Resolved from the
+        // connected address, which is known as soon as the socket exists —
+        // unlike the ingress id, which only appears at negotiation.
+        let session_status: Option<Arc<SessionStatus>> = session
+            .connected_addr()
+            .map(|addr| self.sessions.get_or_create(addr.ip()));
+
         // XXX is this all OK cancel-safety-wise?
         loop {
             tokio::select! {
                 fsm_res = session.tick() => {
                     match fsm_res {
-                        Ok(()) => { },
+                        Ok(()) => {
+                            // Mirror the FSM state out of the session task.
+                            // Deliberately here rather than inside a select!
+                            // arm's body: this runs after tick() has
+                            // returned, so it cannot be hit mid-cancellation.
+                            // Cost in the common case is one relaxed load
+                            // and a comparison.
+                            if let Some(status) = &session_status {
+                                status.set_state(session.fsm_state());
+                            }
+                        },
                         Err(e) => {
                             error!("error from fsm: {e}");
+                            if let Some(status) = &session_status {
+                                status.set_last_error(e.to_string());
+                            }
                             break;
                         }
                     }
@@ -327,6 +373,17 @@ impl Processor {
                     match res {
                         None => { break; }
                         Some(Message::UpdateMessage(bgp_msg)) => {
+                            // Counted before filtering, so this is "what the
+                            // peer sent" rather than "what we kept".
+                            //
+                            // Note there is deliberately no matching
+                            // sent-message counter: netom is a collector and
+                            // never originates UPDATEs, and KEEPALIVEs are
+                            // consumed inside routecore's FSM and never
+                            // surface here. See docs/cli.md.
+                            if let Some(status) = &session_status {
+                                status.inc_updates_received();
+                            }
                             // We can only receive UPDATE messages over an
                             // established session, so not having a
                             // NegotiatedConfig should never happen.
@@ -454,6 +511,15 @@ impl Processor {
                                 "received NOTIFICATION: {:?}",
                                 pdu.details()
                             );
+                            // A NOTIFICATION is why a session went down, so
+                            // keep it for `show ip bgp neighbors`.
+                            if let Some(status) = &session_status {
+                                status.inc_notifications_received();
+                                status.set_last_error(format!(
+                                    "received NOTIFICATION: {:?}",
+                                    pdu.details(),
+                                ));
+                            }
                         }
                         Some(Message::ConnectionLost(socket)) => {
                             //TODO clean up RIB etc?
@@ -618,6 +684,14 @@ impl Processor {
                                     //.with_name("some-bgp-session".to_string())
                                     .with_remote_addr(negotiated.remote_addr())
                                     .with_remote_asn(negotiated.remote_asn())
+                                    // Until now only the BMP path set this,
+                                    // so native BGP peers had no Up/Down
+                                    // value at all. bmp-tcp-out also reads
+                                    // it for the per-peer header of its
+                                    // synthesized Peer Up, which was
+                                    // therefore reporting a zero timestamp
+                                    // for restreamed native sessions.
+                                    .with_session_up_time(Utc::now())
                                     // Direct BGP: routes received from the peer
                                     // are this router's Adj-RIB-In after import
                                     // policy. The previous OutPost default
@@ -654,6 +728,18 @@ impl Processor {
                             let ph = self.peer_stats.get_or_create(session_ingress_id);
                             ph.reset_adj_rib_in();
                             peer_stats_handle = Some(ph);
+
+                            // Everything the summary needs that is only
+                            // known once the OPENs have been exchanged.
+                            if let Some(status) = &session_status {
+                                status.set_ingress_id(session_ingress_id);
+                                status.set_remote_asn(
+                                    negotiated.remote_asn().into_u32()
+                                );
+                                status.set_hold_time(
+                                    session.configured_hold_time()
+                                );
+                            }
                         }
                         Some(Message::Attributes(_)) => unimplemented!(),
                     }
@@ -1052,6 +1138,8 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    use super::FsmState;
+
     use inetnum::asn::Asn;
     use routecore::bgp::fsm::session::{self, Message, NegotiatedConfig};
     use tokio::{sync::mpsc, task::JoinHandle};
@@ -1172,6 +1260,16 @@ mod tests {
 
         fn negotiated(&self) -> Option<&NegotiatedConfig> {
             Some(&self.1)
+        }
+
+        fn fsm_state(&self) -> FsmState {
+            // The mock never runs a real FSM; it stands in for an
+            // already-up session.
+            FsmState::Established
+        }
+
+        fn configured_hold_time(&self) -> u16 {
+            90
         }
 
         async fn tick(&mut self) -> Result<(), session::Error> {

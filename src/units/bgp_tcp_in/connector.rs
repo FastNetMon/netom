@@ -281,6 +281,17 @@ async fn connect_loop(ctx: ConnectorContext, remote_addr: IpAddr) {
             }
             Err(err) => {
                 ctx.status_reporter.connect_error(remote, &err);
+                // No session task exists to mirror FSM state for a peer we
+                // cannot reach, so record the attempt here. RFC 4271 calls
+                // "waiting to retry the transport connection" Active, which
+                // is what an operator expects to see for a peer that is
+                // configured but not answering.
+                let status = super::session_status::registry()
+                    .get_or_create(remote_addr);
+                status.set_state(
+                    super::session_status::FsmState::Active,
+                );
+                status.set_last_error(err.to_string());
             }
         }
 
