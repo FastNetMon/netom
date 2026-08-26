@@ -719,6 +719,7 @@ impl IngressInfo {
 
 #[derive(
     Clone,
+    Copy,
     Debug,
     Eq,
     Ord,

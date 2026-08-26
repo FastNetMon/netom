@@ -30,7 +30,7 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::{
     http_ng::{Api, ApiError, ApiState},
-    ingress::IngressId,
+    ingress::{IngressId, IngressType},
     representation::{GenOutput, Json, OutputFormat},
     roto_runtime::types::PeerRibType,
     units::rib_unit::rpki::RovStatus,
@@ -106,6 +106,16 @@ pub struct QueryFilter {
     #[serde(rename = "filter[largeCommunity]")]
     #[serde_as(as = "Option<serde_with::DisplayFromStr>")]
     pub large_community: Option<LargeCommunity>,
+
+    /// Keep only routes learned over this kind of ingress.
+    ///
+    /// Matched against the *session* a record belongs to, so an ADD-PATH
+    /// peer's per-path children count as their session's type; `bmp` matches
+    /// every peer monitored through BMP (`bgpViaBmp`), since a monitored
+    /// router's own ingress holds no routes. See
+    /// [`ingress_type_matches`](super::rib::ingress_type_matches).
+    #[serde(rename = "filter[ingressType]")]
+    pub ingress_type: Option<IngressType>,
 
     #[serde(rename = "filter[ribType]")]
     pub rib_type: Option<PeerRibType>,
@@ -424,6 +434,25 @@ fn build_flowspec_response(
             }
         })?;
 
+    // Applied after the store walk, so the row/byte caps above still count
+    // the unfiltered result: an ingressType query does not make an oversized
+    // FlowSpec table fit, it only narrows what is returned.
+    let rows = match filter.ingress_type {
+        Some(want) => {
+            let all = rib.ingress_register.cloned_info();
+            rows.into_iter()
+                .filter(|row| {
+                    all.get(&row.ingress_id)
+                        .map(|info| {
+                            super::rib::ingress_type_matches(want, info, &all)
+                        })
+                        .unwrap_or(false)
+                })
+                .collect()
+        }
+        None => rows,
+    };
+
     // Parse once per row for Display + RFC 8955 §5.1 ordering.
     let mut parsed: Vec<_> = rows
         .into_iter()
@@ -703,6 +732,32 @@ mod tests {
         };
         assert!(message.contains("filter[originAsn]"));
         assert!(message.contains("format"));
+    }
+
+    #[test]
+    fn ingress_type_is_parsed_from_the_query_string() {
+        let parse = |query: &str| {
+            let uri: axum::http::Uri =
+                format!("/api/v1/ribs/ipv4unicast/routes?{query}")
+                    .parse()
+                    .unwrap();
+            Query::<QueryFilter>::try_from_uri(&uri).map(|q| q.0)
+        };
+
+        assert_eq!(
+            parse("filter[ingressType]=bgpViaBmp").unwrap().ingress_type,
+            Some(IngressType::BgpViaBmp)
+        );
+        assert_eq!(
+            parse("filter[ingressType]=bgp").unwrap().ingress_type,
+            Some(IngressType::Bgp)
+        );
+        assert_eq!(parse("format=jsonl").unwrap().ingress_type, None);
+
+        // The camelCase spelling is the only one accepted, so a typo is a
+        // 400 rather than a silently unfiltered full-table answer.
+        assert!(parse("filter[ingressType]=bgp_via_bmp").is_err());
+        assert!(parse("filter[ingressType]=nonsense").is_err());
     }
 
     #[test]

@@ -883,6 +883,186 @@ async fn unicast_api_exposes_addpath_session_path_and_internal_child() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unicast_api_filters_routes_by_ingress_type() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    // A locally terminated BGP session with one ADD-PATH child, ...
+    let bgp_session = register.register();
+    register.update_info(
+        bgp_session,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let bgp_child = register.register();
+    register.update_info(
+        bgp_child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(bgp_session)
+            .with_path_id(77u32),
+    );
+
+    // ... and a peer monitored through BMP, under its router.
+    let bmp_router = register.register();
+    register.update_info(
+        bmp_router,
+        IngressInfo::new().with_ingress_type(IngressType::Bmp),
+    );
+    let bmp_peer = register.register();
+    register.update_info(
+        bmp_peer,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpViaBmp)
+            .with_parent_ingress(bmp_router),
+    );
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    for ingress in [bgp_session, bgp_child, bmp_peer] {
+        rib.insert(&route, RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    }
+
+    let ingress_ids = |ingress_type: Option<IngressType>| {
+        let mut json = Vec::new();
+        rib.search_and_output_routes(
+            crate::representation::Json(&mut json),
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            super::QueryFilter {
+                ingress_type,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let mut ids: Vec<u32> = json["data"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["ingress"]["id"].as_u64().unwrap() as u32)
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    assert_eq!(
+        ingress_ids(None),
+        vec![bgp_session, bgp_child, bmp_peer],
+        "an unfiltered query still returns every origin"
+    );
+    assert_eq!(
+        ingress_ids(Some(IngressType::Bgp)),
+        vec![bgp_session, bgp_child],
+        "the session's ADD-PATH child counts as bgp, not as its own origin"
+    );
+    assert_eq!(
+        ingress_ids(Some(IngressType::Bmp)),
+        vec![bmp_peer],
+        "bmp reaches the peers under the monitored router"
+    );
+    assert_eq!(ingress_ids(Some(IngressType::BgpViaBmp)), vec![bmp_peer]);
+    assert_eq!(ingress_ids(Some(IngressType::BgpPath)), vec![bgp_child]);
+    assert!(ingress_ids(Some(IngressType::Mrt)).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingress_scoped_dump_matches_the_full_table_walk() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let peer_a = register.register();
+    register.update_info(
+        peer_a,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let peer_b = register.register();
+    register.update_info(
+        peer_b,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+
+    // A default route, a prefix both peers hold, and one each.
+    let insert = |prefix: &str, ingress| {
+        let prefix = inetnum::addr::Prefix::from_str(prefix).unwrap();
+        let route = RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(&route, RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    };
+    insert("0.0.0.0/0", peer_a);
+    insert("192.0.2.0/24", peer_a);
+    insert("198.51.100.0/24", peer_a);
+    insert("198.51.100.0/24", peer_b);
+    insert("203.0.113.0/24", peer_b);
+
+    let dump = |ingress_id| {
+        let mut out = Vec::new();
+        rib.write_jsonl_stream(
+            AfiSafiType::Ipv4Unicast,
+            inetnum::addr::Prefix::from_str("0.0.0.0/0").unwrap(),
+            super::QueryFilter {
+                ingress_id,
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap_or_else(|_| panic!("jsonl dump for {ingress_id:?} failed"));
+        let mut lines: Vec<(String, u32)> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let row: serde_json::Value =
+                    serde_json::from_str(line).unwrap();
+                (
+                    row["prefix"].as_str().unwrap().to_string(),
+                    row["ingress"]["id"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    };
+
+    // The mui-indexed walk must return exactly what the full-table walk plus
+    // a post-filter would have returned -- the default route included, since
+    // it sits at the root the mui iterator starts from.
+    let full: Vec<(String, u32)> = dump(None);
+    for peer in [peer_a, peer_b] {
+        let expected: Vec<(String, u32)> =
+            full.iter().filter(|(_, id)| *id == peer).cloned().collect();
+        assert_eq!(dump(Some(peer)), expected, "ingress {peer}");
+        assert!(!expected.is_empty());
+    }
+
+    assert_eq!(
+        dump(Some(peer_a))
+            .iter()
+            .map(|(prefix, _)| prefix.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.0.0.0/0", "192.0.2.0/24", "198.51.100.0/24"]
+    );
+
+    // An ingress that holds nothing yields an empty dump, not the table.
+    let idle = register.register();
+    assert!(dump(Some(idle)).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ingests_compressed_mrtgen_files() {
     for extension in ["gz", "bz2"] {
         let runner =

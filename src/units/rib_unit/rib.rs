@@ -39,7 +39,7 @@ use crate::{
         self,
         peer_stats::{self, AfiSafiKey},
         register::IdAndInfo,
-        IngressId, IngressInfo,
+        IngressId, IngressInfo, IngressType,
     },
     payload::{
         PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter,
@@ -2405,6 +2405,22 @@ impl Rib {
             records.retain(|r| r.multi_uniq_id == ingress_id);
         }
 
+        if let Some(ingress_type) = filter.ingress_type {
+            // Unlike the filters below, a record whose ingress is unknown is
+            // dropped rather than kept: it has no type, so it cannot be the
+            // requested one, and keeping it would leak BMP-learned routes into
+            // an ingressType=bgp answer — precisely what this filter exists to
+            // prevent.
+            records.retain(|r| {
+                ingress_info
+                    .get(&r.multi_uniq_id)
+                    .map(|ii| {
+                        ingress_type_matches(ingress_type, ii, ingress_info)
+                    })
+                    .unwrap_or(false)
+            });
+        }
+
         if let Some(rib_type) = filter.rib_type {
             records.retain(|r| {
                 ingress_info
@@ -2700,7 +2716,19 @@ impl Rib {
             let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
                 Vec::with_capacity(chunk.len());
             for &prefix in chunk {
-                match store.get_records_for_prefix(&prefix, None, true) {
+                // Scoped to the queried mui when there is one, so a prefix
+                // held by many peers does not materialize all of their
+                // records just to have apply_filter drop them again. The
+                // walk above still visits every prefix: the store has no
+                // per-mui prefix index (`iter_records_for_mui_*` is itself a
+                // full more-specifics walk from the family default route), so
+                // an ingressId dump can only be made cheaper per prefix, not
+                // shorter.
+                match store.get_records_for_prefix(
+                    &prefix,
+                    filter.ingress_id,
+                    true,
+                ) {
                     Ok(Some(meta)) => {
                         batch.push(PrefixRecord::new(prefix, meta))
                     }
@@ -2865,6 +2893,45 @@ impl RouteSource {
                 internal_path_ingress_id: None,
             }
         }
+    }
+}
+
+/// Whether a record stored under `info`'s ingress belongs to a session of
+/// type `want`, for `filter[ingressType]`.
+///
+/// Matching is on the *session*, not on the store mui: an ADD-PATH path-child
+/// ([`IngressType::BgpPath`]) says nothing about where the route came from, so
+/// it is attributed to its parent session. Without that, `ingressType=bgp`
+/// would silently drop every route from an ADD-PATH peer.
+pub(crate) fn ingress_type_matches(
+    want: IngressType,
+    info: &IngressInfo,
+    all: &HashMap<IngressId, IngressInfo>,
+) -> bool {
+    let own = info.ingress_type;
+
+    // An explicit ingressType=bgpPath query asks for the children themselves,
+    // so answer that before resolving them away.
+    if own == Some(want) {
+        return true;
+    }
+
+    let session_type = if own == Some(IngressType::BgpPath) {
+        info.parent_ingress
+            .and_then(|parent| all.get(&parent))
+            .and_then(|parent| parent.ingress_type)
+    } else {
+        own
+    };
+
+    match (want, session_type) {
+        // Routes learned over BMP are stored under the monitored router's
+        // per-peer `BgpViaBmp` children; the router's own `Bmp` ingress never
+        // owns a record. Treat `bmp` as "everything learned through BMP"
+        // rather than always answering with an empty set.
+        (IngressType::Bmp, Some(IngressType::BgpViaBmp)) => true,
+        (want, Some(session_type)) => want == session_type,
+        (_, None) => false,
     }
 }
 
@@ -3277,6 +3344,71 @@ mod tests {
     };
 
     use super::*;
+
+    fn info(
+        ingress_type: IngressType,
+        parent: Option<IngressId>,
+    ) -> IngressInfo {
+        IngressInfo {
+            ingress_type: Some(ingress_type),
+            parent_ingress: parent,
+            ..IngressInfo::new()
+        }
+    }
+
+    #[test]
+    fn ingress_type_filter_matches_the_session_of_a_path_child() {
+        let session = info(IngressType::Bgp, None);
+        let child = info(IngressType::BgpPath, Some(1));
+        let all = HashMap::from([(1, session.clone()), (2, child.clone())]);
+
+        // The session itself, and its per-path children, are both "bgp".
+        assert!(ingress_type_matches(IngressType::Bgp, &session, &all));
+        assert!(ingress_type_matches(IngressType::Bgp, &child, &all));
+
+        // ... and neither is reachable under another origin.
+        assert!(!ingress_type_matches(IngressType::Mrt, &child, &all));
+        assert!(!ingress_type_matches(IngressType::BgpViaBmp, &child, &all));
+
+        // Asking for the children explicitly still works.
+        assert!(ingress_type_matches(IngressType::BgpPath, &child, &all));
+        assert!(!ingress_type_matches(IngressType::BgpPath, &session, &all));
+    }
+
+    #[test]
+    fn ingress_type_filter_treats_bmp_as_everything_learned_over_bmp() {
+        let router = info(IngressType::Bmp, None);
+        let peer = info(IngressType::BgpViaBmp, Some(1));
+        let child = info(IngressType::BgpPath, Some(2));
+        let all = HashMap::from([
+            (1, router.clone()),
+            (2, peer.clone()),
+            (3, child.clone()),
+        ]);
+
+        // A monitored router's own ingress holds no routes, so `bmp` has to
+        // reach the peers under it — including their ADD-PATH children.
+        assert!(ingress_type_matches(IngressType::Bmp, &peer, &all));
+        assert!(ingress_type_matches(IngressType::Bmp, &child, &all));
+        assert!(ingress_type_matches(IngressType::BgpViaBmp, &peer, &all));
+
+        // A locally terminated session is not BMP-learned.
+        let bgp = info(IngressType::Bgp, None);
+        assert!(!ingress_type_matches(IngressType::Bmp, &bgp, &all));
+    }
+
+    #[test]
+    fn ingress_type_filter_rejects_an_unresolvable_ingress() {
+        // A path child whose parent is gone from the register has no session
+        // type, so it belongs to no origin rather than to all of them.
+        let orphan = info(IngressType::BgpPath, Some(99));
+        let all = HashMap::from([(2, orphan.clone())]);
+        assert!(!ingress_type_matches(IngressType::Bgp, &orphan, &all));
+        assert!(!ingress_type_matches(IngressType::Bmp, &orphan, &all));
+
+        let untyped = IngressInfo::new();
+        assert!(!ingress_type_matches(IngressType::Bgp, &untyped, &all));
+    }
 
     // LH: these do not make much sense anymore with the new prefix store
     // doing all the updating/merging of entries. Adapting does not seem to be

@@ -223,6 +223,32 @@ non-ADD-PATH families) — it does not aggregate the children. To get
 everything a peer contributed, collect the session id plus its `bgpPath`
 children from `/api/v1/ingresses` and query per id.
 
+### Filtering by ingress type
+
+To select routes by *where they were learned* rather than by one session,
+both endpoints also accept `filter[ingressType]=<type>`:
+
+```
+GET /api/v1/ribs/ipv4unicast/routes?format=jsonl&filter[ingressType]=bgp
+GET /api/v1/ribs/ipv4flowspec/routes?filter[ingressType]=bmp
+```
+
+The values are the `ingress_type` spellings from `/api/v1/ingresses`:
+`bgp`, `bmp`, `bgpViaBmp`, `mrt`, `rtr`, `bgpPath`. Two of them are worth
+spelling out:
+
+* Unlike `ingressId`, this matches on the *session* a record belongs to, so
+  a peer's `bgpPath` children are returned under their session's type —
+  `filter[ingressType]=bgp` keeps every path of an ADD-PATH BGP peer instead
+  of dropping them all. Query `bgpPath` explicitly to get only the children.
+* A monitored router's own `bmp` ingress never holds routes (they arrive on
+  its per-peer `bgpViaBmp` children), so `bmp` is accepted as "everything
+  learned through BMP" rather than answering with an empty set.
+
+An unknown type is a 400, not a silently unfiltered dump. For flowspec the
+filter is applied after the store walk, so it narrows the response but does
+not help an oversized table fit under the response limit.
+
 ## On the wire (bmp-out)
 
 Downstream BMP consumers never see the child ingresses. `bmp-tcp-out`
