@@ -42,6 +42,38 @@ feature completeness and cleanup.
       internal-server error.
 - [ ] Add pagination or bounded streaming for queries that can cover the whole
       RIB.
+- [ ] Fix `Rib::match_ingress_id` silently dropping a peer's default route.
+      `iter_records_for_mui_v4/_v6` is a more-specifics walk anchored at the
+      family default route, and a more-specifics walk does not yield its own
+      anchor, so a peer that announces `0.0.0.0/0` or `::/0` has it missing
+      from the result while every other prefix is present. Nothing calls
+      `match_ingress_id` today, which is the only reason this has not bitten;
+      it is a trap for whoever implements `Rib::search_routes_for_ingress`
+      above, or wires the mui iterators into the jsonl dump. Found 2026-08-26
+      while benchmarking exactly that. Fix belongs in netom-store — have the
+      mui iterators include the anchor prefix — with a caller-side probe of
+      the family default route as the workaround until then.
+      `ingress_scoped_dump_matches_the_full_table_walk` in
+      `src/units/rib_unit/tests.rs` asserts that an `?ingressId=` dump keeps
+      the peer's `0.0.0.0/0`, so switching that walk over without fixing the
+      iterator fails the suite instead of quietly losing routes.
+- [ ] Make a per-peer route dump cheaper than a full-table scan. This needs a
+      change in netom-store, not here: `iter_records_for_mui_v4/_v6` looks
+      like an indexed lookup but is a more-specifics walk from the family
+      default route that visits every prefix and only filters each value
+      fetch by mui, so `?ingressId=` stays O(table) however it is driven
+      (measured on a 200k-prefix table with the queried peer holding 100
+      routes: 92ms before scoping the per-prefix fetch to the mui, 84ms
+      after, 80ms when driving the key walk from the mui iterator as well —
+      and that last variant holds an epoch guard across the whole scan,
+      which the guard-free key walk exists to avoid, and misses the peer's
+      own default route because a more-specifics iterator does not yield its
+      anchor). The fix is to prune subtrees during the walk using the
+      per-node mui bitmap the TreeBitMap already maintains
+      (`src/tree_bitmap/node_cht.rs`), i.e. teach `more_specific_prefix_iter_from`
+      to take a mui. `Rib::match_ingress_id` is the natural caller to build
+      on, and would then also give `Rib::search_routes_for_ingress` above a
+      real implementation.
 
 ## 4. Bound memory and output backpressure
 
