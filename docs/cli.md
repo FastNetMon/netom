@@ -190,4 +190,6 @@ access to the API port as equivalent to read access to the config.
 ## See also
 
 * `netom-cli(1)` for the full option and command reference.
-* `docs/addpath-flowspec-api.md` for the JSON shapes behind these commands.
+* `docs/rib-query-api.md` for the HTTP endpoints, filters and JSON shapes
+  behind these commands.
+* `docs/addpath-flowspec-api.md` for what ADD-PATH and FlowSpec add on top.
