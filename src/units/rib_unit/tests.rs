@@ -1270,8 +1270,11 @@ async fn process_update_same_route_twice() {
         1
     );
 
-    // And check that recorded metrics are correct
-    assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 0, 1, 1));
+    // And check that recorded metrics are correct. `announced` stays at 1:
+    // it counts announcements that brought a prefix in, and does not walk
+    // back down on withdrawal -- what the RIB holds now is `num_items`,
+    // read from the store. See `rib_counters_survive_withdrawal_churn`.
+    assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 1, 1, 1));
 }
 
 #[tokio::test]
@@ -1994,6 +1997,78 @@ async fn is_filtered(_runner: &RibUnitRunner, _update: Update) -> bool {
             let num_updates = gate_metrics.num_updates.load(SeqCst);
             num_dropped_updates == 0 && num_updates == 0
                 */
+}
+
+/// The RIB counters against a peer's normal churn.
+///
+/// The one that matters is `num_routes_announced`: it used to count prefixes
+/// on the way in and subtract *records* on the way out, so on any real feed
+/// it went below zero and, being unsigned, wrapped. A collector reported
+/// 18446744073709551615 - 342754275 after four days. Nothing here subtracts
+/// any more -- what the RIB currently holds is read from the store, which
+/// knows -- so the sequence below cannot produce that value however it is
+/// extended.
+#[tokio::test]
+async fn rib_counters_survive_withdrawal_churn() {
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let prefix = Prefix::from_str("127.0.0.1/32").unwrap();
+
+    let counters = || {
+        let m = get_testable_metrics_snapshot(
+            &runner.status_reporter().metrics().unwrap(),
+        );
+        (
+            m.with_name::<usize>("rib_unit_num_unique_prefixes"),
+            m.with_name::<usize>("rib_unit_num_items"),
+            m.with_name::<usize>("rib_unit_num_routes_announced"),
+            m.with_name::<usize>("rib_unit_num_routes_withdrawn"),
+            m.with_name::<usize>("rib_unit_num_modified_route_announcements"),
+        )
+    };
+    let apply = |as_path, ingress| {
+        runner.process_update(mk_route_update_with_ingress(
+            &prefix, as_path, ingress,
+        ))
+    };
+
+    assert_eq!(counters(), (0, 0, 0, 0, 0));
+
+    // One peer announces it: one prefix, one record.
+    apply(Some("[111]"), 1).await.unwrap();
+    assert_eq!(counters(), (1, 1, 1, 0, 0));
+
+    // A second peer announces the same prefix: still one prefix, but the
+    // store now holds two records, and no new prefix entered the RIB.
+    apply(Some("[222]"), 2).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 0, 1));
+
+    // A re-announcement with a different path -- BGP's implicit withdraw --
+    // replaces a record rather than adding one.
+    apply(Some("[333]"), 1).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 0, 2));
+
+    // Withdrawing counts a withdrawal and nothing else. The gauges keep
+    // reporting what the store holds, records included: the withdrawn one
+    // keeps its slot until it is compacted away.
+    apply(None, 1).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 1, 2));
+
+    // Withdrawing again is where the old arithmetic wrapped.
+    apply(None, 1).await.unwrap();
+    let (_, _, announced, withdrawn, _) = counters();
+    assert_eq!(announced, 1, "announced must not go below zero");
+    assert_eq!(withdrawn, 2);
+
+    // A withdrawal for a prefix the RIB never held counts as neither.
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &Prefix::from_str("10.9.9.0/24").unwrap(),
+            None,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(counters(), (1, 2, 1, 2, 2));
 }
 
 fn query_metrics(

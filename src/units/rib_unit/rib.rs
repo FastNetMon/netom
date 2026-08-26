@@ -1082,15 +1082,20 @@ impl Rib {
             // mark_mui_as_withdrawn_for_prefix . This way, we preserve the
             // last seen attributes/nexthop for this {prefix,mui} combination,
             // while setting the status to Withdrawn.
+            //
+            // `mui_count` reports whether there was anything to withdraw, so
+            // the caller does not count a withdrawal for a {prefix,mui} the
+            // store never held. `contains` is a bitmap check and runs only on
+            // the withdrawal path, never on the announcement hot path. The
+            // other fields stay as they are: nothing was inserted.
+            let existed = store.contains(prefix, Some(mui));
             store.mark_mui_as_withdrawn_for_prefix(prefix, mui, 0)?;
 
-            // FIXME this is just to satisfy the function signature, but is
-            // quite useless as-is.
             return Ok(UpsertReport {
                 cas_count: 0,
                 prefix_new: false,
                 mui_new: false,
-                mui_count: 0,
+                mui_count: usize::from(existed),
             });
         }
 

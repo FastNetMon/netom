@@ -353,6 +353,7 @@ impl RibUnitRunner {
             &gate,
             rib_merge_update_stats.clone(),
         ));
+        metrics.set_rib(&rib);
         component.register_metrics(metrics.clone());
 
         // Setup status reporting
@@ -438,7 +439,8 @@ impl RibUnitRunner {
         let ingress_register: Arc<ingress::Register> = Default::default();
         let ctx = Arc::new(Mutex::new(Ctx::empty()));
         let rib = Rib::new(ingress_register.clone(), None, ctx.clone())?;
-        let status_reporter = RibUnitStatusReporter::default().into();
+        let status_reporter: Arc<RibUnitStatusReporter> =
+            RibUnitStatusReporter::default().into();
         let filter_name =
             Arc::new(ArcSwap::from_pointee(FilterName::default()));
         let _process_metrics = Arc::new(TokioTaskMetrics::new());
@@ -446,6 +448,7 @@ impl RibUnitRunner {
             Default::default();
 
         let shared_rib = Arc::new(ArcSwap::new(Arc::new(rib)));
+        status_reporter.set_rib(&shared_rib);
         let tracer = Arc::new(Tracer::new());
         let retain_withdrawn_attributes =
             Arc::new(AtomicBool::new(retain_withdrawn_attributes));
@@ -1445,7 +1448,26 @@ impl RibUnitRunner {
                 let propagation_delay =
                     payload.received.duration_since(post_insert);
 
-                let change = if report.prefix_new {
+                // A withdrawal is reported only as a withdrawal. Reporting
+                // it as an announcement effect as well -- which is what
+                // happened before -- inflated the modified-announcements
+                // counter with every peer's withdrawals.
+                //
+                // `report.mui_count` is zero when there was nothing to
+                // withdraw: a withdrawal for a {prefix, mui} the store never
+                // held, which must not be counted as one.
+                //
+                // These stay keyed on `prefix_new` rather than the
+                // per-record `mui_new`, which would be the better signal:
+                // the store sets `mui_new` unconditionally for a prefix it
+                // already holds, so it reads true even when an existing
+                // record was overwritten. See the RIB metrics item in
+                // TODO.md.
+                let change = if route_status == RouteStatus::Withdrawn {
+                    StoreInsertionEffect::RoutesWithdrawn(usize::from(
+                        report.mui_count > 0,
+                    ))
+                } else if report.prefix_new {
                     StoreInsertionEffect::RouteAdded
                 } else {
                     StoreInsertionEffect::RouteUpdated
@@ -1458,16 +1480,6 @@ impl RibUnitRunner {
                     report.cas_count.try_into().unwrap_or(u32::MAX),
                     change,
                 );
-                if route_status == RouteStatus::Withdrawn {
-                    self.status_reporter.insert_ok(
-                        ingress_id,
-                        store_op_delay,
-                        propagation_delay,
-                        //num_retries,
-                        report.cas_count.try_into().unwrap_or(u32::MAX),
-                        StoreInsertionEffect::RoutesWithdrawn(1),
-                    );
-                }
 
                 // XXX re-introduce sometime later
                 //if let Some(ref roto_function) = self.roto_function_post {

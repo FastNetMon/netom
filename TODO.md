@@ -75,6 +75,31 @@ feature completeness and cleanup.
       on, and would then also give `Rib::search_routes_for_ingress` above a
       real implementation.
 
+## 3a. RIB metric accounting
+
+- [ ] Fix `UpsertReport::mui_new` in netom-store, then count routes per record
+      rather than per prefix. In `prefix_cht/cht.rs::upsert_prefix`, the
+      "prefix already exists" branch initialises `mui_is_new = true` and only
+      ever *sets* it true (`if mui_count.is_none() { mui_is_new = true }`) --
+      the `else` that clears it on an overwrite is missing, so the report
+      reads `mui_new: true` even when an existing record was replaced. The
+      "new prefix" branch gets it right. Until that is fixed netom cannot
+      tell a second peer's path for a known prefix (a new route) from a
+      re-announcement of one it already had, which is why
+      `rib_unit_num_routes_announced` counts prefixes and
+      `rib_unit_num_modified_route_announcements` lumps both together. Found
+      2026-08-26 while fixing the announced-counter underflow; the netom side
+      is keyed on `prefix_new` with a comment pointing here
+      (`units/rib_unit/unit.rs`).
+- [ ] Count a repeated withdrawal of an already-withdrawn record only once.
+      `rib_unit_num_routes_withdrawn` counts every withdrawal the store
+      accepted, and a record that is already `Withdrawn` still exists, so a
+      peer that withdraws twice is counted twice. Telling them apart needs
+      the record's previous status, which is a store probe per withdrawal --
+      the cost `Rib::insert_prefix` deliberately pays only for peers that
+      have a stats entry. Cheap once the store can report the status it
+      replaced.
+
 ## 4. Bound memory and output backpressure
 
 - [ ] Ensure every full-RIB HTTP and WebUI path streams or enforces a strict
