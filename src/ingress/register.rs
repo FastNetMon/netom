@@ -1,7 +1,11 @@
 use chrono::{DateTime, Utc};
 use core::sync::atomic::AtomicU32;
 use std::net::IpAddr;
-use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::atomic::Ordering,
+};
 
 use inetnum::asn::Asn;
 use paste::paste;
@@ -275,6 +279,43 @@ impl Register {
 
     pub fn cloned_info(&self) -> HashMap<IngressId, IngressInfo> {
         self.info.read().unwrap().clone()
+    }
+
+    /// Snapshot the info for just these ingresses, plus the parent each one
+    /// resolves through.
+    ///
+    /// A route query needs the register only for the muis its own result
+    /// holds, which on a collector is a few hundred entries out of a register
+    /// that can hold millions -- one ADD-PATH child per `(session, path_id)`,
+    /// and routers that allocate a path id per path mint one per route. A
+    /// production collector was measured at 1.35M entries, where
+    /// [`cloned_info`](Self::cloned_info) costs 631MB of transient allocation
+    /// and 350ms *per query*, including a single-prefix lookup returning four
+    /// records.
+    ///
+    /// Parents come along because a `BgpPath` child is attributed to its
+    /// session -- see [`RouteSource::resolve`](
+    /// crate::units::rib_unit::rib::RouteSource::resolve) and the
+    /// `filter[ingressType]` matcher. One level is enough: children never
+    /// parent other children.
+    pub fn cloned_info_for(
+        &self,
+        ids: &HashSet<IngressId>,
+    ) -> HashMap<IngressId, IngressInfo> {
+        let lock = self.info.read().unwrap();
+        let mut res = HashMap::with_capacity(ids.len());
+        for id in ids {
+            let Some(info) = lock.get(id) else { continue };
+            if let Some(parent) = info.parent_ingress {
+                if !ids.contains(&parent) {
+                    if let Some(parent_info) = lock.get(&parent) {
+                        res.insert(parent, parent_info.clone());
+                    }
+                }
+            }
+            res.insert(*id, info.clone());
+        }
+        res
     }
 
     /// Tally the register for memory reporting, locking once and counting in
@@ -938,6 +979,49 @@ mod tests {
 
         // And the newly set RibType
         assert_eq!(res.get(id).unwrap().rib_type, Some(RibType::LocRib));
+    }
+
+    #[test]
+    fn cloned_info_for_takes_the_ids_and_their_parents() {
+        let register = Register::new();
+
+        let session = register.register();
+        register.update_info(
+            session,
+            IngressInfo::new().with_ingress_type(IngressType::Bgp),
+        );
+        let child = register.register();
+        register.update_info(
+            child,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(session)
+                .with_path_id(1u32),
+        );
+        let bystander = register.register();
+        register.update_info(
+            bystander,
+            IngressInfo::new().with_ingress_type(IngressType::Bgp),
+        );
+
+        // A child drags its session in, so the record can still be
+        // attributed to the peer that sent it.
+        let res = register.cloned_info_for(&HashSet::from([child]));
+        let mut ids: Vec<_> = res.keys().copied().collect();
+        ids.sort();
+        assert_eq!(ids, vec![session, child]);
+        assert_eq!(res[&child].path_id, Some(1));
+
+        // Nothing else comes along for the ride.
+        assert!(!res.contains_key(&bystander));
+
+        // An id the register does not know is skipped, not an error: a
+        // record can outlive its ingress entry.
+        let res =
+            register.cloned_info_for(&HashSet::from([session, u32::MAX]));
+        assert_eq!(res.keys().copied().collect::<Vec<_>>(), vec![session]);
+
+        assert!(register.cloned_info_for(&HashSet::new()).is_empty());
     }
 
     #[test]

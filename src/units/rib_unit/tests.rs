@@ -974,6 +974,78 @@ async fn unicast_api_filters_routes_by_ingress_type() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_query_snapshots_only_the_ingresses_in_its_result() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let session = register.register();
+    register.update_info(
+        session,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let child = register.register();
+    register.update_info(
+        child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(77u32),
+    );
+
+    // A register far larger than any one query's result, as a collector's
+    // is: one entry per ADD-PATH (session, path_id).
+    for _ in 0..1_000 {
+        let bystander = register.register();
+        register.update_info(
+            bystander,
+            IngressInfo::new().with_ingress_type(IngressType::BgpViaBmp),
+        );
+    }
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    rib.insert(&route, RouteStatus::Active, 1, child, true, false)
+        .unwrap();
+
+    let result = rib
+        .search_routes(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            super::QueryFilter::default(),
+        )
+        .unwrap();
+
+    // The one record's mui and the session it resolves through -- not the
+    // thousand ingresses that have nothing to do with this prefix.
+    let mut ids: Vec<_> = result.ingress_info.keys().copied().collect();
+    ids.sort();
+    assert_eq!(ids, vec![session, child]);
+
+    // ... and the parent being there is the point: without it the record
+    // would report itself as its own source instead of the session's path.
+    let mut json = Vec::new();
+    rib.search_and_output_routes(
+        crate::representation::Json(&mut json),
+        AfiSafiType::Ipv4Unicast,
+        prefix,
+        super::QueryFilter::default(),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let row = &json["data"]["routes"][0];
+    assert_eq!(row["ingress"]["id"], child);
+    assert_eq!(row["source"]["ingressId"], session);
+    assert_eq!(row["source"]["pathId"], 77);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ingress_scoped_dump_matches_the_full_table_walk() {
     use crate::ingress::{IngressInfo, IngressType};
     use crate::payload::{RotondaPaMap, RotondaRoute};

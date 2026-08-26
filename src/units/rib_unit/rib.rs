@@ -2669,7 +2669,16 @@ impl Rib {
             }
         };
 
-        let ingress_info = self.ingress_register.cloned_info();
+        // An ingressId-scoped dump only ever emits records of that one mui,
+        // so it needs that entry and its parent rather than the whole
+        // register (see `Register::cloned_info_for`). Every other dump can
+        // hold any mui and needs the full snapshot.
+        let ingress_info = match filter.ingress_id {
+            Some(mui) => {
+                self.ingress_register.cloned_info_for(&HashSet::from([mui]))
+            }
+            None => self.ingress_register.cloned_info(),
+        };
 
         let maybe_roto_function: Option<RotoHttpFilter> =
             match filter.roto_function.as_ref() {
@@ -2943,11 +2952,38 @@ impl SearchResult {
         ingress_register: Arc<ingress::Register>,
         query_filter: QueryFilter,
     ) -> Self {
+        // Resolve only the muis this result actually holds, rather than
+        // snapshotting the whole register: a query touches a few hundred
+        // ingresses, while the register on a collector holds one entry per
+        // ADD-PATH `(session, path_id)` and so grows with the table. Cloning
+        // all of it cost 631MB and 350ms per query on a production box with
+        // 1.35M entries -- for a single-prefix lookup returning four records.
+        let ingress_info =
+            ingress_register.cloned_info_for(&Self::muis(&query_result));
         Self {
             query_result,
-            ingress_info: ingress_register.cloned_info(),
+            ingress_info,
             query_filter,
         }
+    }
+
+    /// Every mui appearing in a query result, across the matched prefix and
+    /// both include sets.
+    fn muis(query_result: &QueryResult<RotondaPaMap>) -> HashSet<IngressId> {
+        let mut ids = HashSet::new();
+        ids.extend(query_result.records.iter().map(|r| r.multi_uniq_id));
+        for set in [
+            query_result.more_specifics.as_ref(),
+            query_result.less_specifics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for pr in set.v4.iter().chain(set.v6.iter()) {
+                ids.extend(pr.meta.iter().map(|r| r.multi_uniq_id));
+            }
+        }
+        ids
     }
 
     pub(crate) fn ingress_info(
