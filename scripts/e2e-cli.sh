@@ -166,6 +166,52 @@ cli show ip bgp 10.0.0.0/24 | grep -q "10.0.0.0/24" \
 cli show ip bgp | grep -q "Total routes 3" \
     || fail "whole-table dump: $(cli show ip bgp)"
 
+# Route filters. The speaker is a session netom terminates itself, so every
+# route is `source bgp` and none is `source bmp`; the brackets in
+# filter[ingressType] have to survive the wire, not just the unit tests.
+cli show ip bgp source bgp | grep -q "Total routes 3" \
+    || fail "source bgp: $(cli show ip bgp source bgp)"
+cli show ip bgp source bmp | grep -q "Total routes 0" \
+    || fail "source bmp should be empty: $(cli show ip bgp source bmp)"
+cli show ip bgp source mrt | grep -q "Total routes 0" \
+    || fail "source mrt should be empty: $(cli show ip bgp source mrt)"
+
+cli show ip bgp neighbors 127.0.0.1 routes | grep -q "Total routes 3" \
+    || fail "neighbor routes: $(cli show ip bgp neighbors 127.0.0.1 routes)"
+cli show ip bgp neighbors 127.0.0.9 routes | grep -q "Total routes 0" \
+    || fail "routes of a peer that never came up should be empty"
+
+cli show ip bgp origin-as 65001 | grep -q "Total routes 3" \
+    || fail "origin-as: $(cli show ip bgp origin-as 65001)"
+cli show ip bgp origin-as 65999 | grep -q "Total routes 0" \
+    || fail "origin-as of an AS with no routes should be empty"
+
+INGRESS_ID="$(cli --json show ingresses | python3 -c '
+import json, sys
+data = json.load(sys.stdin)["data"]
+print(next(i["id"] for i in data if i.get("ingress_type") == "bgp"))
+')"
+cli show ip bgp ingress "$INGRESS_ID" | grep -q "Total routes 3" \
+    || fail "ingress $INGRESS_ID: $(cli show ip bgp ingress "$INGRESS_ID")"
+
+# A filter that narrows to nothing must still be a well-formed empty table,
+# not a 400 from the daemon.
+cli show ip bgp community 65000:100 | grep -q "Total routes 0" \
+    || fail "community: $(cli show ip bgp community 65000:100)"
+
+# FlowSpec answers buffered JSON, not NDJSON, so it has its own renderer:
+# an empty table must read as a table, not as a 400 about format=jsonl.
+cli show ip bgp flowspec | grep -q "Total rules 0" \
+    || fail "flowspec table: $(cli show ip bgp flowspec)"
+cli show ip bgp flowspec 10.0.0.0/24 | grep -q "Total rules 0" \
+    || fail "flowspec prefix: $(cli show ip bgp flowspec 10.0.0.0/24)"
+cli show ip bgp flowspec source bmp | grep -q "Total rules 0" \
+    || fail "flowspec source bmp: $(cli show ip bgp flowspec source bmp)"
+# ... and only the filters the daemon implements for it are typeable.
+if cli show ip bgp flowspec origin-as 65001 > /dev/null 2>&1; then
+    fail "flowspec should not accept origin-as"
+fi
+
 # --json is a raw passthrough, so it must parse as the API's own output.
 cli --json show ip bgp summary | python3 -c 'import json,sys; json.load(sys.stdin)' \
     || fail "--json summary is not valid JSON"

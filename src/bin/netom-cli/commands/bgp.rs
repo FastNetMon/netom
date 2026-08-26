@@ -270,14 +270,71 @@ fn rib_base(afi: Afi, safi: Safi) -> &'static str {
     }
 }
 
+/// The `filter[...]` parameters implied by the command that was typed.
+///
+/// Each narrowing keyword under `show ip bgp` contributes one, and the tree
+/// is a path, so at most one is ever present. Brackets go on the wire raw,
+/// as `show bmp routers` has always sent `filter[type]`.
+fn filter_params(c: &Captures) -> Vec<String> {
+    let mut params = Vec::new();
+
+    if let Some(source) = c.source() {
+        params.push(format!("filter[ingressType]={}", source.ingress_type()));
+    }
+    if let Some(id) = c.ingress_id() {
+        // Not a filter[...] parameter: the store matches this one directly.
+        params.push(format!("ingressId={id}"));
+    }
+    // Only `neighbors <ip> routes` puts an address in the captures; the
+    // neighbor detail command has its own handler.
+    if let Some(addr) = c.ip() {
+        params.push(format!("filter[peerAddress]={addr}"));
+    }
+    if let Some(asn) = c.asn() {
+        params.push(format!("filter[originAsn]={asn}"));
+    }
+    if let Some(community) = c.community() {
+        params.push(format!("filter[community]={community}"));
+    }
+
+    params
+}
+
 pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
     let base = rib_base(c.afi(), c.safi());
+    let filters = filter_params(c);
+
+    // FlowSpec answers buffered JSON only -- it rejects format=jsonl with a
+    // 400 -- and its rows are rules, not routes, so it needs its own path
+    // and its own renderer for both the whole-table and single-prefix cases.
+    if c.safi() == Safi::FlowSpec {
+        let mut path = match c.prefix() {
+            Some((addr, len)) => format!("{base}/{addr}/{len}"),
+            None => base.to_string(),
+        };
+        if !filters.is_empty() {
+            path.push('?');
+            path.push_str(&filters.join("&"));
+        }
+        if session.json {
+            return session.passthrough(&path);
+        }
+        let body = session.get(&path)?.body_string()?;
+        let mut out = session.writer();
+        render_flowspec(&mut out, &body)?;
+        out.finish()?;
+        return Ok(());
+    }
 
     match c.prefix() {
         // A single prefix is a bounded lookup, so it can be buffered and
         // rendered as a fitted table.
         Some((addr, len)) => {
-            let path = format!("{base}/{addr}/{len}");
+            let mut path = format!("{base}/{addr}/{len}");
+            if !filters.is_empty() {
+                path.push('?');
+                path.push_str(&filters.join("&"));
+            }
             if session.json {
                 return session.passthrough(&path);
             }
@@ -287,11 +344,14 @@ pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
             out.finish()?;
             Ok(())
         }
-        // A whole-table dump. The daemon auto-adds moreSpecifics to a bare
-        // /routes and rejects it with 400 unless format=jsonl, so the
-        // streaming path is mandatory, not an optimisation.
+        // A whole-table dump, narrowed or not. The daemon auto-adds
+        // moreSpecifics to a bare /routes and rejects it with 400 unless
+        // format=jsonl, so the streaming path is mandatory, not an
+        // optimisation -- a filter narrows the output, not the walk.
         None => {
-            let path = format!("{base}?format=jsonl");
+            let mut query = vec![String::from("format=jsonl")];
+            query.extend(filters);
+            let path = format!("{base}?{}", query.join("&"));
             if session.json {
                 return session.passthrough(&path);
             }
@@ -370,6 +430,65 @@ fn route_attrs(route: &serde_json::Value) -> RouteAttrs {
 }
 
 /// Stream an NDJSON table, rendering rows as they arrive.
+static FLOWSPEC_COLS: &[Col] = &[
+    left("Prefix", 18),
+    left("Rule", 30),
+    left("Actions", 20),
+    left("Valid", 14),
+    left("Peer", 6),
+];
+
+/// Render the FlowSpec rules in a `{"data": [ … ]}` response.
+///
+/// The rows are rules rather than routes: keyed on the destination prefix,
+/// carrying a decoded rule and its traffic actions, and validated against
+/// the unicast RIB (RFC 8955 §6). `Peer` is the owning session, so an
+/// ADD-PATH peer's rules do not appear under an id `show ingresses` shows
+/// as a path child.
+pub fn render_flowspec<W: Write>(
+    out: &mut W,
+    body: &str,
+) -> Result<(), CliError> {
+    let rules = data_array(body)?;
+
+    let mut count = 0u64;
+    {
+        let mut table = Table::fit(out, FLOWSPEC_COLS);
+        for rule in &rules {
+            let actions = rule["actions"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            let peer = match rule["source"]["pathId"].as_u64() {
+                Some(path_id) => format!(
+                    "{} path {path_id}",
+                    rule["source"]["ingressId"].as_u64().unwrap_or_default()
+                ),
+                None => rule["source"]["ingressId"]
+                    .as_u64()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+            };
+            table.row(&[
+                rule["keyPrefix"].as_str().unwrap_or("-").to_string(),
+                rule["nlri"].as_str().unwrap_or("-").to_string(),
+                actions,
+                rule["validity"].as_str().unwrap_or("-").to_string(),
+                peer,
+            ])?;
+            count += 1;
+        }
+        table.finish()?;
+    }
+    writeln!(out, "\nTotal rules {}", fmt::count(count))?;
+    Ok(())
+}
+
 fn stream_table(session: &mut Session, path: &str) -> Result<(), CliError> {
     let mut resp = session.get(path)?;
     let mut out = session.writer();
@@ -427,6 +546,7 @@ fn data_array(body: &str) -> Result<Vec<serde_json::Value>, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tree::{Flag, Value};
 
     const NEIGHBORS: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -574,6 +694,72 @@ mod tests {
         assert_eq!(
             rib_base(Afi::V6, Safi::FlowSpec),
             "/api/v1/ribs/ipv6flowspec/routes"
+        );
+    }
+    fn captures(args: Vec<Value>, flags: Vec<Flag>) -> Captures {
+        Captures { args, flags }
+    }
+
+    #[test]
+    fn filters_map_onto_the_query_parameters() {
+        assert!(filter_params(&Captures::default()).is_empty());
+
+        assert_eq!(
+            filter_params(&captures(
+                vec![],
+                vec![Flag::Source(PeerSource::Bmp)]
+            )),
+            vec!["filter[ingressType]=bmp"]
+        );
+        assert_eq!(
+            filter_params(&captures(
+                vec![],
+                vec![Flag::Source(PeerSource::Mrt)]
+            )),
+            vec!["filter[ingressType]=mrt"]
+        );
+        assert_eq!(
+            filter_params(&captures(vec![Value::IngressId(5)], vec![])),
+            vec!["ingressId=5"]
+        );
+        assert_eq!(
+            filter_params(&captures(
+                vec![Value::Ip("10.0.0.1".parse().unwrap())],
+                vec![]
+            )),
+            vec!["filter[peerAddress]=10.0.0.1"]
+        );
+        assert_eq!(
+            filter_params(&captures(vec![Value::Asn(65001)], vec![])),
+            vec!["filter[originAsn]=65001"]
+        );
+        assert_eq!(
+            filter_params(&captures(
+                vec![Value::Community("65000:100".into())],
+                vec![]
+            )),
+            vec!["filter[community]=65000:100"]
+        );
+    }
+
+    /// A narrowed dump is still a dump: format=jsonl has to survive, or the
+    /// daemon answers 400.
+    #[test]
+    fn a_filtered_table_dump_keeps_format_jsonl() {
+        let mut query = vec![String::from("format=jsonl")];
+        query.extend(filter_params(&captures(
+            vec![],
+            vec![Flag::Source(PeerSource::Bgp)],
+        )));
+        assert_eq!(
+            format!(
+                "{}?{}",
+                rib_base(Afi::V4, Safi::Unicast),
+                query.join("&")
+            ),
+            "/api/v1/ribs/ipv4unicast/routes\
+             ?format=jsonl&filter[ingressType]=bgp"
+                .replace(['\n', ' '], "")
         );
     }
 }

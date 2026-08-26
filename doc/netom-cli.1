@@ -136,11 +136,38 @@ through BMP.
 .B show ip bgp neighbors [\fIaddress\fB]
 Detailed neighbor information.
 .TP
+.B show ip bgp neighbors \fIaddress\fB routes
+Routes learned from one neighbor.
+.TP
 .B show ip bgp [\fIprefix\fB]
 Routes for one prefix, or the whole table when no prefix is given.
 .TP
+.B show ip bgp source bgp|bmp|mrt
+Only routes learned over one kind of ingress: sessions netom terminates
+itself, peers monitored through BMP, or peers replayed from MRT files.
+For a peer using ADD\-PATH this returns every path it sent.
+.TP
+.B show ip bgp ingress \fIid\fB
+Only routes stored under one ingress id, from
+.BR "show ingresses" .
+For a peer using ADD\-PATH an id is one path, not the peer.
+.TP
+.B show ip bgp origin\-as \fIasn\fB
+Only routes originated by one AS.
+.TP
+.B show ip bgp community \fIvalue\fB
+Only routes carrying one standard community, e.g.
+.BR 65000:100 ,
+.BR 0x1a2b3c4d ,
+or a well\-known name such as
+.BR NO_EXPORT .
+.TP
 .B show ip bgp flowspec [\fIprefix\fB]
-FlowSpec rules.
+FlowSpec rules. Takes
+.B source
+and
+.B ingress
+as above; the other filters are not implemented for FlowSpec.
 .TP
 .B show ipv6 bgp ...
 As above, for IPv6.

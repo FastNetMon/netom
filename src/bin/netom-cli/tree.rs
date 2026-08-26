@@ -29,6 +29,10 @@ pub enum ArgKind {
     Ip,
     /// An ingress id.
     IngressId,
+    /// An AS number, with or without the `AS` prefix.
+    Asn,
+    /// A standard community: `65000:100`, `0x1a2b3c4d`, or a well-known name.
+    Community,
 }
 
 impl ArgKind {
@@ -38,6 +42,8 @@ impl ArgKind {
             ArgKind::Prefix => "<A.B.C.D/M>",
             ArgKind::Ip => "<A.B.C.D|X:X::X>",
             ArgKind::IngressId => "<0-4294967295>",
+            ArgKind::Asn => "<1-4294967295>",
+            ArgKind::Community => "<AA:NN>",
         }
     }
 
@@ -52,6 +58,38 @@ impl ArgKind {
             }
             ArgKind::Ip => tok.parse().ok().map(Value::Ip),
             ArgKind::IngressId => tok.parse().ok().map(Value::IngressId),
+            ArgKind::Asn => {
+                // `AS65000` and `65000` both, as inetnum's own parser accepts.
+                let digits =
+                    if tok.len() > 2 && tok[..2].eq_ignore_ascii_case("as") {
+                        &tok[2..]
+                    } else {
+                        tok
+                    };
+                digits.parse().ok().map(Value::Asn)
+            }
+            // Validated only for shape: the daemon owns the real grammar, and
+            // duplicating routecore's parser here would be one more thing to
+            // keep in step. This rejects the typos worth a caret -- a bare
+            // word, a missing half -- and lets anything plausible through.
+            ArgKind::Community => {
+                let plausible = match tok.split_once(':') {
+                    Some((asn, tag)) => {
+                        !asn.is_empty()
+                            && !tag.is_empty()
+                            && tag.bytes().all(|b| b.is_ascii_digit())
+                    }
+                    None => {
+                        tok.strip_prefix("0x").is_some_and(|hex| {
+                            !hex.is_empty()
+                                && hex.bytes().all(|b| b.is_ascii_hexdigit())
+                        }) || tok.bytes().all(|b| {
+                            b.is_ascii_alphabetic() || b == b'_' || b == b'-'
+                        })
+                    }
+                };
+                plausible.then(|| Value::Community(tok.to_string()))
+            }
         }
     }
 }
@@ -62,6 +100,8 @@ pub enum Value {
     Prefix(IpAddr, u8),
     Ip(IpAddr),
     IngressId(u32),
+    Asn(u32),
+    Community(String),
 }
 
 /// Static context a node contributes when traversed, so that one subtree can
@@ -89,6 +129,22 @@ pub enum Safi {
 pub enum PeerSource {
     Bgp,
     Bmp,
+    /// Replayed from an MRT file. Route queries can be narrowed to it;
+    /// `show ip bgp summary` cannot, since an MRT peer has no session.
+    Mrt,
+}
+
+impl PeerSource {
+    /// The `filter[ingressType]` value this narrows routes to.
+    pub fn ingress_type(self) -> &'static str {
+        match self {
+            PeerSource::Bgp => "bgp",
+            // The daemon reads `bmp` as everything learned through BMP, i.e.
+            // the `bgpViaBmp` peers under a monitored router.
+            PeerSource::Bmp => "bmp",
+            PeerSource::Mrt => "mrt",
+        }
+    }
 }
 
 pub struct Node {
@@ -124,6 +180,20 @@ impl Captures {
     pub fn ingress_id(&self) -> Option<u32> {
         self.args.iter().find_map(|v| match v {
             Value::IngressId(a) => Some(*a),
+            _ => None,
+        })
+    }
+
+    pub fn asn(&self) -> Option<u32> {
+        self.args.iter().find_map(|v| match v {
+            Value::Asn(a) => Some(*a),
+            _ => None,
+        })
+    }
+
+    pub fn community(&self) -> Option<&str> {
+        self.args.iter().find_map(|v| match v {
+            Value::Community(c) => Some(c.as_str()),
             _ => None,
         })
     }
@@ -486,6 +556,97 @@ macro_rules! flagged {
     };
 }
 
+//------------ Route filters -------------------------------------------------
+
+// These narrow a route query the way the API's `filter[...]` parameters do.
+// They are `const`, not `static`, so one definition can appear in several
+// subtrees; the tree is a path, so only one applies per command -- stack
+// `| include` on top when you need a second condition.
+
+/// `source bgp|bmp|mrt` -- where a route was learned.
+const FILTER_SOURCE: Node = Node {
+    kw: Kw::Lit("source"),
+    help: "Only routes learned over one kind of ingress",
+    set: None,
+    run: None,
+    children: FILTER_SOURCE_KINDS,
+};
+
+static FILTER_SOURCE_KINDS: &[Node] = &[
+    Node {
+        kw: Kw::Lit("bgp"),
+        help: "Sessions netom terminates itself",
+        set: Some(Flag::Source(PeerSource::Bgp)),
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
+    Node {
+        kw: Kw::Lit("bmp"),
+        help: "Peers monitored through BMP",
+        set: Some(Flag::Source(PeerSource::Bmp)),
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
+    Node {
+        kw: Kw::Lit("mrt"),
+        help: "Peers replayed from MRT files",
+        set: Some(Flag::Source(PeerSource::Mrt)),
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
+];
+
+/// `ingress <id>` -- one exact ingress, i.e. one path of an ADD-PATH peer.
+const FILTER_INGRESS: Node = Node {
+    kw: Kw::Lit("ingress"),
+    help: "Only routes stored under one ingress id",
+    set: None,
+    run: None,
+    children: FILTER_INGRESS_ARG,
+};
+
+static FILTER_INGRESS_ARG: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::IngressId),
+    help: "Ingress id, from `show ingresses`",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: &[],
+}];
+
+/// `origin-as <asn>` -- the last ASN of the AS_PATH.
+const FILTER_ORIGIN_AS: Node = Node {
+    kw: Kw::Lit("origin-as"),
+    help: "Only routes originated by one AS",
+    set: None,
+    run: None,
+    children: FILTER_ORIGIN_AS_ARG,
+};
+
+static FILTER_ORIGIN_AS_ARG: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::Asn),
+    help: "Originating AS number",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: &[],
+}];
+
+/// `community <value>` -- one standard community.
+const FILTER_COMMUNITY: Node = Node {
+    kw: Kw::Lit("community"),
+    help: "Only routes carrying one community",
+    set: None,
+    run: None,
+    children: FILTER_COMMUNITY_ARG,
+};
+
+static FILTER_COMMUNITY_ARG: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::Community),
+    help: "Community, e.g. 65000:100 or NO_EXPORT",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: &[],
+}];
+
 pub static ROOT: &[Node] = &[
     lit!("show", "Show running system information", SHOW),
     leaf!("help", "List every command", commands::system::help),
@@ -570,6 +731,10 @@ static BGP_BODY: &[Node] = &[
         run: Some(commands::bgp::routes),
         children: &[],
     },
+    FILTER_SOURCE,
+    FILTER_INGRESS,
+    FILTER_ORIGIN_AS,
+    FILTER_COMMUNITY,
 ];
 
 static BGP_SUMMARY: &[Node] = &[
@@ -594,16 +759,28 @@ static BGP_NEIGHBORS: &[Node] = &[Node {
     help: "Neighbor address",
     set: None,
     run: Some(commands::bgp::neighbors),
-    children: &[],
+    children: BGP_NEIGHBOR_BODY,
 }];
 
-static BGP_FLOWSPEC: &[Node] = &[Node {
-    kw: Kw::Arg(ArgKind::Prefix),
-    help: "Destination prefix of the rule",
-    set: None,
-    run: Some(commands::bgp::routes),
-    children: &[],
-}];
+static BGP_NEIGHBOR_BODY: &[Node] = &[leaf!(
+    "routes",
+    "Routes learned from this neighbor",
+    commands::bgp::routes
+)];
+
+// The FlowSpec endpoint rejects every filter but these two with a 400, so
+// only these two are typeable here.
+static BGP_FLOWSPEC: &[Node] = &[
+    Node {
+        kw: Kw::Arg(ArgKind::Prefix),
+        help: "Destination prefix of the rule",
+        set: None,
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
+    FILTER_SOURCE,
+    FILTER_INGRESS,
+];
 
 static SHOW_BMP: &[Node] = &[
     leaf!("routers", "Monitored routers", commands::bmp::routers),
@@ -708,6 +885,62 @@ mod tests {
     }
 
     #[test]
+    fn resolves_the_route_filters() {
+        assert!(resolves("show ip bgp source bgp"));
+        assert!(resolves("show ip bgp source bmp"));
+        assert!(resolves("show ip bgp source mrt"));
+        assert!(resolves("show ipv6 bgp source bmp"));
+        assert!(resolves("show ip bgp ingress 5"));
+        assert!(resolves("show ip bgp origin-as 65001"));
+        assert!(resolves("show ip bgp origin-as AS65001"));
+        assert!(resolves("show ip bgp community 65000:100"));
+        assert!(resolves("show ip bgp community NO_EXPORT"));
+        assert!(resolves("show ip bgp neighbors 10.0.0.1 routes"));
+        assert!(resolves("show ipv6 bgp neighbors 2001:db8::1 routes"));
+
+        // The neighbor detail command still stands on its own.
+        assert!(resolves("show ip bgp neighbors 10.0.0.1"));
+
+        // A filter keyword on its own is incomplete, not a full-table dump.
+        assert!(matches!(
+            resolve("show ip bgp source"),
+            Err(MatchErr::Incomplete)
+        ));
+        assert!(matches!(
+            resolve("show ip bgp ingress"),
+            Err(MatchErr::Incomplete)
+        ));
+    }
+
+    /// FlowSpec only takes the filters the daemon implements for it; the
+    /// others would come back as a 400 from the API.
+    #[test]
+    fn flowspec_offers_only_the_filters_it_supports() {
+        assert!(resolves("show ip bgp flowspec source bmp"));
+        assert!(resolves("show ip bgp flowspec ingress 5"));
+        assert!(matches!(
+            resolve("show ip bgp flowspec origin-as 65001"),
+            Err(MatchErr::Invalid { .. })
+        ));
+        assert!(matches!(
+            resolve("show ip bgp flowspec community 65000:100"),
+            Err(MatchErr::Invalid { .. })
+        ));
+    }
+
+    /// `summary` and `source` share a first letter, so the abbreviation has
+    /// to report the ambiguity rather than silently pick one.
+    #[test]
+    fn summary_and_source_are_ambiguous_at_one_letter() {
+        assert!(matches!(
+            resolve("show ip bgp s"),
+            Err(MatchErr::Ambiguous { .. })
+        ));
+        assert!(resolves("show ip bgp sum"));
+        assert!(resolves("show ip bgp sou bmp"));
+    }
+
+    #[test]
     fn arg_kinds_parse_what_they_claim() {
         assert_eq!(
             ArgKind::Prefix.parse("10.0.0.0/24"),
@@ -732,6 +965,30 @@ mod tests {
             Some(Value::IngressId(42))
         );
         assert_eq!(ArgKind::IngressId.parse("bogus"), None);
+
+        assert_eq!(ArgKind::Asn.parse("65001"), Some(Value::Asn(65001)));
+        assert_eq!(ArgKind::Asn.parse("AS65001"), Some(Value::Asn(65001)));
+        assert_eq!(ArgKind::Asn.parse("as65001"), Some(Value::Asn(65001)));
+        assert_eq!(ArgKind::Asn.parse("AS"), None);
+        assert_eq!(ArgKind::Asn.parse("65001:1"), None);
+
+        assert_eq!(
+            ArgKind::Community.parse("65000:100"),
+            Some(Value::Community("65000:100".into()))
+        );
+        assert_eq!(
+            ArgKind::Community.parse("0x1a2b3c4d"),
+            Some(Value::Community("0x1a2b3c4d".into()))
+        );
+        assert_eq!(
+            ArgKind::Community.parse("NO_EXPORT"),
+            Some(Value::Community("NO_EXPORT".into()))
+        );
+        // Shape checks only, but enough to catch the typos worth a caret.
+        assert_eq!(ArgKind::Community.parse("65000:"), None);
+        assert_eq!(ArgKind::Community.parse("65000:abc"), None);
+        assert_eq!(ArgKind::Community.parse("0x"), None);
+        assert_eq!(ArgKind::Community.parse("10.0.0.1"), None);
     }
 
     /// Declaration order decides which typed argument wins, so a prefix must

@@ -34,10 +34,14 @@ instead, and `?` works at any point in the line without disturbing it.
 
 ```
 netom> show ip bgp ?
-  summary       Summary of BGP neighbor status
-  neighbors     Detailed neighbor information
-  flowspec      FlowSpec rules
-  <A.B.C.D/M>   Network in the BGP routing table
+  summary      Summary of BGP neighbor status
+  neighbors    Detailed neighbor information
+  flowspec     FlowSpec rules
+  <A.B.C.D/M>  Network in the BGP routing table
+  source       Only routes learned over one kind of ingress
+  ingress      Only routes stored under one ingress id
+  origin-as    Only routes originated by one AS
+  community    Only routes carrying one community
   <cr>
 ```
 
@@ -133,6 +137,44 @@ hold time netom was configured with. The negotiated value —
 **`Src` distinguishes the two kinds of peer.** `bgp` is a session this netom
 terminates; `bmp` is one it observes through a monitored router. Narrow to
 one with `show ip bgp summary bgp` or `... bmp`.
+
+## Narrowing a route query
+
+`show ip bgp` dumps the whole table. Each of these narrows it, and works the
+same under `show ipv6 bgp`:
+
+```
+netom> show ip bgp source bmp                 routes learned through BMP
+netom> show ip bgp source bgp                 sessions netom terminates itself
+netom> show ip bgp source mrt                 peers replayed from MRT files
+netom> show ip bgp neighbors 10.1.0.1 routes  what one neighbor sent
+netom> show ip bgp ingress 5                  one exact ingress id
+netom> show ip bgp origin-as 65001            originated by one AS
+netom> show ip bgp community 65000:100        carrying one community
+```
+
+Two of these need a word about ADD-PATH, where each `(peer, path_id)` gets
+its own ingress id. `ingress 5` is one exact id, so for such a peer it is one
+*path*, not the peer — while `source` and `neighbors … routes` resolve those
+children back to their session, and so return every path the peer sent. The
+ids come from `show ingresses`.
+
+`source bmp` covers every peer under a monitored router, not the router's
+own ingress, which holds no routes of its own.
+
+Only one filter applies per command — the grammar is a path, not a set of
+flags — so stack `| include` on top when you need a second condition:
+
+```sh
+netom-cli show ip bgp source bmp '| include 10.0.'
+```
+
+FlowSpec takes `source` and `ingress` (`show ip bgp flowspec source bmp`) but
+not the others; the API implements only those two for FlowSpec, so the rest
+are not typeable there rather than failing at the daemon.
+
+A filter narrows the output, not the work: the daemon still walks the whole
+table to answer, so a narrowed dump is no faster than a full one.
 
 ## Peers that are down
 
