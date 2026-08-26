@@ -341,6 +341,24 @@ impl Rib {
     /// * `bmp-out buffered` large/growing ⇒ a slow consumer's dump backlog.
     /// * `RSS` is the bottom line — cross-check it against the sum of the above
     ///   to see whether the leak is accounted for here or somewhere unmeasured.
+    /// Sweep one shard of the path-attribute interner, dropping the `Weak`s
+    /// whose blobs are gone and the buckets they emptied.
+    ///
+    /// Driven one shard per tick by the `pa-interner-sweep` task, so a full
+    /// pass never holds any one shard's lock for long. See
+    /// [`PathAttributeInterner::sweep_shard`].
+    pub fn sweep_path_attribute_interner(
+        &self,
+        shard: usize,
+    ) -> (usize, usize) {
+        self.path_attribute_interner.sweep_shard(shard)
+    }
+
+    /// Number of interner shards, i.e. how many ticks one full pass takes.
+    pub fn path_attribute_interner_shards(&self) -> usize {
+        self.path_attribute_interner.num_shards()
+    }
+
     pub fn report_memory(&self, status_split: bool) {
         use crate::mem_stats::{
             bmp_out_snapshot, fmt_bytes, fmt_count, read_rss_bytes,

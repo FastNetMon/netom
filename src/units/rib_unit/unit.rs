@@ -615,6 +615,77 @@ impl RibUnitRunner {
             });
         }
 
+        // Sweep the path-attribute interner, one shard per tick.
+        //
+        // `intern` prunes only the bucket it touches, so blobs whose hash
+        // never recurs leave their dead `Weak` -- and the `HashMap` entry
+        // around it -- in place forever. On a collector with real churn that
+        // was the whole of the observed leak: 153.4M weak slots against
+        // 51.8M live blobs, growing ~13M slots (~2.3 GiB) per day, while the
+        // RIB's own record count barely moved.
+        //
+        // One shard per tick keeps each lock hold to 1/64 of the table and
+        // spreads a full pass over ~30 minutes, which is far quicker than
+        // dead slots accumulate. It runs on the blocking pool: the sweep is
+        // CPU-bound and takes a mutex the insert path also wants.
+        {
+            let sweep_rib = Arc::downgrade(&arc_self.rib);
+            crate::tokio::spawn(
+                &"pa-interner-sweep".to_string(),
+                async move {
+                    const SWEEP_INTERVAL: std::time::Duration =
+                        std::time::Duration::from_secs(30);
+                    let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+                    interval.tick().await; // consume the immediate first tick
+                    let mut shard = 0usize;
+                    let mut pass_slots = 0usize;
+                    let mut pass_buckets = 0usize;
+                    loop {
+                        interval.tick().await;
+                        let Some(rib_swap) = sweep_rib.upgrade() else {
+                            break; // rib unit gone; stop sweeping
+                        };
+                        let rib = rib_swap.load().clone();
+                        drop(rib_swap);
+
+                        let shards = rib.path_attribute_interner_shards();
+                        if shards == 0 {
+                            continue;
+                        }
+                        let index = shard % shards;
+                        match tokio::task::spawn_blocking(move || {
+                            rib.sweep_path_attribute_interner(index)
+                        })
+                        .await
+                        {
+                            Ok((slots, buckets)) => {
+                                pass_slots += slots;
+                                pass_buckets += buckets;
+                            }
+                            Err(e) => {
+                                error!("pa-interner sweep task failed: {e}");
+                            }
+                        }
+
+                        shard += 1;
+                        // Report per full pass rather than per shard, so the log
+                        // says how much a pass is actually reclaiming.
+                        if shard.is_multiple_of(shards) {
+                            if pass_slots > 0 || pass_buckets > 0 {
+                                info!(
+                                "pa-interner sweep: dropped {pass_slots} dead \
+                                 weak slots and {pass_buckets} buckets over \
+                                 the last full pass"
+                            );
+                            }
+                            pass_slots = 0;
+                            pass_buckets = 0;
+                        }
+                    }
+                },
+            );
+        }
+
         // Periodic memory report: log a consolidated snapshot of the main
         // memory consumers (RIB store variants/prefixes/nodes, path-attribute
         // interner, ingress register state breakdown, bmp-out dump buffers,
