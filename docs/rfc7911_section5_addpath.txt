@@ -1,0 +1,48 @@
+RFC 7911 - Advertisement of Multiple Paths in BGP
+Section 5: Operation
+
+ADD-PATH. Changes what the decision process operates on: paths are keyed
+by (prefix, Path Identifier) rather than prefix alone, so a peer may hold
+and advertise several paths for one NLRI:
+
+   5.  Operation
+
+      The Path Identifier specified in Section 3 can be used to advertise
+      multiple paths for the same address prefix without subsequent
+      advertisements replacing the previous ones.  Apart from the fact that
+      this is now possible, the route advertisement rules of [RFC4271] are
+      not changed.  In particular, a new advertisement for a given address
+      prefix and a given Path Identifier replaces a previous advertisement
+
+      for the same address prefix and Path Identifier.  If a BGP speaker
+      receives a message to withdraw a prefix with a Path Identifier not
+      seen before, it SHOULD silently ignore it.
+
+      For a BGP speaker to be able to send multiple paths to its peer, that
+      BGP speaker MUST advertise the ADD-PATH Capability with the Send/
+      Receive field set to either 2 or 3, and MUST receive from its peer
+      the ADD-PATH Capability with the Send/Receive field set to either 1
+      or 3, for the corresponding <AFI, SAFI>.
+
+      A BGP speaker MUST follow the procedures defined in [RFC4271] when
+      generating an UPDATE message for a particular <AFI, SAFI> to a peer
+      unless the BGP speaker advertises the ADD-PATH Capability to the peer
+      indicating its ability to send multiple paths for the <AFI, SAFI>,
+      and also receives the ADD-PATH Capability from the peer indicating
+      its ability to receive multiple paths for the <AFI, SAFI>, in which
+      case the speaker MUST generate a route update for the <AFI, SAFI>
+      based on the combination of the address prefix and the Path
+      Identifier, and use the extended NLRI encodings specified in this
+      document.  The peer SHALL act accordingly in processing an UPDATE
+      message related to a particular <AFI, SAFI>.
+
+      A BGP speaker SHOULD include the best route [RFC4271] when more than
+      one path is advertised to a neighbor, unless it is a path received
+      from that neighbor.
+
+      As the Path Identifiers are locally assigned, and may or may not be
+      persistent across a control plane restart of a BGP speaker, an
+      implementation SHOULD take special care so that the underlying
+      forwarding plane of a "Receiving Speaker" as described in [RFC4724]
+      is not affected during the graceful restart of a BGP session.
+

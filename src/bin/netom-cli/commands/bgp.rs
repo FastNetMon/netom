@@ -301,6 +301,13 @@ fn filter_params(c: &Captures) -> Vec<String> {
 }
 
 pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
+    // `best` is a narrowing keyword in the tree, so it arrives here as a flag
+    // and shares the whole route-filter subtree. It answers a different
+    // endpoint with a different renderer, so it branches out immediately.
+    if c.best() {
+        return best_path(session, c);
+    }
+
     let base = rib_base(c.afi(), c.safi());
     let filters = filter_params(c);
 
@@ -429,6 +436,197 @@ fn route_attrs(route: &serde_json::Value) -> RouteAttrs {
     RouteAttrs { next_hop, as_path }
 }
 
+//------------ show ip bgp <prefix> best / best <addr> -----------------------
+
+/// The RIB path for the best-path endpoint of an address family.
+fn best_path_base(afi: Afi) -> &'static str {
+    match afi {
+        Afi::V4 => "/api/v1/ribs/ipv4unicast/best-path",
+        Afi::V6 => "/api/v1/ribs/ipv6unicast/best-path",
+    }
+}
+
+/// `show ip bgp <prefix> best` and `show ip bgp best <addr>`.
+///
+/// Reached from [`routes`] when the tree set [`Flag::Best`], never registered
+/// as a handler of its own.
+///
+/// The first is an exact-prefix decision; the second is a longest-prefix
+/// match answering "which route would forward this address", so the prefix in
+/// the answer need not be the one that was typed.
+fn best_path(session: &mut Session, c: &Captures) -> Result<(), CliError> {
+    let base = best_path_base(c.afi());
+    // Whether the captured address is the thing being looked up, rather than
+    // a `neighbors <ip> routes`-style peer filter.
+    let mut addr_is_the_query = false;
+    let mut path = match (c.prefix(), c.ip()) {
+        (Some((addr, len)), _) => format!("{base}/{addr}/{len}"),
+        (None, Some(addr)) => {
+            addr_is_the_query = true;
+            format!("{base}/{addr}")
+        }
+        // The tree only reaches this command through a prefix or an address
+        // node, so this is unreachable in practice.
+        (None, None) => {
+            return Err(CliError::Usage(
+                "best path needs a prefix or an address".into(),
+            ))
+        }
+    };
+
+    // The endpoint takes the same filters as /routes, so `source bgp` and
+    // friends narrow the candidate set rather than the output.
+    //
+    // `filter_params` turns any captured address into `filter[peerAddress]`,
+    // which is right for `neighbors <ip> routes` but wrong here: in
+    // `show ip bgp best <addr>` the address is the destination being looked
+    // up, not a peer. Sending both would ask for the best path to an address
+    // among only the routes learned *from* that same address, which is
+    // essentially always empty.
+    let filters: Vec<String> = filter_params(c)
+        .into_iter()
+        .filter(|p| {
+            !(addr_is_the_query && p.starts_with("filter[peerAddress]="))
+        })
+        .collect();
+    if !filters.is_empty() {
+        path.push('?');
+        path.push_str(&filters.join("&"));
+    }
+
+    if session.json {
+        return session.passthrough(&path);
+    }
+    let body = session.get(&path)?.body_string()?;
+    let mut out = session.writer();
+    render_best_path(&mut out, &body)?;
+    out.finish()?;
+    Ok(())
+}
+
+static BEST_PATH_COLS: &[Col] = &[
+    left("", 3),
+    left("Network", 20),
+    left("Next Hop", 20),
+    left("Path", 18),
+    left("Peer", 6),
+    left("Decided by", 20),
+];
+
+/// Render a best-path decision.
+///
+/// The winner is marked `>` the way every vendor's `show ip bgp` marks it.
+/// The `Decided by` column carries the RFC 4271 section 9.1.2.2 step that put
+/// each row where it is: on the best path it is the step that separated it
+/// from the runner-up, on the others the step at which they lost to the best.
+pub fn render_best_path<W: Write>(
+    out: &mut W,
+    body: &str,
+) -> Result<(), CliError> {
+    let value: serde_json::Value = parse(body)?;
+    let data = &value["data"];
+    let nlri = data["nlri"].as_str().unwrap_or("-");
+
+    if data["best"].is_null() {
+        // A prefix with no eligible route is not the same as a prefix with no
+        // route at all, so say which happened.
+        let ineligible =
+            data["ineligible"].as_array().map(|a| a.len()).unwrap_or(0);
+        if ineligible == 0 {
+            writeln!(out, "% Network not in table.")?;
+        } else {
+            writeln!(
+                out,
+                "% No eligible path ({ineligible} route(s) excluded from the \
+                 decision process)."
+            )?;
+        }
+        render_ineligible(out, data)?;
+        return Ok(());
+    }
+
+    match data["queryAddress"].as_str() {
+        Some(addr) => {
+            writeln!(out, "BGP routing table entry for {nlri} (best path for {addr})")?
+        }
+        None => writeln!(out, "BGP routing table entry for {nlri}")?,
+    }
+    if let Some(strategy) = data["strategy"].as_str() {
+        if strategy != "rfc4271" {
+            writeln!(out, "  decision process: {strategy}")?;
+        }
+    }
+
+    let mut table = Table::fit(out, BEST_PATH_COLS);
+    let mut row = |marker: &str, route: &serde_json::Value, step: &str| {
+        let attrs = route_attrs(route);
+        table.row(&[
+            marker.to_string(),
+            nlri.to_string(),
+            attrs.next_hop,
+            attrs.as_path,
+            peer_cell(route),
+            step.to_string(),
+        ])
+    };
+
+    let best = &data["best"];
+    row(">", best, best["decidedBy"].as_str().unwrap_or("-"))?;
+
+    if let Some(alternatives) = data["alternatives"].as_array() {
+        for alt in alternatives {
+            row(" ", alt, alt["lostAt"].as_str().unwrap_or("-"))?;
+        }
+    }
+    table.finish()?;
+
+    // Anything the decision process could not weigh is worth showing: a
+    // silently missing route looks like a RIB bug from the outside.
+    render_ineligible(out, data)?;
+
+    if let Some(assumed) = best["assumed"].as_array() {
+        if !assumed.is_empty() {
+            let names: Vec<&str> =
+                assumed.iter().filter_map(|a| a.as_str()).collect();
+            writeln!(
+                out,
+                "  note: best path assumed {} (not recorded for this peer)",
+                names.join(", ")
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The owning session for a row, which for an ADD-PATH path-child is the
+/// parent peer rather than the store mui.
+fn peer_cell(route: &serde_json::Value) -> String {
+    match route["source"]["ingressId"].as_u64() {
+        Some(id) => id.to_string(),
+        None => "-".to_string(),
+    }
+}
+
+fn render_ineligible<W: Write>(
+    out: &mut W,
+    data: &serde_json::Value,
+) -> Result<(), CliError> {
+    let Some(rows) = data["ineligible"].as_array().filter(|r| !r.is_empty())
+    else {
+        return Ok(());
+    };
+    writeln!(out, "  excluded from the decision process:")?;
+    for route in rows {
+        writeln!(
+            out,
+            "    peer {} - {}",
+            peer_cell(route),
+            route["reason"].as_str().unwrap_or("unknown")
+        )?;
+    }
+    Ok(())
+}
+
 /// Stream an NDJSON table, rendering rows as they arrive.
 static FLOWSPEC_COLS: &[Col] = &[
     left("Prefix", 18),
@@ -552,6 +750,145 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/test-data/cli/bgp-neighbors.json"
     ));
+
+    const BEST_PATH: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/test-data/cli/best-path.json"
+    ));
+
+    fn best(body: &str) -> String {
+        let mut buf = Vec::new();
+        render_best_path(&mut buf, body).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    /// Only the winner is marked, the way every vendor's `show ip bgp` does.
+    #[test]
+    fn best_path_marks_exactly_one_winner() {
+        let out = best(BEST_PATH);
+        let marked: Vec<&str> =
+            out.lines().filter(|l| l.trim_start().starts_with('>')).collect();
+        assert_eq!(marked.len(), 1, "{out}");
+        assert!(marked[0].contains("65001"), "{marked:?}");
+        assert!(marked[0].contains("10.0.0.2"), "{marked:?}");
+    }
+
+    /// The point of the command: every row says which RFC 4271 step put it
+    /// where it is.
+    #[test]
+    fn best_path_shows_the_deciding_step_for_every_row() {
+        let out = best(BEST_PATH);
+        assert!(out.contains("asPathLength"), "{out}");
+        assert!(out.contains("med"), "{out}");
+    }
+
+    /// A route the decision process could not weigh must be visible with its
+    /// reason -- silently dropping it looks like a missing route.
+    #[test]
+    fn best_path_lists_ineligible_routes_with_their_reason() {
+        let out = best(BEST_PATH);
+        assert!(out.contains("excluded from the decision process"), "{out}");
+        assert!(out.contains("missingAsPath"), "{out}");
+        assert!(out.contains("peer 9"), "{out}");
+    }
+
+    /// An ADD-PATH alternative is attributed to its session, not to the
+    /// internal path-child mui.
+    #[test]
+    fn best_path_attributes_addpath_rows_to_the_session() {
+        let out = best(BEST_PATH);
+        let alt = out
+            .lines()
+            .find(|l| l.contains("65001 65002"))
+            .expect("the two-hop alternative must be listed");
+        // source.ingressId is 2; the child mui 4 must not be the Peer cell.
+        let peer = alt.split_whitespace().last().unwrap();
+        assert_eq!(peer, "asPathLength", "{alt}");
+        assert!(alt.contains(" 2 "), "session id, not the child: {alt}");
+    }
+
+    /// The longest-prefix form says which address it resolved, because the
+    /// answer's prefix is not the one that was typed.
+    #[test]
+    fn best_path_for_an_address_names_the_address() {
+        let body = BEST_PATH.replace(
+            r#""strategy": "rfc4271","#,
+            r#""queryAddress": "198.51.100.7", "matchType": "longestMatch", "strategy": "rfc4271","#,
+        );
+        let out = best(&body);
+        assert!(out.contains("198.51.100.0/24"), "{out}");
+        assert!(out.contains("best path for 198.51.100.7"), "{out}");
+    }
+
+    /// A non-default decision process must be stated, or the output is
+    /// misleading about why a route won.
+    #[test]
+    fn best_path_states_a_non_default_strategy() {
+        // Matched on the whole line: the ineligible section's header also
+        // contains the words "decision process".
+        let stated = |out: &str| {
+            out.lines()
+                .any(|l| l.trim_start().starts_with("decision process:"))
+        };
+
+        assert!(!stated(&best(BEST_PATH)), "rfc4271 is the default");
+
+        let body = BEST_PATH.replace(r#""rfc4271""#, r#""skipMed""#);
+        let out = best(&body);
+        assert!(stated(&out), "{out}");
+        assert!(out.contains("decision process: skipMed"), "{out}");
+    }
+
+    #[test]
+    fn best_path_reports_an_empty_table_and_an_all_ineligible_one_differently()
+    {
+        let empty = r#"{"data":{"nlri":"10.0.0.0/8","best":null,"alternatives":[],"ineligible":[]}}"#;
+        assert!(best(empty).contains("Network not in table"));
+
+        let excluded = r#"{"data":{"nlri":"10.0.0.0/8","best":null,"alternatives":[],
+            "ineligible":[{"reason":"unknownIngress","source":{"ingressId":1},"pathAttributes":[]}]}}"#;
+        let out = best(excluded);
+        assert!(out.contains("No eligible path"), "{out}");
+        assert!(out.contains("unknownIngress"), "{out}");
+    }
+
+    /// `best` is a narrowing keyword, so it reaches `routes` as a flag and
+    /// must be dispatched there -- otherwise `show ip bgp <prefix> best` would
+    /// silently run the plain route query.
+    #[test]
+    fn the_best_flag_is_what_selects_the_best_path_command() {
+        use crate::tree::resolve;
+
+        for line in [
+            "show ip bgp 10.0.0.0/24 best",
+            "show ip bgp best 10.0.0.7",
+            // The filters hang off the shared subtree, so they must keep the
+            // flag rather than fall back to a plain route query.
+            "show ip bgp 10.0.0.0/24 best source bgp",
+            "show ip bgp best 10.0.0.7 origin-as 65001",
+            "show ipv6 bgp 2001:db8::/32 best",
+        ] {
+            let (_, captures) = resolve(line)
+                .unwrap_or_else(|_| panic!("{line} must parse"));
+            assert!(captures.best(), "{line} lost the Best flag");
+        }
+
+        // ... and a plain route query must not pick it up.
+        let (_, captures) = resolve("show ip bgp 10.0.0.0/24").unwrap();
+        assert!(!captures.best());
+    }
+
+    /// An assumption behind the winner has to surface: a ranking based on a
+    /// guessed identifier should not read as certain.
+    #[test]
+    fn best_path_notes_assumptions_behind_the_winner() {
+        let body = BEST_PATH.replace(
+            r#""decidedBy": "asPathLength","#,
+            r#""decidedBy": "asPathLength", "assumed": ["routeSource"],"#,
+        );
+        let out = best(&body);
+        assert!(out.contains("assumed routeSource"), "{out}");
+    }
 
     fn render(body: &str, only: Option<PeerSource>) -> String {
         let mut buf = Vec::new();

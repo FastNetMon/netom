@@ -28,6 +28,7 @@ use serde_with::StringWithSeparator;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::best_path::{Alternatives, BestPathOptions, Strategy};
 use crate::{
     http_ng::{Api, ApiError, ApiState},
     ingress::{IngressId, IngressType},
@@ -59,6 +60,20 @@ pub fn register_routes(router: &mut Api) {
         search_ipv6flowspec,
     );
     router.add_get("/ribs/ipv6flowspec/routes", search_ipv6flowspec_all);
+
+    // Best path (RFC 4271 section 9.1) for one prefix, or for the prefix that
+    // covers one address. Registered before the catch-all below so the
+    // literal `best-path` segment is not swallowed by `{afisafi}`.
+    router.add_get(
+        "/ribs/ipv4unicast/best-path/{prefix}/{prefix_len}",
+        best_path_ipv4unicast,
+    );
+    router.add_get("/ribs/ipv4unicast/best-path/{addr}", best_path_ipv4_addr);
+    router.add_get(
+        "/ribs/ipv6unicast/best-path/{prefix}/{prefix_len}",
+        best_path_ipv6unicast,
+    );
+    router.add_get("/ribs/ipv6unicast/best-path/{addr}", best_path_ipv6_addr);
 
     // The 'hardcoded' afisafis above take precedence over this 'catch-all' one.
     router.add_get("/ribs/{afisafi}/routes", generic_afisafi_all);
@@ -790,4 +805,169 @@ mod tests {
         assert_eq!(json["source"]["pathId"], 123);
         assert_eq!(json["source"]["internalPathIngressId"], child);
     }
+}
+
+//------------ Best path -----------------------------------------------------
+
+/// The best-path-only query parameters. Everything that narrows the candidate
+/// set is [`QueryFilter`], shared with `/routes`.
+#[derive(Debug, Default, Deserialize)]
+struct BestPathParams {
+    /// `rfc4271` (default) or `skipMed`.
+    strategy: Option<String>,
+    /// A count, or `all` (the default).
+    alternatives: Option<String>,
+}
+
+impl BestPathParams {
+    fn options(&self) -> Result<BestPathOptions, ApiError> {
+        let strategy = match &self.strategy {
+            Some(s) => s.parse().map_err(ApiError::BadRequest)?,
+            None => Strategy::default(),
+        };
+        let alternatives = match &self.alternatives {
+            Some(s) => s.parse().map_err(ApiError::BadRequest)?,
+            None => Alternatives::default(),
+        };
+        Ok(BestPathOptions {
+            strategy,
+            alternatives,
+        })
+    }
+}
+
+/// `include` shapes a `/routes` answer with covering and covered prefixes.
+/// Best path is a decision about one prefix, so the parameter has no meaning
+/// here — refuse it by name rather than ignore it, the way the FlowSpec
+/// endpoints refuse the filters they cannot honour.
+fn check_best_path_filter(filter: &QueryFilter) -> Result<(), ApiError> {
+    if !filter.include.is_empty() {
+        return Err(ApiError::BadRequest(
+            "include is not supported on best-path: it selects among the \
+             routes for one prefix, so more/less specifics have no meaning \
+             here. Query /routes for those."
+                .into(),
+        ));
+    }
+    if filter.format != OutputFormat::Json {
+        return Err(ApiError::BadRequest(
+            "best-path answers JSON only: the result is bounded by one \
+             prefix's routes, so there is nothing to stream"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn run_best_path(
+    afisafi: AfiSafiType,
+    prefix: Prefix,
+    query_addr: Option<IpAddr>,
+    filter: QueryFilter,
+    params: BestPathParams,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    check_best_path_filter(&filter)?;
+    let options = params.options()?;
+
+    let rib = load_rib(&state)?;
+
+    // Same reasoning as `search_ipv4unicast`: the store lookup and the roto
+    // filter are synchronous and may take the roto context lock, so keep them
+    // off the async workers. Unlike a table dump this is bounded by one
+    // prefix's record count, so it needs no dump guard and no streaming.
+    let result = tokio::task::spawn_blocking(move || {
+        rib.best_path(afisafi, prefix, query_addr, filter, options)
+    })
+    .await
+    .map_err(|e| {
+        ApiError::InternalServerError(format!("best-path task failed: {e}"))
+    })?
+    .map_err(ApiError::BadRequest)?;
+
+    let body = serde_json::json!({ "meta": None::<()>, "data": result });
+    Ok((
+        [("content-type", OutputFormat::Json.content_type())],
+        serde_json::to_string(&body).map_err(|e| {
+            ApiError::InternalServerError(format!("serialization failed: {e}"))
+        })?,
+    ))
+}
+
+async fn best_path_ipv4unicast(
+    Path((prefix, prefix_len)): Path<(Ipv4Addr, u8)>,
+    Query(filter): Query<QueryFilter>,
+    Query(params): Query<BestPathParams>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v4(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    run_best_path(
+        AfiSafiType::Ipv4Unicast,
+        prefix,
+        None,
+        filter,
+        params,
+        state,
+    )
+    .await
+}
+
+async fn best_path_ipv6unicast(
+    Path((prefix, prefix_len)): Path<(Ipv6Addr, u8)>,
+    Query(filter): Query<QueryFilter>,
+    Query(params): Query<BestPathParams>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v6(prefix, prefix_len)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    run_best_path(
+        AfiSafiType::Ipv6Unicast,
+        prefix,
+        None,
+        filter,
+        params,
+        state,
+    )
+    .await
+}
+
+/// "Which route would forward this address" — a longest-prefix match on the
+/// address's host prefix.
+async fn best_path_ipv4_addr(
+    Path(addr): Path<Ipv4Addr>,
+    Query(filter): Query<QueryFilter>,
+    Query(params): Query<BestPathParams>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v4(addr, 32)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    run_best_path(
+        AfiSafiType::Ipv4Unicast,
+        prefix,
+        Some(IpAddr::V4(addr)),
+        filter,
+        params,
+        state,
+    )
+    .await
+}
+
+async fn best_path_ipv6_addr(
+    Path(addr): Path<Ipv6Addr>,
+    Query(filter): Query<QueryFilter>,
+    Query(params): Query<BestPathParams>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    let prefix = Prefix::new_v6(addr, 128)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    run_best_path(
+        AfiSafiType::Ipv6Unicast,
+        prefix,
+        Some(IpAddr::V6(addr)),
+        filter,
+        params,
+        state,
+    )
+    .await
 }

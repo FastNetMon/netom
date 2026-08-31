@@ -2768,3 +2768,208 @@ mod adj_rib_in_gauge {
         assert!(peer_stats::registry().get(9009).is_none());
     }
 }
+
+//------------ Best path over the real store ---------------------------------
+
+/// Build a stored path-attribute blob: [rpki, ppi=modern] + ORIGIN(IGP) +
+/// AS_PATH. Mirrors the helpers in `best_path`'s own tests, but here the
+/// records go through the actual store rather than straight into `select`.
+fn best_path_pamap(asns: &[u32]) -> crate::payload::RotondaPaMap {
+    let mut raw = vec![0u8, 1u8, 0x40, 1, 1, 0];
+    let mut seg = vec![2u8, asns.len() as u8];
+    for asn in asns {
+        seg.extend_from_slice(&asn.to_be_bytes());
+    }
+    raw.extend_from_slice(&[0x40, 2, seg.len() as u8]);
+    raw.extend_from_slice(&seg);
+    crate::payload::RotondaPaMap::from_raw(raw)
+}
+
+fn best_path_peer(
+    register: &crate::ingress::Register,
+    remote_asn: u32,
+    addr: &str,
+    bgp_id: [u8; 4],
+) -> crate::ingress::IngressId {
+    use crate::ingress::{IngressInfo, IngressType};
+    let id = register.register();
+    register.update_info(
+        id,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bgp)
+            .with_local_asn(Asn::from_u32(65000))
+            .with_remote_asn(Asn::from_u32(remote_asn))
+            .with_remote_addr(addr.parse::<IpAddr>().unwrap())
+            .with_bgp_id(bgp_id),
+    );
+    id
+}
+
+/// The whole path end to end: two peers announce one prefix through the real
+/// store, and the API ranks them and says which step decided it.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_ranks_stored_routes_and_names_the_deciding_step() {
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::{
+        BestPathOptions, DecisionStep,
+    };
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let long = best_path_peer(&register, 65001, "10.0.0.1", [10, 0, 0, 1]);
+    let short = best_path_peer(&register, 65001, "10.0.0.2", [10, 0, 0, 2]);
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    for (ingress, asns) in
+        [(long, &[65001u32, 65002][..]), (short, &[65001][..])]
+    {
+        let route = RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(asns),
+        );
+        rib.insert(&route, RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    }
+
+    let result = rib
+        .best_path(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            None,
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap();
+
+    assert_eq!(result.best_mui(), Some(short));
+
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["nlri"], "198.51.100.0/24");
+    assert_eq!(json["strategy"], "rfc4271");
+    assert_eq!(json["counts"]["total"], 2);
+    assert_eq!(json["counts"]["eligible"], 2);
+    assert_eq!(json["counts"]["ineligible"], 0);
+    assert_eq!(json["best"]["rank"], 1);
+    assert_eq!(
+        json["best"]["decidedBy"],
+        DecisionStep::AsPathLength.as_str()
+    );
+    // A best-path row is a `/routes` row plus the ranking fields, so the
+    // shared keys must still be there for existing consumers.
+    assert_eq!(json["best"]["status"], "active");
+    assert_eq!(json["best"]["source"]["ingressId"], short);
+    assert!(json["best"]["pathAttributes"].is_array());
+
+    assert_eq!(json["alternatives"][0]["rank"], 2);
+    assert_eq!(json["alternatives"][0]["source"]["ingressId"], long);
+    assert_eq!(
+        json["alternatives"][0]["lostAt"],
+        DecisionStep::AsPathLength.as_str()
+    );
+    assert_eq!(json["ineligible"].as_array().unwrap().len(), 0);
+}
+
+/// The "which route forwards this address" form: a longest-prefix match that
+/// reports the covering prefix it landed on, not the /32 that was asked for.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_for_an_address_resolves_to_the_covering_prefix() {
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::BestPathOptions;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+    let peer = best_path_peer(&register, 65001, "10.0.0.1", [10, 0, 0, 1]);
+
+    // A /16 and a more specific /24; the address falls inside both, and the
+    // longest match must win.
+    for cidr in ["198.51.0.0/16", "198.51.100.0/24"] {
+        let prefix = Prefix::from_str(cidr).unwrap();
+        let route = RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(&[65001]),
+        );
+        rib.insert(&route, RouteStatus::Active, 1, peer, true, false)
+            .unwrap();
+    }
+
+    let addr: IpAddr = "198.51.100.7".parse().unwrap();
+    let result = rib
+        .best_path(
+            AfiSafiType::Ipv4Unicast,
+            Prefix::from_str("198.51.100.7/32").unwrap(),
+            Some(addr),
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap();
+
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["nlri"], "198.51.100.0/24");
+    assert_eq!(json["queryAddress"], "198.51.100.7");
+    assert_eq!(
+        json["matchType"], "longestMatch",
+        "the /32 asked for is not the prefix that answered"
+    );
+    assert_eq!(json["best"]["source"]["ingressId"], peer);
+}
+
+/// ADD-PATH: both paths of one peer are stored under child muis and must
+/// compete, with the winner still resolving back to the parent session.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_compares_addpath_children_of_one_peer() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::BestPathOptions;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+    let session = best_path_peer(&register, 65001, "10.0.0.1", [10, 0, 0, 1]);
+
+    let mut children = Vec::new();
+    for path_id in [1u32, 2] {
+        let child = register.register();
+        register.update_info(
+            child,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(session)
+                .with_path_id(path_id),
+        );
+        children.push(child);
+    }
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    for (child, asns) in [
+        (children[0], &[65001u32, 65002, 65003][..]),
+        (children[1], &[65001][..]),
+    ] {
+        let route = RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(asns),
+        );
+        rib.insert(&route, RouteStatus::Active, 1, child, true, false)
+            .unwrap();
+    }
+
+    let result = rib
+        .best_path(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            None,
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap();
+
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["counts"]["eligible"], 2);
+    assert_eq!(json["counts"]["ineligible"], 0);
+    // The child is the store mui, the session is the peer identity.
+    assert_eq!(json["best"]["ingress"]["id"], children[1]);
+    assert_eq!(json["best"]["source"]["ingressId"], session);
+    assert_eq!(json["best"]["source"]["pathId"], 2);
+}

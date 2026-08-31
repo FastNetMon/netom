@@ -198,8 +198,26 @@ impl Meta for RotondaPaMap {
 
     type TBI = TiebreakerInfo;
 
+    /// Deliberately unreachable: netom does not use the store's path
+    /// selection.
+    ///
+    /// `rotonda-store` calls this only from `RecordMap::best_backup`, which
+    /// takes a single `TiebreakerInfo` and applies it to every record of a
+    /// prefix. `TiebreakerInfo` carries `peer_addr`, `bgp_identifier` and the
+    /// EBGP/IBGP `source`, all of which differ per record, so one instance per
+    /// prefix cannot express steps d, f or g of RFC 4271 section 9.1.2.2.
+    ///
+    /// netom therefore never passes `Some(tbi)` to `store.insert`, and runs
+    /// the decision process at query time instead, where the ingress register
+    /// supplies per-record peer identity. See
+    /// [`units::rib_unit::best_path`](crate::units::rib_unit::best_path) and
+    /// `docs/best-path-selection.md`.
     fn as_orderable(&self, _tbi: Self::TBI) -> Self::Orderable<'_> {
-        todo!()
+        unreachable!(
+            "netom selects best paths in units::rib_unit::best_path, not in \
+             the store: a single per-prefix TiebreakerInfo cannot express the \
+             per-peer tie-breakers of RFC 4271 9.1.2.2"
+        )
     }
 }
 

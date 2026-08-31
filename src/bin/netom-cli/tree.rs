@@ -111,6 +111,10 @@ pub enum Flag {
     Afi(Afi),
     Safi(Safi),
     Source(PeerSource),
+    /// Answer with the best path rather than every route. Set by the `best`
+    /// keyword, which delegates to the shared route-filter subtree, so the
+    /// filters narrow the *candidates* the decision process weighs.
+    Best,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +231,10 @@ impl Captures {
             Flag::Source(s) => Some(*s),
             _ => None,
         })
+    }
+
+    pub fn best(&self) -> bool {
+        self.flags.contains(&Flag::Best)
     }
 }
 
@@ -729,13 +737,52 @@ static BGP_BODY: &[Node] = &[
         help: "Network in the BGP routing table",
         set: None,
         run: Some(commands::bgp::routes),
-        children: &[],
+        children: BGP_PREFIX_BODY,
+    },
+    // `show ip bgp best <addr>` -- a longest-prefix match, i.e. the route
+    // that would forward this address. `show ip bgp <prefix> best` below is
+    // the exact-prefix form.
+    Node {
+        kw: Kw::Lit("best"),
+        help: "Best path (RFC 4271 decision process)",
+        set: Some(Flag::Best),
+        run: None,
+        children: BGP_BEST_ADDR,
     },
     FILTER_SOURCE,
     FILTER_INGRESS,
     FILTER_ORIGIN_AS,
     FILTER_COMMUNITY,
 ];
+
+/// What can follow a prefix under `show ip bgp`.
+///
+/// `best` sets a flag and delegates to the shared route-filter subtree rather
+/// than carrying a handler of its own, the way `flowspec` does. Those filters
+/// all run `commands::bgp::routes`, which dispatches on the flag; giving
+/// `best` its own handler would mean either duplicating the whole filter
+/// subtree or having `... best source bgp` silently run the plain route query.
+static BGP_PREFIX_BODY: &[Node] = &[Node {
+    kw: Kw::Lit("best"),
+    help: "Only the best path, and why the others lost",
+    set: Some(Flag::Best),
+    run: Some(commands::bgp::routes),
+    children: BGP_BEST_FILTERS,
+}];
+
+static BGP_BEST_ADDR: &[Node] = &[Node {
+    kw: Kw::Arg(ArgKind::Ip),
+    help: "Address to resolve to its best path",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: BGP_BEST_FILTERS,
+}];
+
+/// The filters narrow the candidate set: "what would win if only BGP-learned
+/// routes existed". `neighbors <ip> routes` is deliberately not among them --
+/// narrowing the candidates to one peer makes the decision process vacuous.
+static BGP_BEST_FILTERS: &[Node] =
+    &[FILTER_SOURCE, FILTER_INGRESS, FILTER_ORIGIN_AS, FILTER_COMMUNITY];
 
 static BGP_SUMMARY: &[Node] = &[
     Node {

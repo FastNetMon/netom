@@ -1,0 +1,111 @@
+RFC 4451 - BGP MULTI_EXIT_DISC (MED) Considerations
+Section 3: Implementation and Protocol Considerations
+
+Clarifies the RFC 4271 section 9.1.2.2 step c comparison. Relevant
+excerpts on MED comparability, the missing-MED value, and MED under
+route reflection and confederations:
+
+   3.  Implementation and Protocol Considerations
+
+      There are a number of implementation and protocol peculiarities
+      relating to MEDs that have been discovered that may affect network
+      behavior.  The following sections provide information on these
+      issues.
+
+   3.1.  MULTI_EXIT_DISC Is an Optional Non-Transitive Attribute
+
+      MULTI_EXIT_DISC is a non-transitive optional attribute whose
+      advertisement to both IBGP and EBGP peers is discretionary.  As a
+      result, some implementations enable sending of MEDs to IBGP peers by
+      default, while others do not.  This behavior may result in sub-
+      optimal route selection within an AS.  In addition, some
+      implementations send MEDs to EBGP peers by default, while others do
+      not.  This behavior may result in sub-optimal inter-domain route
+      selection.
+
+   3.2.  MED Values and Preferences
+
+      Some implementations consider an MED value of zero less preferable
+      than no MED value.  This behavior resulted in path selection
+      inconsistencies within an AS.  The current version of the BGP
+      specification [BGP4] removes ambiguities that existed in [RFC1771] by
+      stating that if route n has no MULTI_EXIT_DISC attribute, the lowest
+      possible MULTI_EXIT_DISC value (i.e., 0) should be assigned to the
+      attribute.
+
+      It is apparent that different implementations and different versions
+      of the BGP specification have been all over the map with
+      interpretation of missing-MED.  For example, earlier versions of the
+      specification called for a missing MED to be assigned the highest
+      possible MED value (i.e., 2^32-1).
+
+      In addition, some implementations have been shown to internally
+      employ a maximum possible MED value (2^32-1) as an "infinity" metric
+      (i.e., the MED value is used to tag routes as unfeasible); upon
+      receiving an update with an MED value of 2^32-1, they would rewrite
+
+      the value to 2^32-2.  Subsequently, the new MED value would be
+      propagated and could result in routing inconsistencies or unintended
+      path selections.
+
+      As a result of implementation inconsistencies and protocol revision
+      variances, many network operators today explicitly reset (i.e., set
+      to zero or some other 'fixed' value) all MED values on ingress to
+      conform to their internal routing policies (i.e., to include policy
+      that requires that MED values of 0 and 2^32-1 not be used in
+      configurations, whether the MEDs are directly computed or
+      configured), so as not to have to rely on all their routers having
+      the same missing-MED behavior.
+
+      Because implementations don't normally provide a mechanism to disable
+      MED comparisons in the decision algorithm, "not using MEDs" usually
+      entails explicitly setting all MEDs to some fixed value upon ingress
+      to the routing domain.  By assigning a fixed MED value consistently
+      to all routes across the network, MEDs are a effectively a non-issue
+      in the decision algorithm.
+
+   3.3.  Comparing MEDs between Different Autonomous Systems
+
+      The MED was intended to be used on external (inter-AS) links to
+      discriminate among multiple exit or entry points to the same
+      neighboring AS.  However, a large number of MED applications now
+      employ MEDs for the purpose of determining route preference between
+      like routes received from different autonomous systems.
+
+      A large number of implementations provide the capability to enable
+      comparison of MEDs between routes received from different neighboring
+      autonomous systems.  While this capability has demonstrated some
+      benefit (e.g., that described in [RFC3345]), operators should be wary
+      of the potential side effects of enabling such a function.  The
+      deployment section below provides some examples as to why this may
+      result in undesirable behavior.
+
+   3.4.  MEDs, Route Reflection, and AS Confederations for BGP
+
+      In particular configurations, the BGP scaling mechanisms defined in
+      "BGP Route Reflection - An Alternative to Full Mesh IBGP" [RFC2796]
+      and "Autonomous System Confederations for BGP" [RFC3065] will
+      introduce persistent BGP route oscillation [RFC3345].  The problem is
+      inherent in the way BGP works: a conflict exists between information
+      hiding/hierarchy and the non-hierarchical selection process imposed
+      by lack of total ordering caused by the MED rules.  Given current
+      practices, we see the problem manifest itself most frequently in the
+      context of MED + route reflectors or confederations.
+
+      One potential way to avoid this is by configuring inter-Member-AS or
+      inter-cluster IGP metrics higher than intra-Member-AS IGP metrics
+      and/or using other tie-breaking policies to avoid BGP route selection
+      based on incomparable MEDs.  Of course, IGP metric constraints may be
+      unreasonably onerous for some applications.
+
+      Not comparing MEDs between multiple paths for a prefix learned from
+      different adjacent autonomous systems, as discussed in section 2.3,
+      or not utilizing MEDs at all, significantly decreases the probability
+      of introducing potential route oscillation conditions into the
+      network.
+
+      Although perhaps "legal" as far as current specifications are
+      concerned, modifying MED attributes received on any type of IBGP
+      session (e.g., standard IBGP, EBGP sessions between Member-ASes of a
+      BGP confederation, route reflection, etc.) is not recommended.
+

@@ -1,0 +1,31 @@
+RFC 5004 - Avoid BGP Best Path Transitions from One External to Another
+Section 3: The Algorithm
+
+An optional stability rule applied at RFC 4271 section 9.1.2.2 step f:
+when two external paths are still tied on reaching the BGP Identifier
+comparison, keep the incumbent best path rather than switching:
+
+   3.  The Algorithm
+
+      Consider the case in which the existing best path A is from an
+      external peer, and another external path B is then selected as the
+      new best path by the route selection algorithm described in [BGP].
+      When comparing all the paths in route selection, if neither Path A
+      nor Path B is eliminated by the route selection algorithm prior to
+      Step f) -- BGP identifier comparison (Section 9.1.2.2, [BGP]) -- we
+      propose that the existing best path (Path A) be kept as the best path
+      (thus avoiding switching the best path to Path B).
+
+      This algorithm SHOULD NOT be applied when either path is from a BGP
+      Confederation peer.
+
+      In addition, the algorithm SHOULD NOT be applied when both paths are
+      from peers with an identical BGP identifier (i.e., there exist
+      parallel BGP sessions between two BGP speakers).  As the peering
+      addresses for the parallel sessions are typically allocated by one AS
+      (possibly with route selection considerations), the algorithm (if
+      applied) could impact the existing routing setup.  Furthermore, by
+      not applying the algorithm, the allocation of peering addresses would
+      remain as a simple and effective tool in influencing route selection
+      when parallel BGP sessions exist.
+

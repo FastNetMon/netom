@@ -212,6 +212,67 @@ if cli show ip bgp flowspec origin-as 65001 > /dev/null 2>&1; then
     fail "flowspec should not accept origin-as"
 fi
 
+# --- best path -------------------------------------------------------------
+
+# One session, so each prefix has a single candidate: the assertions here are
+# that the endpoint answers, resolves the right prefix, and marks a winner --
+# the tie-breakers themselves are unit-tested against a multi-peer corpus.
+BEST="$(cli show ip bgp 10.0.0.0/24 best)"
+echo "$BEST" | grep -q "BGP routing table entry for 10.0.0.0/24" \
+    || fail "best path for a prefix: $BEST"
+echo "$BEST" | grep -q "^>" || fail "best path did not mark a winner: $BEST"
+echo "$BEST" | grep -q "excluded from the decision process" \
+    && fail "a plain session route must not be ineligible: $BEST"
+
+# The address form is a longest-prefix match, so the answer names the covering
+# prefix rather than the /32 that was asked for.
+LOOKUP="$(cli show ip bgp best 10.0.1.7)"
+echo "$LOOKUP" | grep -q "10.0.1.0/24" \
+    || fail "best path for an address did not resolve the covering prefix: $LOOKUP"
+echo "$LOOKUP" | grep -q "best path for 10.0.1.7" \
+    || fail "best path for an address did not echo the address: $LOOKUP"
+
+# An address with no covering route is "not in table", not an error.
+cli show ip bgp best 203.0.113.9 | grep -q "Network not in table" \
+    || fail "best path for an unrouted address: $(cli show ip bgp best 203.0.113.9)"
+
+# `best` is a narrowing keyword in the CLI grammar, so the route filters hang
+# off it and must still reach the best-path endpoint rather than falling back
+# to a plain route query.
+cli show ip bgp 10.0.0.0/24 best source bgp | grep -q "^>" \
+    || fail "best path with a filter: $(cli show ip bgp 10.0.0.0/24 best source bgp)"
+cli show ip bgp 10.0.0.0/24 best source bmp | grep -q "Network not in table" \
+    || fail "a filter that excludes every candidate must empty the decision"
+
+# The JSON contract: a best-path row is a /routes row plus the ranking fields.
+cli --json show ip bgp 10.0.0.0/24 best | python3 -c '
+import json, sys
+d = json.load(sys.stdin)["data"]
+assert d["nlri"] == "10.0.0.0/24", d["nlri"]
+assert d["strategy"] == "rfc4271", d["strategy"]
+assert d["counts"]["eligible"] == 1, d["counts"]
+assert d["counts"]["ineligible"] == 0, d["counts"]
+best = d["best"]
+assert best["rank"] == 1, best
+# A lone candidate has nothing to be compared against.
+assert best.get("decidedBy") is None, best
+# Shared with /routes, so existing consumers keep working.
+for key in ("status", "source", "pathAttributes"):
+    assert key in best, (key, sorted(best))
+assert d["alternatives"] == [], d["alternatives"]
+' || fail "best path JSON shape"
+
+# skipMed is the other decision process routecore offers; with one candidate
+# it changes nothing, but the parameter must be accepted rather than 400.
+curl -sf "http://$HTTP_ADDR/api/v1/ribs/ipv4unicast/best-path/10.0.0.0/24?strategy=skipMed" \
+    | grep -q '"strategy":"skipMed"' || fail "strategy=skipMed rejected"
+
+# Parameters that cannot be honoured are refused by name rather than ignored.
+curl -s "http://$HTTP_ADDR/api/v1/ribs/ipv4unicast/best-path/10.0.0.0/24?strategy=bogus" \
+    | grep -q '"error"' || fail "an unknown strategy must be a 400"
+curl -s "http://$HTTP_ADDR/api/v1/ribs/ipv4unicast/best-path/10.0.0.0/24?include=moreSpecifics" \
+    | grep -q '"error"' || fail "include must be refused on best-path"
+
 # --json is a raw passthrough, so it must parse as the API's own output.
 cli --json show ip bgp summary | python3 -c 'import json,sys; json.load(sys.stdin)' \
     || fail "--json summary is not valid JSON"

@@ -1,0 +1,37 @@
+RFC 4271 - A Border Gateway Protocol 4 (BGP-4)
+Section 6.8: NOTIFICATION Message / Cease
+
+Relevant excerpt for Connection Collision Detection:
+
+   If a pair of BGP speakers try simultaneously to establish a BGP
+   connection to each other, then two parallel connections well be
+   formed.  If the source IP address used by one of these connections is
+   the same as the destination IP address used by the other, and the
+   destination IP address used by the first connection is the same as
+   the source IP address used by the other, we have a connection
+   collision.
+
+   ...
+
+   Upon receipt of an OPEN message, the local system MUST examine all of
+   its connections that are in the OpenConfirm state.  A BGP speaker MAY
+   also examine connections in an OpenSent state if it knows the BGP
+   Identifier of the peer by means outside of the protocol.  If among
+   these connections there is a connection to a remote BGP speaker whose
+   BGP Identifier equals the one in the OPEN message, and this
+   connection collides with the connection over which the OPEN message
+   is received, then the local system performs the following collision
+   resolution procedure:
+
+   ...
+
+   Unless allowed via configuration, a connection collision with an
+   existing BGP connection that is in the Established state causes
+   closing of the newly created connection.
+
+Key takeaway: The phrase "Unless allowed via configuration" explicitly
+permits implementations to replace Established sessions when configured
+to do so. This is exactly what rotonda implements for passive-only
+speakers receiving duplicate incoming connections from the same peer.
+
+Reference: https://www.rfc-editor.org/rfc/rfc4271#section-6.8

@@ -26,7 +26,6 @@ use routecore::bgp::{
     aspath::HopPath,
     nlri::afisafi::{AfiSafiNlri, IsPrefix, Nlri},
     path_attributes::PaMap,
-    path_selection::{OrdRoute, Rfc4271, TiebreakerInfo},
     types::{AfiSafiType, Otc},
 };
 use serde::{
@@ -34,6 +33,7 @@ use serde::{
     Serialize, Serializer,
 };
 
+use super::best_path::{BestPathOptions, BestPathResult};
 use crate::{
     ingress::{
         self,
@@ -2257,6 +2257,27 @@ impl Rib {
         filter: QueryFilter,
         //) -> Result<QueryResult<RotondaPaMap>, String> {
     ) -> Result<SearchResult, String> {
+        self.search_routes_with(
+            rotonda_store::match_options::MatchType::ExactMatch,
+            afisafi,
+            nlri,
+            filter,
+        )
+    }
+
+    /// [`search_routes`](Self::search_routes) with the store's match type left
+    /// to the caller.
+    ///
+    /// Every route query is an exact-prefix lookup except best-path-for-an-IP,
+    /// which needs `LongestMatch` to answer "which route would forward this
+    /// address". Nothing else differs, so the two share this body.
+    fn search_routes_with(
+        &self,
+        match_type: rotonda_store::match_options::MatchType,
+        afisafi: AfiSafiType,
+        nlri: Prefix,
+        filter: QueryFilter,
+    ) -> Result<SearchResult, String> {
         let guard = &epoch::pin();
 
         let store = match afisafi {
@@ -2275,7 +2296,7 @@ impl Rib {
         };
 
         let match_options = &MatchOptions {
-            match_type: rotonda_store::match_options::MatchType::ExactMatch,
+            match_type,
             include_withdrawn: false,
             include_less_specifics: filter
                 .include
@@ -2858,6 +2879,55 @@ impl Rib {
     }
 
     /// Query the store based on `IngressId`/MUI
+    /// Run the BGP decision process (RFC 4271 section 9.1) over one prefix.
+    ///
+    /// `query_addr` is set only for the "best path for this IP" form: the
+    /// lookup is then a longest-prefix match on that address's host prefix,
+    /// and the result reports which prefix it landed on. With `None` the
+    /// lookup is an exact match on `nlri`, as `/routes` does.
+    ///
+    /// Selection happens here rather than in the store because the store's
+    /// path-selection hook takes one `TiebreakerInfo` per prefix, while the
+    /// decision process needs per-record peer identity. See
+    /// [`best_path`](super::best_path) for the full explanation.
+    pub fn best_path(
+        &self,
+        afisafi: AfiSafiType,
+        nlri: Prefix,
+        query_addr: Option<IpAddr>,
+        filter: QueryFilter,
+        options: BestPathOptions,
+    ) -> Result<BestPathResult, String> {
+        let match_type = if query_addr.is_some() {
+            rotonda_store::match_options::MatchType::LongestMatch
+        } else {
+            rotonda_store::match_options::MatchType::ExactMatch
+        };
+
+        let search =
+            self.search_routes_with(match_type, afisafi, nlri, filter.clone())?;
+
+        let total = search.query_result.records.len();
+        let (best, alternatives, excluded) = super::best_path::select(
+            &search.query_result.records,
+            &search.ingress_info,
+            options,
+        );
+
+        Ok(BestPathResult {
+            prefix: search.query_result.prefix,
+            query_addr,
+            exact_match: search.query_result.prefix == Some(nlri),
+            strategy: options.strategy,
+            best,
+            alternatives,
+            excluded,
+            total,
+            ingress_info: search.ingress_info,
+            query_filter: filter,
+        })
+    }
+
     pub fn search_routes_for_ingress(
         _afisafi: AfiSafiType,
         _nlri: Nlri<&[u8]>,

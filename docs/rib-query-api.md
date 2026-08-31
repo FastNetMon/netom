@@ -25,6 +25,10 @@ in this API changes state.
 | `GET /api/v1/ribs/ipv6flowspec/routes/{addr}/{len}` | |
 | `GET /api/v1/ribs/ipv4flowspec/routes` | every FlowSpec rule |
 | `GET /api/v1/ribs/ipv6flowspec/routes` | |
+| `GET /api/v1/ribs/ipv4unicast/best-path/{addr}/{len}` | the best path for one prefix (see [Best path](#best-path)) |
+| `GET /api/v1/ribs/ipv6unicast/best-path/{addr}/{len}` | |
+| `GET /api/v1/ribs/ipv4unicast/best-path/{addr}` | the best path for the prefix covering one address |
+| `GET /api/v1/ribs/ipv6unicast/best-path/{addr}` | |
 
 The prefix is split over two path segments — `10.0.0.0/24` is
 `/routes/10.0.0.0/24`, and `2001:db8::/32` is `/routes/2001:db8::/32`.
@@ -137,6 +141,127 @@ are the rule's identity. Rules are ordered per RFC 8955 §5.1, and `validity` is
 the RFC 8955 §6 state, recomputed against the current unicast RIB on every
 query.
 
+## Best path
+
+`/best-path` runs the RFC 4271 §9.1 decision process over the routes for one
+prefix and returns the winner, the ranked alternatives, and the step at which
+each of them lost. `docs/best-path-selection.md` covers what is and is not
+implemented, and keeps the RFC text alongside it.
+
+Two forms:
+
+* `/best-path/{addr}/{len}` — an exact prefix, the counterpart of
+  `/routes/{addr}/{len}`.
+* `/best-path/{addr}` — a longest-prefix match: "which route would forward this
+  address". The answer's `nlri` is the prefix that matched, which is normally
+  not the address that was asked for, so the response echoes `queryAddress` and
+  a `matchType`.
+
+Selection happens at query time; nothing is precomputed and no "best" flag is
+stored. There is no whole-table form — that would be a full store walk with a
+sort per prefix. Use `/routes` and rank client-side if you need it.
+
+### Parameters
+
+Every parameter under [Selecting routes](#selecting-routes) works here and
+narrows the *candidate set*, so `?filter[ingressType]=bgp` asks "what would the
+best path be if only BGP-learned routes existed". `fields[pathAttributes]`
+works as elsewhere. Two are specific to this endpoint:
+
+| Parameter | Value | Notes |
+| --- | --- | --- |
+| `strategy` | `rfc4271` (default) or `skipMed` | `skipMed` drops step c, for deployments that do not compare MULTI_EXIT_DISC. These are the only two routecore offers; there is no always-compare-MED. |
+| `alternatives` | a count, or `all` (default) | Caps how many ranked alternatives are listed. It does not change what was considered — `counts` still reports the whole candidate set. |
+
+`include` and `format=jsonl` are rejected with 400 naming the parameter: the
+first has no meaning for a decision about one prefix, and the second has
+nothing to stream.
+
+### Response
+
+```json
+{
+  "meta": null,
+  "data": {
+    "nlri": "10.0.0.0/24",
+    "queryAddress": "10.0.0.7",
+    "matchType": "longestMatch",
+    "strategy": "rfc4271",
+    "counts": {"total": 4, "eligible": 3, "ineligible": 1, "reported": 3},
+    "best": {
+      "rank": 1,
+      "decidedBy": "asPathLength",
+      "status": "active",
+      "ingress": {"id": 3, "ingress_type": "bgp"},
+      "source": {"ingressId": 3},
+      "rpki": {"rov": "notChecked"},
+      "pathAttributes": [{"origin": "Igp"}, {"asPath": ["AS65001"]}]
+    },
+    "alternatives": [{"rank": 2, "lostAt": "med", "...": "same shape"}],
+    "ineligible": [{"reason": "missingAsPath", "...": "same shape, no rank"}]
+  }
+}
+```
+
+A route row is exactly a `/routes` row — `status`, `ingress`, `source`, `rpki`,
+`pathAttributes`, with the same ADD-PATH semantics — plus the ranking fields,
+so anything that renders `/routes` renders these.
+
+`queryAddress` and `matchType` appear only on the address form. `best` is
+`null` when no route was eligible; check `ineligible` to tell that apart from
+"no such prefix".
+
+`counts.eligible` is the whole candidate set, `counts.reported` is how many of
+them this response lists — they differ when `alternatives=<n>` capped it.
+
+### The deciding step
+
+`decidedBy` on the best path is the step that separated it from the runner-up
+(absent when there is no runner-up). `lostAt` on an alternative is the step at
+which it lost **to the best path**, not to the row above it.
+
+| Value | RFC 4271 §9.1.2.2 |
+| --- | --- |
+| `degreeOfPreference` | Phase 1 — LOCAL_PREF, on IBGP routes only |
+| `asPathLength` | step a |
+| `origin` | step b |
+| `med` | step c |
+| `peerType` | step d — EBGP over IBGP |
+| `interiorCost` | step e — never returned; netom has no IGP view |
+| `bgpIdentifier` | step f, with RFC 4456's ORIGINATOR_ID substitution |
+| `clusterListLength` | RFC 4456, between f and g |
+| `peerAddress` | step g |
+| `tie` | every step compared equal |
+
+### Routes that did not compete
+
+`ineligible` lists what never entered the comparison, each with a `reason`:
+
+| Reason | Meaning |
+| --- | --- |
+| `missingOrigin` | Mandatory ORIGIN absent |
+| `missingAsPath` | Mandatory AS_PATH absent |
+| `ebgpWithoutNeighbour` | An EBGP route whose AS_PATH names no neighbour AS |
+| `malformedPathAttributes` | The stored attribute blob would not parse |
+| `unknownIngress` | The record's mui has no ingress register entry |
+| `unknownPeerAddress` | The session has no remote address recorded |
+
+The last two are netom's own: without a peer identity, steps d, f and g have no
+inputs, and ranking the route anyway would mean inventing one.
+
+### Assumptions
+
+A candidate carries an `assumed` array when a tiebreaker input was missing but
+not disqualifying:
+
+* `routeSource` — the session has no recorded local ASN, so EBGP vs IBGP (step
+  d) is unknown and the route was treated as EBGP. MRT-replayed peers have no
+  local end at all.
+* `bgpIdentifier` — the peer's BGP Identifier is unknown, so step f used
+  `255.255.255.255`; an unknown identifier loses a tie rather than winning it.
+  Expect this on natively terminated sessions, where routecore does not expose
+  the negotiated `remote_bgp_id`.
+
 ## Whole-table dumps
 
 A bare `/routes` (or an explicit `/0` plus `moreSpecifics`) covers the entire
@@ -165,7 +290,7 @@ Errors come back as `{"data": null, "error": "<message>"}` with:
 
 | Status | When |
 | --- | --- |
-| 400 | Unparseable prefix or parameter value, an undefined `function[roto]`, a full dump without `format=jsonl`, an unsupported FlowSpec parameter, or a FlowSpec response over the limits |
+| 400 | Unparseable prefix or parameter value, an undefined `function[roto]`, a full dump without `format=jsonl`, an unsupported FlowSpec parameter, a FlowSpec response over the limits, or `include`/`format=jsonl`/an unknown `strategy` on `/best-path` |
 | 500 | Store not ready, or an unimplemented AFI/SAFI |
 | 503 | Dump concurrency cap reached |
 

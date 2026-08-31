@@ -176,6 +176,50 @@ are not typeable there rather than failing at the daemon.
 A filter narrows the output, not the work: the daemon still walks the whole
 table to answer, so a narrowed dump is no faster than a full one.
 
+## Best path
+
+Which of the routes for a prefix wins the RFC 4271 decision process, and why
+the others lost:
+
+```
+netom> show ip bgp 10.0.0.0/24 best     the decision for one prefix
+netom> show ip bgp best 10.0.0.7        the route that would forward an address
+```
+
+The second is a longest-prefix match, so the prefix in the answer is normally
+not the address that was typed — the header says which one answered:
+
+```
+netom> show ip bgp best 10.0.1.7
+BGP routing table entry for 10.0.1.0/24 (best path for 10.0.1.7)
+    Network              Next Hop             Path        Peer   Decided by
+>   10.0.1.0/24          192.0.2.9            65001       3      asPathLength
+    10.0.1.0/24          192.0.2.1            65001 65002 2      asPathLength
+```
+
+`>` marks the winner, as it does on a router. `Decided by` is the step of the
+decision process that put each row where it is: on the winner, the step that
+separated it from the runner-up; on the others, the step at which they lost to
+the winner. `Peer` is the owning session, so an ADD-PATH peer's paths are
+attributed to the peer rather than to the internal path-child id.
+
+Routes that could not be weighed at all are listed separately with the reason,
+rather than silently omitted:
+
+```
+  excluded from the decision process:
+    peer 9 - missingAsPath
+```
+
+A `note:` line appears when a tiebreaker had to be assumed — most often
+`bgpIdentifier` on a session netom terminates itself, whose peer identifier it
+cannot read. `docs/rib-query-api.md` lists every step, reason and assumption.
+
+`source`, `ingress`, `origin-as` and `community` work here too, narrowing the
+*candidates*: `show ip bgp 10.0.0.0/24 best source bgp` asks what the best path
+would be if only BGP-learned routes existed. `neighbors <ip> routes` is not
+among them — narrowing to a single peer leaves nothing to decide.
+
 ## Peers that are down
 
 A peer that has never established has no session and no routes, so before

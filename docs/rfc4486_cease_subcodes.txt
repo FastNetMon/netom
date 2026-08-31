@@ -1,0 +1,33 @@
+RFC 4486 - Subcodes for BGP Cease NOTIFICATION Message
+
+Defines subcodes for the Cease NOTIFICATION message (error code 6):
+
+   Subcode   Name
+   -------   ----
+   1         Maximum Number of Prefixes Reached
+   2         Administrative Shutdown
+   3         Peer De-configured
+   4         Administrative Reset
+   5         Connection Rejected
+   6         Other Configuration Change
+   7         Connection Collision Resolution
+   8         Out of Resources
+
+Section 4 - Connection Collision Resolution (Subcode 7):
+
+   If a BGP speaker has detected that a connection collision has
+   occurred and it has decided to close one of the connections, it
+   SHOULD send a NOTIFICATION message with the Cease error code and
+   the Connection Collision Resolution subcode.
+
+   Note: This subcode is specifically excluded from the recommended
+   backoff behavior described in Section 1, as collision resolution
+   is a normal operational event, not an error condition.
+
+Implementation note (rotonda):
+   routecore's DisconnectReason enum does not have a CollisionResolution
+   variant. We use ConnectionRejected (subcode 5) as the closest
+   available alternative when disconnecting stale sessions during
+   collision resolution.
+
+Reference: https://www.rfc-editor.org/rfc/rfc4486

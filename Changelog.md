@@ -27,6 +27,25 @@ Released yyyy-mm-dd.
 
 ### New
 
+* New `/api/v1/ribs/{ipv4,ipv6}unicast/best-path/{prefix}` and
+  `.../best-path/{address}` endpoints: the RFC 4271 section 9.1 decision
+  process over the routes for one prefix, returning the winner, the ranked
+  alternatives, and the step at which each of them lost, plus the routes that
+  could not compete and why. The address form is a longest-prefix match,
+  answering "which route would forward this". Ordering is routecore's
+  `path_selection`; `strategy=skipMed` drops the MULTI_EXIT_DISC comparison.
+  Selection runs at query time — the store's own path-selection hook takes one
+  tiebreaker per prefix and so cannot express the per-peer steps d, f and g.
+  See `docs/best-path-selection.md` and `docs/rib-query-api.md`.
+
+* `netom-cli`: `show ip bgp <prefix> best` and `show ip bgp best <address>`,
+  rendering the above with the conventional `>` best marker.
+
+* BGP session ingresses now record the local ASN — from the unit's `my_asn`
+  for sessions netom terminates, and from the Peer Up's sent OPEN for
+  BMP-monitored peers — so a route can be classified as EBGP or IBGP for
+  best-path step d. It also appears as `local_asn` in `/api/v1/ingresses`.
+
 * `netom-cli`, a read-only operational CLI speaking router-style commands
   over the HTTP API: `show ip bgp summary`, `show ip bgp neighbors [<ip>]`,
   `show ip bgp [<prefix>]`, `show bmp routers`, `show bmp router <id>`,
