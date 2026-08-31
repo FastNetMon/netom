@@ -108,7 +108,17 @@ AS_PATH.
 
 netom maps those three onto `missingOrigin`, `missingAsPath` and
 `ebgpWithoutNeighbour` in the `ineligible` array, and adds `unknownIngress`,
-`unknownPeerAddress` and `malformedPathAttributes` of its own. What eligibility
+`unknownPeerAddress`, `malformedPathAttributes` and `asPathLoop` of its own.
+
+`asPathLoop` is the other half of §9.1.2's candidate rule, which routecore
+declares but never applies: a route whose AS_PATH contains the local AS is
+excluded from Phase 2. netom can run it now that sessions record their local
+ASN — for a BMP-monitored peer that is the monitored router's ASN, so the check
+reproduces that router's view. The full path is scanned, so an AS inside an
+AS_SET or an AS_CONFED segment counts, and the check runs *before* routecore's
+eligibility so a looped path beginning with a set or confed segment is reported
+as a loop rather than as a missing neighbour. MRT replay records no local ASN,
+so the check is skipped there rather than guessed at. What eligibility
 does **not** cover is under [Known gaps](#known-gaps).
 
 Running it is not optional: step a calls
@@ -125,9 +135,20 @@ Inherited from routecore, and unchanged by this:
   it with. `DecisionStep::InteriorCost` exists in the API's vocabulary but is
   never returned.
 - **NEXT_HOP resolvability (§9.1.2.1) is not checked.** A candidate with an
-  unreachable next hop is still ranked.
-- **AS_PATH loop detection is not checked.** `DecisionErrorType::AsPathLoop` is
-  defined in routecore but never constructed.
+  unreachable next hop is still ranked. netom has no FIB or IGP view, so there
+  is nothing to resolve against.
+- **Confederation-external routes are not selectable.** Their AS_PATH begins
+  with an AS_CONFED_SEQUENCE, so `neighbor_path_selection()` returns `None` and
+  routecore's eligibility rejects them as "expected non-empty AS_PATH". Fixing
+  it means teaching routecore to look past a leading confed segment. AS_CONFED
+  handling is correct elsewhere: excluded from the step a length per RFC 5065
+  §5.3, and scanned for loops.
+- **AS4_PATH (RFC 6793) is not merged into AS_PATH** for the step a count.
+- **Vendor-style import defaults are absent**, which changes outcomes rather
+  than just omitting a feature: an EBGP route's degree of preference is 0
+  because §9.1.1 leaves it to local policy and netom has none, so any IBGP
+  route with a LOCAL_PREF above 0 wins Phase 1 outright. A missing LOCAL_PREF
+  on an IBGP route is 0, not 100.
 - **RFC 5004 is not implemented** — there is no "prefer the incumbent external
   path" rule, so a best path can flap between two externals tied at step f.
   See `rfc5004_section3_avoid_oscillation.txt`.

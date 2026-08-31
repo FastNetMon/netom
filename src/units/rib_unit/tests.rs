@@ -2973,3 +2973,57 @@ async fn best_path_compares_addpath_children_of_one_peer() {
     assert_eq!(json["best"]["source"]["ingressId"], session);
     assert_eq!(json["best"]["source"]["pathId"], 2);
 }
+
+/// A withdrawn record is not a candidate: the store lookup behind `best_path`
+/// sets `include_withdrawn: false`, so a peer that pulled its route stops
+/// competing for the prefix rather than being ranked and then ignored.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_does_not_consider_withdrawn_routes() {
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::BestPathOptions;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let winner = best_path_peer(&register, 65001, "10.0.0.1", [10, 0, 0, 1]);
+    let quitter = best_path_peer(&register, 65001, "10.0.0.2", [10, 0, 0, 2]);
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = |asns: &[u32]| {
+        RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(asns),
+        )
+    };
+
+    // The quitter has the shorter path, so while it is active it wins.
+    rib.insert(&route(&[65001, 65002]), RouteStatus::Active, 1, winner, true, false)
+        .unwrap();
+    rib.insert(&route(&[65001]), RouteStatus::Active, 1, quitter, true, false)
+        .unwrap();
+
+    let best = |rib: &crate::units::rib_unit::rib::Rib| {
+        rib.best_path(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            None,
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap()
+    };
+
+    assert_eq!(best(&rib).best_mui(), Some(quitter));
+
+    // ... and once it withdraws, the remaining route takes over rather than
+    // the withdrawn one staying best.
+    rib.insert(&route(&[65001]), RouteStatus::Withdrawn, 2, quitter, true, false)
+        .unwrap();
+
+    let result = best(&rib);
+    assert_eq!(result.best_mui(), Some(winner));
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json["counts"]["total"], 1, "the withdrawn record is not a candidate");
+    assert_eq!(json["ineligible"].as_array().unwrap().len(), 0);
+}

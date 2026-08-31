@@ -241,13 +241,50 @@ which it lost **to the best path**, not to the row above it.
 | --- | --- |
 | `missingOrigin` | Mandatory ORIGIN absent |
 | `missingAsPath` | Mandatory AS_PATH absent |
-| `ebgpWithoutNeighbour` | An EBGP route whose AS_PATH names no neighbour AS |
+| `ebgpWithoutNeighbour` | An EBGP route whose AS_PATH names no neighbour AS — also what a confederation-external route looks like, see below |
+| `asPathLoop` | The AS_PATH contains the session's local AS (RFC 4271 §9.1.2) |
 | `malformedPathAttributes` | The stored attribute blob would not parse |
 | `unknownIngress` | The record's mui has no ingress register entry |
 | `unknownPeerAddress` | The session has no remote address recorded |
 
-The last two are netom's own: without a peer identity, steps d, f and g have no
-inputs, and ranking the route anyway would mean inventing one.
+`unknownIngress` and `unknownPeerAddress` are netom's own: without a peer
+identity, steps d, f and g have no inputs, and ranking the route anyway would
+mean inventing one.
+
+`asPathLoop` is RFC 4271 §9.1.2's rule that a route whose AS_PATH contains the
+local AS is excluded from Phase 2. The whole path is scanned, so an AS inside
+an AS_SET or an AS_CONFED segment counts. It can only be applied when the
+session recorded a local ASN, which MRT replay never does — those routes are
+left in, unchecked.
+
+### Behaviour worth knowing about
+
+Several of these follow the RFC but differ from what a router would do, because
+netom applies no import policy:
+
+* **EBGP routes have a degree of preference of 0.** RFC 4271 §9.1.1 computes it
+  from local policy for external routes, and netom has none — so LOCAL_PREF on
+  an EBGP route is ignored, and any *internal* route with a LOCAL_PREF above 0
+  outranks every external one at Phase 1, before step d is reached. Vendors
+  avoid this by applying a default LOCAL_PREF of 100 on import.
+* **A missing LOCAL_PREF on an IBGP route is 0**, not the 100 vendors default
+  to.
+* **A missing MULTI_EXIT_DISC is the lowest MED**, per step c. The widespread
+  "MED missing as worst" behaviour is a vendor option, not the RFC.
+* **Confederation-external routes are not selectable.** Their AS_PATH begins
+  with an AS_CONFED_SEQUENCE, which names no neighbour ASN, so routecore's
+  eligibility check rejects them as `ebgpWithoutNeighbour`. RFC 5065
+  deployments get no best path for those routes today. AS_CONFED segments are
+  handled correctly everywhere else: they are excluded from the step a path
+  length (RFC 5065 §5.3) and scanned for loops.
+* **Step g across address families.** A v6 session can carry v4 NLRI, so peer
+  addresses of both families can meet at step g. The RFC says nothing about
+  ordering between them; every IPv4 address sorts before every IPv6 one. It is
+  arbitrary, but stable.
+* **AS4_PATH is not merged.** On a session without four-octet ASN support the
+  AS_PATH carries AS_TRANS placeholders and the real path is in AS4_PATH (RFC
+  6793); step a counts the AS_PATH as received. Every modern session negotiates
+  four-octet ASNs, so this is unlikely to be reached.
 
 ### Assumptions
 

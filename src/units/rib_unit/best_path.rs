@@ -30,7 +30,7 @@ use std::{cmp::Ordering, collections::HashMap, fmt, net::IpAddr, str::FromStr};
 use inetnum::{addr::Prefix, asn::Asn};
 use rotonda_store::prefix_record::{Record, RouteStatus};
 use routecore::bgp::{
-    aspath::HopPath,
+    aspath::{Hop, HopPath},
     path_attributes::{
         BgpIdentifier, ClusterIds, PaMap, PathAttribute, WireformatPathAttribute,
     },
@@ -207,6 +207,8 @@ pub enum IneligibleReason {
     MissingAsPath,
     /// An EBGP route whose AS_PATH has no neighbour ASN.
     EbgpWithoutNeighbour,
+    /// The AS_PATH contains the local AS (RFC 4271 section 9.1.2).
+    AsPathLoop,
 }
 
 impl IneligibleReason {
@@ -220,6 +222,7 @@ impl IneligibleReason {
             IneligibleReason::MissingOrigin => "missingOrigin",
             IneligibleReason::MissingAsPath => "missingAsPath",
             IneligibleReason::EbgpWithoutNeighbour => "ebgpWithoutNeighbour",
+            IneligibleReason::AsPathLoop => "asPathLoop",
         }
     }
 }
@@ -263,6 +266,12 @@ impl Serialize for Assumed {
 /// Step f prefers the *lower* identifier, so the maximum value means an
 /// unknown identity can never win the tie-break by default.
 const UNKNOWN_BGP_ID: [u8; 4] = [0xff; 4];
+
+/// Stands in for a session's local ASN when it was never recorded. AS 0 is
+/// reserved by RFC 7607 and never appears as a real neighbour.
+fn unknown_asn() -> Asn {
+    Asn::from_u32(0)
+}
 
 //------------ Candidates ----------------------------------------------------
 
@@ -385,7 +394,14 @@ fn classify(
         }
     };
 
-    let local_asn = info.local_asn.or(info.remote_asn).unwrap_or(Asn::from_u32(0));
+    // Step c falls back to the local ASN when a route's AS_PATH does not begin
+    // with a bare ASN — an AS_SET or AS_CONFED_SEQUENCE — which is RFC 4271
+    // step c's "it is the local AS" clause. When the local ASN is unknown the
+    // fallback has to be the *same* value for every candidate, or two routes
+    // that the RFC says share a neighbour AS would compare as if they did not,
+    // and their MEDs would silently stop being weighed. AS 0 is reserved
+    // (RFC 7607) and so can never collide with a real neighbour.
+    let local_asn = info.local_asn.unwrap_or_else(unknown_asn);
 
     let bgp_identifier = match info.bgp_id {
         Some(id) => id,
@@ -407,11 +423,46 @@ fn classify(
         assumed,
     };
 
+    // RFC 4271 section 9.1.2: a route whose AS_PATH contains the local AS is
+    // excluded from Phase 2. Only checkable when the local ASN was recorded —
+    // an MRT-replayed peer has no local end, so there is nothing to compare
+    // against and the route is left in.
+    //
+    // "Local" is the local end of *that session*: for a BMP-monitored peer it
+    // is the monitored router's ASN, which is what this reproduces the view
+    // of. Excluded routes are reported in `ineligible`, so an operator can
+    // still see a loop netom rejected rather than wondering where it went.
+    //
+    // Checked *before* routecore's eligibility, which would otherwise claim a
+    // looped path that begins with an AS_SET or AS_CONFED_SEQUENCE as
+    // `EbgpWithoutNeighbour`. Both exclude the route; the loop is the more
+    // specific and more actionable answer.
+    if let (Some(local), Some(path)) =
+        (info.local_asn, candidate.pa_map.get::<HopPath>())
+    {
+        if as_path_contains(&path, local) {
+            return Err(exclude(IneligibleReason::AsPathLoop));
+        }
+    }
+
     if let Err(reason) = check_eligible(&candidate) {
         return Err(exclude(reason));
     }
 
     Ok(candidate)
+}
+
+/// Whether `asn` appears anywhere in the AS_PATH.
+///
+/// RFC 4271 section 9.1.2 excludes a route from Phase 2 when its AS_PATH
+/// contains the local AS, and says the check scans the *full* path — so
+/// AS_SET, AS_CONFED_SEQUENCE and AS_CONFED_SET members count, not just the
+/// bare hops of an AS_SEQUENCE.
+fn as_path_contains(path: &HopPath, asn: Asn) -> bool {
+    path.iter().any(|hop| match hop {
+        Hop::Asn(hop_asn) => *hop_asn == asn,
+        Hop::Segment(segment) => segment.asns().any(|a| a == asn),
+    })
 }
 
 /// Build a [`PaMap`] from a stored attribute blob.
@@ -892,9 +943,24 @@ mod tests {
 
     /// AS_PATH (type 2) as a single AS_SEQUENCE of four-octet ASNs.
     fn as_path(asns: &[u32]) -> Vec<u8> {
-        let mut value = vec![2u8, asns.len() as u8];
-        for asn in asns {
-            value.extend_from_slice(&asn.to_be_bytes());
+        as_path_segments(&[(SEQ, asns)])
+    }
+
+    // AS_PATH segment types (RFC 4271 section 4.3, RFC 5065 section 3).
+    const SET: u8 = 1;
+    const SEQ: u8 = 2;
+    const CONFED_SEQ: u8 = 3;
+
+    /// AS_PATH built from explicit segments, for the AS_SET and confederation
+    /// cases where the segment type is the point.
+    fn as_path_segments(segments: &[(u8, &[u32])]) -> Vec<u8> {
+        let mut value = Vec::new();
+        for (stype, asns) in segments {
+            value.push(*stype);
+            value.push(asns.len() as u8);
+            for asn in *asns {
+                value.extend_from_slice(&asn.to_be_bytes());
+            }
         }
         let mut out = vec![0x40, 2, value.len() as u8];
         out.extend_from_slice(&value);
@@ -1482,6 +1548,277 @@ mod tests {
         let out = rfc4271(&records, &info);
         assert_eq!(out.best_mui(), 1);
         assert_eq!(out.decided_by(), None);
+    }
+
+    //--- RFC edge cases -----------------------------------------------------
+
+    /// RFC 4271 §9.1.2: "If the AS_PATH attribute of a BGP route contains an
+    /// AS loop, the BGP route should be excluded from the Phase 2 decision
+    /// function."
+    #[test]
+    fn a_route_whose_as_path_contains_the_local_as_is_excluded() {
+        let records = [
+            record(1, plain(&[65001, 65000, 65002])),
+            record(2, plain(&[65001, 65002, 65003, 65004])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(
+            out.best_mui(),
+            2,
+            "the longer path wins because the shorter one loops"
+        );
+        assert_eq!(out.excluded.len(), 1);
+        assert_eq!(out.excluded[0].mui, 1);
+        assert_eq!(out.excluded[0].reason, IneligibleReason::AsPathLoop);
+    }
+
+    /// The RFC says the check scans the *full* AS path, so a local AS hidden
+    /// inside an AS_SET is still a loop.
+    #[test]
+    fn an_as_path_loop_inside_an_as_set_is_found() {
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(SEQ, &[65001]), (SET, &[65009, 65000])]),
+            ]),
+        )];
+        let info = registry(vec![(1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1]))]);
+
+        let out = rfc4271(&records, &info);
+        assert!(out.best.is_none());
+        assert_eq!(out.excluded[0].reason, IneligibleReason::AsPathLoop);
+    }
+
+    /// Confederation members appear in AS_CONFED_SEQUENCE, which is part of
+    /// the path being scanned: a route that already traversed this member AS
+    /// is a loop like any other.
+    #[test]
+    fn an_as_path_loop_inside_a_confed_sequence_is_found() {
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path_segments(&[
+                    (CONFED_SEQ, &[65000]),
+                    (SEQ, &[65001]),
+                ]),
+            ]),
+        )];
+        let info = registry(vec![(1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1]))]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.excluded[0].reason, IneligibleReason::AsPathLoop);
+    }
+
+    /// Without a local ASN there is nothing to compare against, so the check
+    /// is skipped rather than guessed at. MRT-replayed peers have no local
+    /// end at all.
+    #[test]
+    fn loop_detection_is_skipped_when_the_local_asn_is_unknown() {
+        let records = [record(1, plain(&[65001, 65000, 65002]))];
+        let info = registry(vec![(
+            1,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::Mrt)
+                .with_remote_asn(Asn::from_u32(65001))
+                .with_remote_addr("10.0.0.1".parse::<IpAddr>().unwrap())
+                .with_bgp_id([10, 0, 0, 1]),
+        )]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1, "cannot detect a loop without a local AS");
+        assert!(out.excluded.is_empty());
+    }
+
+    /// Step a: "an AS_SET counts as 1, no matter how many ASes are in the
+    /// set". The set here holds three ASNs but must weigh the same as one hop,
+    /// so the two-hop sequence loses.
+    #[test]
+    fn an_as_set_counts_as_a_single_hop() {
+        let records = [
+            record(
+                1,
+                pamap(&[
+                    origin(0),
+                    as_path_segments(&[(SET, &[65001, 65002, 65003])]),
+                ]),
+            ),
+            record(2, plain(&[65004, 65005])),
+        ];
+        let info = registry(vec![
+            (1, ibgp("10.0.0.1", [10, 0, 0, 1])),
+            (2, ibgp("10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1);
+        assert_eq!(out.decided_by(), Some(DecisionStep::AsPathLength));
+    }
+
+    /// RFC 5065 §5.3: AS_CONFED segments are not counted in the AS_PATH
+    /// length used by step a. The confederation route below has four ASNs in
+    /// its path but only one that counts, so it beats a two-hop sequence.
+    #[test]
+    fn confed_segments_do_not_count_towards_as_path_length() {
+        let records = [
+            record(
+                1,
+                pamap(&[
+                    origin(0),
+                    as_path_segments(&[
+                        (CONFED_SEQ, &[65101, 65102, 65103]),
+                        (SEQ, &[65001]),
+                    ]),
+                ]),
+            ),
+            record(2, plain(&[65004, 65005])),
+        ];
+        let info = registry(vec![
+            (1, ibgp("10.0.0.1", [10, 0, 0, 1])),
+            (2, ibgp("10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1);
+        assert_eq!(out.decided_by(), Some(DecisionStep::AsPathLength));
+    }
+
+    /// Step c's neighbour AS is "the local AS" when the AS_PATH does not begin
+    /// with a plain ASN — an aggregate whose path starts with an AS_SET. Both
+    /// routes then share a neighbour AS, so their MEDs *are* comparable.
+    #[test]
+    fn med_is_comparable_when_both_paths_start_with_an_as_set() {
+        let set_path = as_path_segments(&[(SET, &[65001, 65002])]);
+        let records = [
+            record(
+                1,
+                pamap(&[origin(0), set_path.clone(), med(200)]),
+            ),
+            record(2, pamap(&[origin(0), set_path, med(50)])),
+        ];
+        // IBGP: an EBGP route whose path names no neighbour is ineligible, so
+        // this clause is only reachable for internal routes.
+        let info = registry(vec![
+            (1, ibgp("10.0.0.1", [10, 0, 0, 1])),
+            (2, ibgp("10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::Med));
+    }
+
+    /// Phase 1 runs before every tie-breaker, so an internal route with a
+    /// LOCAL_PREF outranks an external one — netom applies no import policy,
+    /// which means EBGP routes have a degree of preference of 0 rather than a
+    /// vendor-style default of 100. Step d never gets to run.
+    #[test]
+    fn an_ibgp_local_pref_outranks_an_ebgp_route() {
+        let records = [
+            record(1, pamap(&[origin(0), as_path(&[65001]), local_pref(100)])),
+            record(2, plain(&[65001])),
+        ];
+        let info = registry(vec![
+            (1, ibgp("10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1, "LOCAL_PREF is weighed before step d");
+        assert_eq!(out.decided_by(), Some(DecisionStep::DegreeOfPreference));
+    }
+
+    /// An IBGP route with no LOCAL_PREF has a degree of preference of 0, not
+    /// the 100 most vendors default to, so it loses to any internal route that
+    /// carries one.
+    #[test]
+    fn a_missing_local_pref_on_an_ibgp_route_counts_as_zero() {
+        let records = [
+            record(1, plain(&[65001])),
+            record(2, pamap(&[origin(0), as_path(&[65001]), local_pref(1)])),
+        ];
+        let info = registry(vec![
+            (1, ibgp("10.0.0.1", [10, 0, 0, 1])),
+            (2, ibgp("10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::DegreeOfPreference));
+    }
+
+    /// Step g compares peer addresses, which may be of different families —
+    /// a v6 session can carry v4 NLRI. The RFC says nothing about ordering
+    /// across families; `IpAddr` sorts every v4 address before every v6 one.
+    /// Pinned because it is arbitrary but must stay deterministic.
+    #[test]
+    fn step_g_sorts_ipv4_peers_before_ipv6_peers() {
+        let records =
+            [record(1, plain(&[65001])), record(2, plain(&[65001]))];
+        // Identical but for the peer address family.
+        let info = registry(vec![
+            (1, ebgp(65001, "2001:db8::1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 1])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::PeerAddress));
+    }
+
+    /// A missing MULTI_EXIT_DISC is the *lowest* value, per RFC 4271 step c —
+    /// not the highest, which is a widespread vendor option
+    /// ("med-missing-as-worst") and not what the RFC says.
+    #[test]
+    fn a_missing_med_is_the_lowest_med() {
+        let records = [
+            record(1, pamap(&[origin(0), as_path(&[65001]), med(1)])),
+            record(2, plain(&[65001])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2, "no MED beats MED 1");
+        assert_eq!(out.decided_by(), Some(DecisionStep::Med));
+    }
+
+    /// A confederation-external peer's routes begin with an
+    /// AS_CONFED_SEQUENCE, which names no neighbour ASN, so routecore's
+    /// eligibility check rejects them as `ebgpWithoutNeighbour`. RFC 5065
+    /// deployments therefore do not get best-path selection for
+    /// confederation-external routes today.
+    ///
+    /// Pinned as a known limitation rather than asserted as correct: if
+    /// routecore learns to read a neighbour out of an AS_CONFED_SEQUENCE this
+    /// test should be the one that fails and gets updated.
+    #[test]
+    fn confed_external_routes_are_currently_ineligible() {
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]),
+            ]),
+        )];
+        // A confederation member AS, distinct from ours, so the session reads
+        // as EBGP.
+        let info = registry(vec![(1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1]))]);
+
+        let out = rfc4271(&records, &info);
+        assert!(out.best.is_none());
+        assert_eq!(
+            out.excluded[0].reason,
+            IneligibleReason::EbgpWithoutNeighbour
+        );
     }
 
     //--- The explanation must not drift from the ranking --------------------

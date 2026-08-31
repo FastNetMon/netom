@@ -38,6 +38,11 @@ Released yyyy-mm-dd.
   tiebreaker per prefix and so cannot express the per-peer steps d, f and g.
   See `docs/best-path-selection.md` and `docs/rib-query-api.md`.
 
+* Best path excludes a route whose AS_PATH contains the session's local AS
+  (RFC 4271 section 9.1.2), reported as `asPathLoop`. The full path is
+  scanned, so an AS inside an AS_SET or an AS_CONFED segment counts. Skipped
+  for MRT-replayed peers, which record no local ASN.
+
 * `netom-cli`: `show ip bgp <prefix> best` and `show ip bgp best <address>`,
   rendering the above with the conventional `>` best marker.
 
