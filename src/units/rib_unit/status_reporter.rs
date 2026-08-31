@@ -31,6 +31,12 @@ impl RibUnitStatusReporter {
         }
     }
 
+    /// Point the metrics' store-sourced gauges at the RIB, for callers that
+    /// build the reporter before the RIB exists (the test mock).
+    pub fn set_rib(&self, rib: &Arc<arc_swap::ArcSwap<super::rib::Rib>>) {
+        self.metrics.set_rib(rib);
+    }
+
     pub fn filter_name_changed(
         &self,
         old: &FilterName,
@@ -121,6 +127,16 @@ impl RibUnitStatusReporter {
                 .fetch_add(num_retries as usize, SeqCst);
         }
 
+        // Every arm here adds; nothing subtracts. These are counters of
+        // events that happened, and how many routes are *currently* in the
+        // RIB is read from the store itself (see `RibUnitMetrics::append`),
+        // which knows without being told.
+        //
+        // The previous shape mixed the two: `num_routes_announced` counted
+        // prefixes on the way in and subtracted records on the way out, so on
+        // any real feed it went negative and, being unsigned, wrapped. A
+        // production collector reported 18446744073709551615 - 342754275
+        // after four days: 344M withdrawals against 1.66M prefixes.
         match change {
             StoreInsertionEffect::RoutesWithdrawn(0)
             | StoreInsertionEffect::RoutesRemoved(0) => {
@@ -129,20 +145,15 @@ impl RibUnitStatusReporter {
                     .fetch_add(1, SeqCst);
             }
 
-            StoreInsertionEffect::RoutesWithdrawn(n) => {
-                self.metrics.num_routes_announced.fetch_sub(n, SeqCst);
+            // Records that left the announced set, whether their attributes
+            // were retained (withdrawn) or dropped (removed).
+            StoreInsertionEffect::RoutesWithdrawn(n)
+            | StoreInsertionEffect::RoutesRemoved(n) => {
                 self.metrics.num_routes_withdrawn.fetch_add(n, SeqCst);
-            }
-
-            StoreInsertionEffect::RoutesRemoved(n) => {
-                self.metrics.num_routes_announced.fetch_sub(n, SeqCst);
-                self.metrics.num_items.fetch_sub(n, SeqCst);
             }
 
             StoreInsertionEffect::RouteAdded => {
                 self.metrics.num_routes_announced.fetch_add(1, SeqCst);
-                self.metrics.num_unique_prefixes.fetch_add(1, SeqCst);
-                self.metrics.num_items.fetch_add(1, SeqCst);
             }
 
             StoreInsertionEffect::RouteUpdated => {
@@ -151,13 +162,6 @@ impl RibUnitStatusReporter {
                     .fetch_add(1, SeqCst);
             }
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn unique_prefix_count_updated(&self, num_unique_prefixes: usize) {
-        self.metrics
-            .num_unique_prefixes
-            .store(num_unique_prefixes, SeqCst);
     }
 
     #[allow(dead_code)]

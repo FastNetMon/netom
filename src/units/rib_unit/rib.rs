@@ -35,7 +35,12 @@ use serde::{
 };
 
 use crate::{
-    ingress::{self, register::IdAndInfo, IngressId, IngressInfo},
+    ingress::{
+        self,
+        peer_stats::{self, AfiSafiKey},
+        register::IdAndInfo,
+        IngressId, IngressInfo, IngressType,
+    },
     payload::{
         PathAttributeInterner, RotondaPaMap, RotondaPaMapWithQueryFilter,
         RotondaRoute, RouterId,
@@ -190,6 +195,74 @@ pub struct Rib {
 #[derive(Copy, Clone, Debug)]
 struct Multicast(bool);
 
+/// The Adj-RIB-In gauge for the peer that owns `mui`, if it is a peer we
+/// keep per-peer stats for.
+///
+/// Only native BGP sessions have an entry (BMP-observed peers deliberately
+/// have none — see `bgp_tcp_in::http_ng::Neighbor::prefixes_received`), so
+/// this is `None` for most muis in a BMP collector and the caller skips the
+/// extra store probes that maintaining the gauge costs. ADD-PATH
+/// path-children resolve to their parent session's entry via the registry
+/// alias installed in `router_handler::get_or_create_path_child`.
+fn peer_gauge(mui: IngressId) -> Option<Arc<peer_stats::BgpPeerStats>> {
+    let registry = peer_stats::registry();
+    if registry.is_empty() {
+        return None;
+    }
+    registry.get(mui)
+}
+
+/// RFC 7854 §4.8 per-AFI/SAFI key for a stored unicast/multicast prefix.
+fn prefix_afi_safi(prefix: &Prefix, multicast: Multicast) -> AfiSafiKey {
+    let afi = if prefix.is_v4() { 1 } else { 2 };
+    let safi = if multicast.0 { 2 } else { 1 };
+    (afi, safi)
+}
+
+/// Zero the Adj-RIB-In gauge for `mui` because every route it owns has just
+/// been withdrawn or removed in bulk. `family` scopes it to one AFI/SAFI;
+/// `None` clears the peer entirely.
+///
+/// Bulk teardown is the one case where the per-prefix transition tracking in
+/// `insert_prefix` is bypassed — the store flips a whole-mui bit rather than
+/// walking prefixes — so the gauge has to be reset explicitly here or it
+/// would keep reporting a table for a peer that has none.
+fn reset_peer_gauge(mui: IngressId, family: Option<AfiSafiType>) {
+    let Some(gauge) = peer_gauge(mui) else {
+        return;
+    };
+    match family {
+        None => gauge.reset_adj_rib_in(),
+        Some(f) => {
+            let key: AfiSafiKey = match f {
+                AfiSafiType::Ipv4Unicast => (1, 1),
+                AfiSafiType::Ipv6Unicast => (2, 1),
+                AfiSafiType::Ipv4Multicast => (1, 2),
+                AfiSafiType::Ipv6Multicast => (2, 2),
+                AfiSafiType::Ipv4FlowSpec => (1, 133),
+                AfiSafiType::Ipv6FlowSpec => (2, 133),
+                // Families we never store; nothing was ever counted.
+                _ => return,
+            };
+            gauge.reset_adj_rib_in_afi_safi(key);
+        }
+    }
+}
+
+/// Prefix and route counts for one of the RIB's backing stores.
+///
+/// `routes` counts stored records — one per `(prefix, mui)` — so it exceeds
+/// `prefixes` whenever several peers announce the same prefix.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoreCounts {
+    pub name: &'static str,
+    pub prefixes: usize,
+    pub prefixes_v4: usize,
+    pub prefixes_v6: usize,
+    pub routes: usize,
+}
+
 impl Rib {
     pub fn new(
         ingress_register: Arc<ingress::Register>,
@@ -222,6 +295,38 @@ impl Rib {
         }
     }
 
+    /// Per-store prefix and route counts, for `/api/v1/status`.
+    ///
+    /// Cheap — the store counters are atomic loads, the same ones
+    /// `log_memory_stats` reads.
+    pub fn store_counts(&self) -> Vec<StoreCounts> {
+        let mut res = Vec::with_capacity(3);
+        for (name, store) in [
+            ("unicast", self.unicast.as_ref()),
+            ("multicast", self.multicast.as_ref()),
+        ] {
+            if let Some(store) = store {
+                res.push(StoreCounts {
+                    name,
+                    prefixes: store.prefixes_count().in_memory(),
+                    prefixes_v4: store.prefixes_v4_count().in_memory(),
+                    prefixes_v6: store.prefixes_v6_count().in_memory(),
+                    routes: store.routes_count().in_memory(),
+                });
+            }
+        }
+        if let Some(store) = self.flowspec.as_ref() {
+            res.push(StoreCounts {
+                name: "flowspec",
+                prefixes: store.prefixes_count().in_memory(),
+                prefixes_v4: store.prefixes_v4_count().in_memory(),
+                prefixes_v6: store.prefixes_v6_count().in_memory(),
+                routes: store.routes_count().in_memory(),
+            });
+        }
+        res
+    }
+
     /// Emit a consolidated snapshot of the main memory consumers to the log,
     /// for leak hunting. Cheap: store counters are atomic loads, the interner
     /// scan and register tally lock briefly. Intended to be called on a slow
@@ -236,6 +341,24 @@ impl Rib {
     /// * `bmp-out buffered` large/growing ⇒ a slow consumer's dump backlog.
     /// * `RSS` is the bottom line — cross-check it against the sum of the above
     ///   to see whether the leak is accounted for here or somewhere unmeasured.
+    /// Sweep one shard of the path-attribute interner, dropping the `Weak`s
+    /// whose blobs are gone and the buckets they emptied.
+    ///
+    /// Driven one shard per tick by the `pa-interner-sweep` task, so a full
+    /// pass never holds any one shard's lock for long. See
+    /// [`PathAttributeInterner::sweep_shard`].
+    pub fn sweep_path_attribute_interner(
+        &self,
+        shard: usize,
+    ) -> (usize, usize) {
+        self.path_attribute_interner.sweep_shard(shard)
+    }
+
+    /// Number of interner shards, i.e. how many ticks one full pass takes.
+    pub fn path_attribute_interner_shards(&self) -> usize {
+        self.path_attribute_interner.num_shards()
+    }
+
     pub fn report_memory(&self, status_split: bool) {
         use crate::mem_stats::{
             bmp_out_snapshot, fmt_bytes, fmt_count, read_rss_bytes,
@@ -541,6 +664,17 @@ impl Rib {
         {
             // Lock order: flowspec_lock (held) -> withdraw_lock (inside).
             self.reset_flowspec_family(store, mui, key.is_v4())?;
+            // The retained rules just went away, so the gauge for this
+            // family has to follow them down before the new session's
+            // first rule is counted.
+            reset_peer_gauge(
+                mui,
+                Some(if key.is_v4() {
+                    AfiSafiType::Ipv4FlowSpec
+                } else {
+                    AfiSafiType::Ipv6FlowSpec
+                }),
+            );
             self.ingress_register.update_info(
                 mui,
                 ingress::IngressInfo::new()
@@ -562,11 +696,21 @@ impl Rib {
         let metrics = super::flowspec::flowspec_metrics();
         let is_v4 = key.is_v4();
 
+        // Per-peer Adj-RIB-In for SAFI 133 counts rules, and `upsert` /
+        // `remove` on the rule set already report whether the rule was
+        // actually added or actually removed — the same not-present ->
+        // present transition the unicast path has to derive from the store.
+        let gauge = peer_gauge(mui);
+        let afi_safi: AfiSafiKey = (if is_v4 { 1 } else { 2 }, 133);
+
         if route_status == RouteStatus::Withdrawn {
             metrics.note_update(is_v4, true);
             if !ruleset.remove(nlri_raw) {
                 // Unknown rule (or peer) — nothing to withdraw.
                 return Ok(no_op);
+            }
+            if let Some(gauge) = &gauge {
+                gauge.sub_adj_rib_in(afi_safi, 1);
             }
             let (status, ltime) = if ruleset.is_empty() {
                 (RouteStatus::Withdrawn, ltime)
@@ -583,16 +727,22 @@ impl Rib {
         metrics.note_update(is_v4, false);
 
         let flow_originator = self.flowspec_identity(pamap, mui).0;
-        let validity = self.validate_flowspec(
-            nlri_raw,
-            flow_originator,
-            is_v4,
-        );
+        let validity =
+            self.validate_flowspec(nlri_raw, flow_originator, is_v4);
         let replaced = ruleset.upsert(nlri_raw, pamap, validity);
         let pubrec = Record::new(mui, ltime, route_status, ruleset);
         let report = store.insert(&key, pubrec, None);
-        if report.is_ok() && !replaced {
-            self.flowspec_rule_counts.add(is_v4, 1);
+        if report.is_ok() {
+            if !replaced {
+                self.flowspec_rule_counts.add(is_v4, 1);
+            }
+            if let Some(gauge) = &gauge {
+                if replaced {
+                    gauge.inc_dup_prefix_advertisements(1);
+                } else {
+                    gauge.add_adj_rib_in(afi_safi, 1);
+                }
+            }
         }
         report
     }
@@ -805,11 +955,9 @@ impl Rib {
         // bgp_id of their own; resolve to the parent session so every
         // path of one peer yields the same identity.
         let session_id = self.ingress_register.session_for(ingress_id);
-        let (attr_id, path_neighbor) =
-            self.flowspec_validation_attrs(pamap);
-        let (peer_id, remote_asn) = self
-            .ingress_register
-            .bgp_id_and_remote_asn(session_id);
+        let (attr_id, path_neighbor) = self.flowspec_validation_attrs(pamap);
+        let (peer_id, remote_asn) =
+            self.ingress_register.bgp_id_and_remote_asn(session_id);
         let originator = attr_id
             .or(peer_id)
             .map(FlowSpecOriginator::BgpId)
@@ -889,7 +1037,44 @@ impl Rib {
 
         let mui = ingress_id;
 
+        // Adj-RIB-In is a gauge, so it may only move on a transition of this
+        // (prefix, mui) between "active" and "not active". Counting raw NLRIs
+        // instead inflates it without bound, because BGP's implicit withdraw
+        // re-advertises a prefix that is already in the RIB with no matching
+        // UNREACH to balance it. `was_active` is the pre-state; it costs a
+        // store probe, so it is only computed for peers we report on.
+        let gauge = peer_gauge(mui);
+        let afi_safi = prefix_afi_safi(prefix, multicast);
+        let was_active = gauge.as_ref().map(|_| {
+            // A globally withdrawn mui (peer down, records retained for a
+            // possible reconnect) owns nothing, but its individual records
+            // keep their Active status — `mark_mui_as_withdrawn` only sets
+            // the store-wide bitmap, and a mui-scoped record lookup does not
+            // consult it. Check the bitmap first, or every prefix of a
+            // reconnecting peer would look like a re-advertisement and the
+            // gauge would never climb back up. This is a roaring-bitmap
+            // lookup, cheaper than the tree descents below.
+            if store.mui_is_withdrawn_v4(mui)
+                || store.mui_is_withdrawn_v6(mui)
+            {
+                return false;
+            }
+            // `contains` is a bitmap check with no record-map read: false
+            // means no record at all, which is the overwhelmingly common
+            // case while a peer is loading its table. Only when a record
+            // does exist do we pay for reading its status, which is the
+            // churn path and runs orders of magnitude less often.
+            store.contains(prefix, Some(mui))
+                && store
+                    .get_records_for_prefix(prefix, Some(mui), false)
+                    .is_ok_and(|r| r.is_some_and(|recs| !recs.is_empty()))
+        });
+
         if route_status == RouteStatus::Withdrawn {
+            if let (Some(gauge), Some(true)) = (&gauge, was_active) {
+                gauge.sub_adj_rib_in(afi_safi, 1);
+            }
+
             if !retain_withdrawn_attributes {
                 if !store.contains(prefix, Some(mui)) {
                     return Ok(UpsertReport {
@@ -915,15 +1100,20 @@ impl Rib {
             // mark_mui_as_withdrawn_for_prefix . This way, we preserve the
             // last seen attributes/nexthop for this {prefix,mui} combination,
             // while setting the status to Withdrawn.
+            //
+            // `mui_count` reports whether there was anything to withdraw, so
+            // the caller does not count a withdrawal for a {prefix,mui} the
+            // store never held. `contains` is a bitmap check and runs only on
+            // the withdrawal path, never on the announcement hot path. The
+            // other fields stay as they are: nothing was inserted.
+            let existed = store.contains(prefix, Some(mui));
             store.mark_mui_as_withdrawn_for_prefix(prefix, mui, 0)?;
 
-            // FIXME this is just to satisfy the function signature, but is
-            // quite useless as-is.
             return Ok(UpsertReport {
                 cas_count: 0,
                 prefix_new: false,
                 mui_new: false,
-                mui_count: 0,
+                mui_count: usize::from(existed),
             });
         }
 
@@ -955,9 +1145,26 @@ impl Rib {
             },
         );
 
-        store.insert(
+        let report = store.insert(
             prefix, pubrec, None, // Option<TBI>
-        )
+        );
+
+        // Only a not-active -> active transition grows the Adj-RIB-In. A
+        // re-advertisement of a prefix the peer already has is an implicit
+        // withdraw: the RIB replaces the record, the gauge does not move,
+        // and the announcement is counted as a duplicate instead (RFC 7854
+        // §4.8 stat type 1) so the churn stays visible.
+        if let (Some(gauge), Some(was_active)) = (&gauge, was_active) {
+            if report.is_ok() && route_status == RouteStatus::Active {
+                if was_active {
+                    gauge.inc_dup_prefix_advertisements(1);
+                } else {
+                    gauge.add_adj_rib_in(afi_safi, 1);
+                }
+            }
+        }
+
+        report
     }
 
     pub fn withdraw_for_ingress(
@@ -1003,6 +1210,7 @@ impl Rib {
 
         for (ingress_id, specific_afisafi) in ids {
             debug!("withdraw_for_ingress for {ingress_id}");
+            reset_peer_gauge(*ingress_id, *specific_afisafi);
             match specific_afisafi {
                 None => {
                     // Set all address families to withdrawn.
@@ -1152,6 +1360,7 @@ impl Rib {
         let count_mutation = self.flowspec_rule_counts.begin_mutation();
 
         for &id in ids {
+            reset_peer_gauge(id, None);
             if let Some(store) = (*self.unicast).as_ref() {
                 match store.remove_mui(id) {
                     Ok((records, emptied)) => debug!(
@@ -1546,8 +1755,7 @@ impl Rib {
         let mut peers: HashSet<IngressId> = HashSet::new();
         let mut childless_routers: HashSet<IngressId> = HashSet::new();
         for (id, i) in &info {
-            if i.state
-                != Some(ingress::register::IngressState::Disconnected)
+            if i.state != Some(ingress::register::IngressState::Disconnected)
             {
                 continue;
             }
@@ -1749,10 +1957,7 @@ impl Rib {
     ///
     /// A [`DUMP_MAX_DURATION`] wall-clock backstop stops a pathologically long
     /// dump early (logged; partial count returned).
-    pub fn stream_prefix_records<F>(
-        &self,
-        mut f: F,
-    ) -> Result<usize, String>
+    pub fn stream_prefix_records<F>(&self, mut f: F) -> Result<usize, String>
     where
         F: FnMut(PrefixRecord<RotondaPaMap>) -> bool,
     {
@@ -1888,46 +2093,45 @@ impl Rib {
 
         let mut rows: Vec<FlowSpecQueryRow> = Vec::new();
         let mut raw_bytes = 0usize;
-        let mut push_records =
-            |rows: &mut Vec<FlowSpecQueryRow>,
-             key: Prefix,
-             records: Vec<Record<FlowSpecRuleSet>>|
-             -> Result<(), String> {
-                for r in records {
-                    if r.status == RouteStatus::Withdrawn {
+        let mut push_records = |rows: &mut Vec<FlowSpecQueryRow>,
+                                key: Prefix,
+                                records: Vec<Record<FlowSpecRuleSet>>|
+         -> Result<(), String> {
+            for r in records {
+                if r.status == RouteStatus::Withdrawn {
+                    continue;
+                }
+                if let Some(want) = ingress_id {
+                    if r.multi_uniq_id != want {
                         continue;
                     }
-                    if let Some(want) = ingress_id {
-                        if r.multi_uniq_id != want {
-                            continue;
-                        }
-                    }
-                    for rule in r.meta.iter() {
-                        if let Some((max_rows, max_raw_bytes)) = limits {
-                            let rule_bytes = rule
-                                .nlri
-                                .len()
-                                .saturating_add(rule.pamap.as_ref().len());
-                            if rows.len() >= max_rows
-                                || raw_bytes.saturating_add(rule_bytes)
-                                    > max_raw_bytes
-                            {
-                                return Err(format!(
+                }
+                for rule in r.meta.iter() {
+                    if let Some((max_rows, max_raw_bytes)) = limits {
+                        let rule_bytes = rule
+                            .nlri
+                            .len()
+                            .saturating_add(rule.pamap.as_ref().len());
+                        if rows.len() >= max_rows
+                            || raw_bytes.saturating_add(rule_bytes)
+                                > max_raw_bytes
+                        {
+                            return Err(format!(
                                     "FlowSpec query exceeds the response limit \
                                      ({max_rows} rules or {max_raw_bytes} raw bytes)"
                                 ));
-                            }
-                            raw_bytes += rule_bytes;
                         }
-                        rows.push(FlowSpecQueryRow {
-                            key_prefix: key,
-                            ingress_id: r.multi_uniq_id,
-                            rule: rule.clone(),
-                        });
+                        raw_bytes += rule_bytes;
                     }
+                    rows.push(FlowSpecQueryRow {
+                        key_prefix: key,
+                        ingress_id: r.multi_uniq_id,
+                        rule: rule.clone(),
+                    });
                 }
-                Ok(())
-            };
+            }
+            Ok(())
+        };
 
         match prefix {
             None => {
@@ -1947,7 +2151,8 @@ impl Rib {
             Some(prefix) => {
                 let guard = &epoch::pin();
                 let match_options = MatchOptions {
-                    match_type: rotonda_store::match_options::MatchType::ExactMatch,
+                    match_type:
+                        rotonda_store::match_options::MatchType::ExactMatch,
                     include_withdrawn: false,
                     include_less_specifics,
                     include_more_specifics,
@@ -1966,11 +2171,7 @@ impl Rib {
                     .flatten()
                 {
                     for pr in set.iter() {
-                        push_records(
-                            &mut rows,
-                            pr.prefix,
-                            pr.meta.clone(),
-                        )?;
+                        push_records(&mut rows, pr.prefix, pr.meta.clone())?;
                     }
                 }
             }
@@ -1990,13 +2191,14 @@ impl Rib {
             let flow_originator =
                 self.flowspec_identity(&row.rule.pamap, row.ingress_id).0;
             let cache_key = (row.key_prefix, flow_originator);
-            let validity = *validity_cache.entry(cache_key).or_insert_with(|| {
-                self.validate_flowspec(
-                    &row.rule.nlri,
-                    flow_originator,
-                    family_v4,
-                )
-            });
+            let validity =
+                *validity_cache.entry(cache_key).or_insert_with(|| {
+                    self.validate_flowspec(
+                        &row.rule.nlri,
+                        flow_originator,
+                        family_v4,
+                    )
+                });
             row.rule.validity = validity;
         }
         Ok(rows)
@@ -2224,6 +2426,22 @@ impl Rib {
     ) {
         if let Some(ingress_id) = filter.ingress_id {
             records.retain(|r| r.multi_uniq_id == ingress_id);
+        }
+
+        if let Some(ingress_type) = filter.ingress_type {
+            // Unlike the filters below, a record whose ingress is unknown is
+            // dropped rather than kept: it has no type, so it cannot be the
+            // requested one, and keeping it would leak BMP-learned routes into
+            // an ingressType=bgp answer — precisely what this filter exists to
+            // prevent.
+            records.retain(|r| {
+                ingress_info
+                    .get(&r.multi_uniq_id)
+                    .map(|ii| {
+                        ingress_type_matches(ingress_type, ii, ingress_info)
+                    })
+                    .unwrap_or(false)
+            });
         }
 
         if let Some(rib_type) = filter.rib_type {
@@ -2474,7 +2692,16 @@ impl Rib {
             }
         };
 
-        let ingress_info = self.ingress_register.cloned_info();
+        // An ingressId-scoped dump only ever emits records of that one mui,
+        // so it needs that entry and its parent rather than the whole
+        // register (see `Register::cloned_info_for`). Every other dump can
+        // hold any mui and needs the full snapshot.
+        let ingress_info = match filter.ingress_id {
+            Some(mui) => {
+                self.ingress_register.cloned_info_for(&HashSet::from([mui]))
+            }
+            None => self.ingress_register.cloned_info(),
+        };
 
         let maybe_roto_function: Option<RotoHttpFilter> =
             match filter.roto_function.as_ref() {
@@ -2521,7 +2748,19 @@ impl Rib {
             let mut batch: Vec<PrefixRecord<RotondaPaMap>> =
                 Vec::with_capacity(chunk.len());
             for &prefix in chunk {
-                match store.get_records_for_prefix(&prefix, None, true) {
+                // Scoped to the queried mui when there is one, so a prefix
+                // held by many peers does not materialize all of their
+                // records just to have apply_filter drop them again. The
+                // walk above still visits every prefix: the store has no
+                // per-mui prefix index (`iter_records_for_mui_*` is itself a
+                // full more-specifics walk from the family default route), so
+                // an ingressId dump can only be made cheaper per prefix, not
+                // shorter.
+                match store.get_records_for_prefix(
+                    &prefix,
+                    filter.ingress_id,
+                    true,
+                ) {
                     Ok(Some(meta)) => {
                         batch.push(PrefixRecord::new(prefix, meta))
                     }
@@ -2689,6 +2928,45 @@ impl RouteSource {
     }
 }
 
+/// Whether a record stored under `info`'s ingress belongs to a session of
+/// type `want`, for `filter[ingressType]`.
+///
+/// Matching is on the *session*, not on the store mui: an ADD-PATH path-child
+/// ([`IngressType::BgpPath`]) says nothing about where the route came from, so
+/// it is attributed to its parent session. Without that, `ingressType=bgp`
+/// would silently drop every route from an ADD-PATH peer.
+pub(crate) fn ingress_type_matches(
+    want: IngressType,
+    info: &IngressInfo,
+    all: &HashMap<IngressId, IngressInfo>,
+) -> bool {
+    let own = info.ingress_type;
+
+    // An explicit ingressType=bgpPath query asks for the children themselves,
+    // so answer that before resolving them away.
+    if own == Some(want) {
+        return true;
+    }
+
+    let session_type = if own == Some(IngressType::BgpPath) {
+        info.parent_ingress
+            .and_then(|parent| all.get(&parent))
+            .and_then(|parent| parent.ingress_type)
+    } else {
+        own
+    };
+
+    match (want, session_type) {
+        // Routes learned over BMP are stored under the monitored router's
+        // per-peer `BgpViaBmp` children; the router's own `Bmp` ingress never
+        // owns a record. Treat `bmp` as "everything learned through BMP"
+        // rather than always answering with an empty set.
+        (IngressType::Bmp, Some(IngressType::BgpViaBmp)) => true,
+        (want, Some(session_type)) => want == session_type,
+        (_, None) => false,
+    }
+}
+
 crate::genoutput_json!(SearchResult);
 
 impl SearchResult {
@@ -2697,11 +2975,38 @@ impl SearchResult {
         ingress_register: Arc<ingress::Register>,
         query_filter: QueryFilter,
     ) -> Self {
+        // Resolve only the muis this result actually holds, rather than
+        // snapshotting the whole register: a query touches a few hundred
+        // ingresses, while the register on a collector holds one entry per
+        // ADD-PATH `(session, path_id)` and so grows with the table. Cloning
+        // all of it cost 631MB and 350ms per query on a production box with
+        // 1.35M entries -- for a single-prefix lookup returning four records.
+        let ingress_info =
+            ingress_register.cloned_info_for(&Self::muis(&query_result));
         Self {
             query_result,
-            ingress_info: ingress_register.cloned_info(),
+            ingress_info,
             query_filter,
         }
+    }
+
+    /// Every mui appearing in a query result, across the matched prefix and
+    /// both include sets.
+    fn muis(query_result: &QueryResult<RotondaPaMap>) -> HashSet<IngressId> {
+        let mut ids = HashSet::new();
+        ids.extend(query_result.records.iter().map(|r| r.multi_uniq_id));
+        for set in [
+            query_result.more_specifics.as_ref(),
+            query_result.less_specifics.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for pr in set.v4.iter().chain(set.v6.iter()) {
+                ids.extend(pr.meta.iter().map(|r| r.multi_uniq_id));
+            }
+        }
+        ids
     }
 
     pub(crate) fn ingress_info(
@@ -3099,6 +3404,71 @@ mod tests {
 
     use super::*;
 
+    fn info(
+        ingress_type: IngressType,
+        parent: Option<IngressId>,
+    ) -> IngressInfo {
+        IngressInfo {
+            ingress_type: Some(ingress_type),
+            parent_ingress: parent,
+            ..IngressInfo::new()
+        }
+    }
+
+    #[test]
+    fn ingress_type_filter_matches_the_session_of_a_path_child() {
+        let session = info(IngressType::Bgp, None);
+        let child = info(IngressType::BgpPath, Some(1));
+        let all = HashMap::from([(1, session.clone()), (2, child.clone())]);
+
+        // The session itself, and its per-path children, are both "bgp".
+        assert!(ingress_type_matches(IngressType::Bgp, &session, &all));
+        assert!(ingress_type_matches(IngressType::Bgp, &child, &all));
+
+        // ... and neither is reachable under another origin.
+        assert!(!ingress_type_matches(IngressType::Mrt, &child, &all));
+        assert!(!ingress_type_matches(IngressType::BgpViaBmp, &child, &all));
+
+        // Asking for the children explicitly still works.
+        assert!(ingress_type_matches(IngressType::BgpPath, &child, &all));
+        assert!(!ingress_type_matches(IngressType::BgpPath, &session, &all));
+    }
+
+    #[test]
+    fn ingress_type_filter_treats_bmp_as_everything_learned_over_bmp() {
+        let router = info(IngressType::Bmp, None);
+        let peer = info(IngressType::BgpViaBmp, Some(1));
+        let child = info(IngressType::BgpPath, Some(2));
+        let all = HashMap::from([
+            (1, router.clone()),
+            (2, peer.clone()),
+            (3, child.clone()),
+        ]);
+
+        // A monitored router's own ingress holds no routes, so `bmp` has to
+        // reach the peers under it — including their ADD-PATH children.
+        assert!(ingress_type_matches(IngressType::Bmp, &peer, &all));
+        assert!(ingress_type_matches(IngressType::Bmp, &child, &all));
+        assert!(ingress_type_matches(IngressType::BgpViaBmp, &peer, &all));
+
+        // A locally terminated session is not BMP-learned.
+        let bgp = info(IngressType::Bgp, None);
+        assert!(!ingress_type_matches(IngressType::Bmp, &bgp, &all));
+    }
+
+    #[test]
+    fn ingress_type_filter_rejects_an_unresolvable_ingress() {
+        // A path child whose parent is gone from the register has no session
+        // type, so it belongs to no origin rather than to all of them.
+        let orphan = info(IngressType::BgpPath, Some(99));
+        let all = HashMap::from([(2, orphan.clone())]);
+        assert!(!ingress_type_matches(IngressType::Bgp, &orphan, &all));
+        assert!(!ingress_type_matches(IngressType::Bmp, &orphan, &all));
+
+        let untyped = IngressInfo::new();
+        assert!(!ingress_type_matches(IngressType::Bgp, &untyped, &all));
+    }
+
     // LH: these do not make much sense anymore with the new prefix store
     // doing all the updating/merging of entries. Adapting does not seem to be
     // worth it, perhaps we redo some of these from scratch?
@@ -3487,12 +3857,8 @@ mod tests {
     // ------------ FlowSpec store ------------------------------------------
 
     fn test_rib() -> Rib {
-        Rib::new(
-            Default::default(),
-            None,
-            Arc::new(Mutex::new(Ctx::empty())),
-        )
-        .unwrap()
+        Rib::new(Default::default(), None, Arc::new(Mutex::new(Ctx::empty())))
+            .unwrap()
     }
 
     /// Wrap raw v4 flowspec component bytes into a RotondaRoute.
@@ -3520,11 +3886,23 @@ mod tests {
         RotondaRoute::Ipv4FlowSpec(nlri.into(), pamap)
     }
 
-    fn validation_pamap(originator: [u8; 4], neighbor_asn: u32) -> RotondaPaMap {
+    fn validation_pamap(
+        originator: [u8; 4],
+        neighbor_asn: u32,
+    ) -> RotondaPaMap {
         RotondaPaMap::from(vec![
-            0x80, 9, 4, originator[0], originator[1], originator[2],
+            0x80,
+            9,
+            4,
+            originator[0],
+            originator[1],
+            originator[2],
             originator[3], // ORIGINATOR_ID
-            0x40, 2, 6, 2, 1, // AS_PATH, one AS_SEQUENCE entry
+            0x40,
+            2,
+            6,
+            2,
+            1, // AS_PATH, one AS_SEQUENCE entry
             (neighbor_asn >> 24) as u8,
             (neighbor_asn >> 16) as u8,
             (neighbor_asn >> 8) as u8,
@@ -3533,11 +3911,9 @@ mod tests {
     }
 
     // {dst 10.0.1.0/24, proto =17}
-    const FS_DST_PROTO: &[u8] =
-        &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
+    const FS_DST_PROTO: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x03, 0x81, 0x11];
     // {dst 10.0.1.0/24, dport =53}
-    const FS_DST_DPORT: &[u8] =
-        &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
+    const FS_DST_DPORT: &[u8] = &[0x01, 0x18, 10, 0, 1, 0x05, 0x81, 0x35];
     // {proto =17, sport =53} — no destination prefix component
     const FS_NO_DST: &[u8] = &[0x03, 0x81, 0x11, 0x06, 0x81, 0x35];
 
@@ -3587,10 +3963,7 @@ mod tests {
 
         let rows = flowspec_rows(&rib);
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].key_prefix,
-            Prefix::new_v4(0.into(), 0).unwrap()
-        );
+        assert_eq!(rows[0].key_prefix, Prefix::new_v4(0.into(), 0).unwrap());
         assert_eq!(rows[0].ingress_id, mui);
         assert_eq!(rows[0].rule.nlri, FS_NO_DST);
 
@@ -3784,10 +4157,7 @@ mod tests {
             .iter()
             .find(|r| r.key_prefix.len() == 0)
             .expect("no-dst rule stored");
-        assert_eq!(
-            nodst_row.rule.validity,
-            FlowSpecValidity::Unvalidatable
-        );
+        assert_eq!(nodst_row.rule.validity, FlowSpecValidity::Unvalidatable);
 
         // (b) violated: a more-specific unicast route from a different
         // neighboring AS invalidates the existing rule on the next query.
@@ -3904,11 +4274,7 @@ mod tests {
         assert_eq!(flowspec_rows(&rib).len(), 1);
 
         // Peer-down: mark the whole mui withdrawn for the flowspec family.
-        rib.withdraw_for_ingress(
-            mui,
-            Some(AfiSafiType::Ipv4FlowSpec),
-            true,
-        );
+        rib.withdraw_for_ingress(mui, Some(AfiSafiType::Ipv4FlowSpec), true);
         assert!(flowspec_rows(&rib).is_empty());
 
         // Re-announcement reactivates the mui (withdrawn-mui bitmap

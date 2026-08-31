@@ -1,0 +1,7 @@
+{"data":[
+{"id":2,"ingress_type":"bmp","state":"Connected","remote_addr":"10.99.0.1","name":"edge1"},
+{"id":3,"ingress_type":"bgpViaBmp","parent_ingress":2,"state":"Connected","remote_addr":"192.0.2.7","remote_asn":65100,"bgp_id":[10,99,0,1],"peer_rib_type":"inPre","session_up_time":"2026-08-12T06:00:00+00:00"},
+{"id":4,"ingress_type":"bgpPath","parent_ingress":3,"state":"Connected","remote_addr":"192.0.2.7","remote_asn":65100,"path_id":1},
+{"id":5,"ingress_type":"bgpPath","parent_ingress":3,"state":"Connected","remote_addr":"192.0.2.7","remote_asn":65100,"path_id":2},
+{"id":6,"ingress_type":"bgpViaBmp","parent_ingress":2,"state":"Disconnected","remote_addr":"192.0.2.8","remote_asn":65101,"peer_rib_type":"inPre"}
+]}

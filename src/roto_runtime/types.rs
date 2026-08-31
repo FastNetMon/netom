@@ -23,8 +23,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ingress::IngressId,
-    manager,
-    metrics,
+    manager, metrics,
     payload::{RotondaPaMap, RotondaRoute},
 };
 
@@ -781,8 +780,7 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
 /// ingress to store the route under.
 pub(crate) fn explode_announcements(
     bgp_update: &UpdateMessage<impl routecore::Octets>,
-) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError>
-{
+) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError> {
     let mut res = vec![];
 
     let pas = bgp_update.path_attributes()?;
@@ -803,8 +801,7 @@ pub(crate) fn explode_announcements(
 /// [`explode_announcements`] for the path-id component.
 pub(crate) fn explode_withdrawals(
     bgp_update: &UpdateMessage<impl routecore::Octets>,
-) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError>
-{
+) -> Result<Vec<(RotondaRoute, Option<PathId>)>, routecore::bgp::ParseError> {
     let mut res = vec![];
 
     let pamap = RotondaPaMap::new(
@@ -885,8 +882,7 @@ mod tests {
         use routecore::bgp::message::SessionConfig;
         use routecore::bgp::nlri::afisafi::{Ipv4UnicastNlri, IsPrefix};
 
-        let prefix =
-            inetnum::addr::Prefix::from_str("10.0.0.0/24").unwrap();
+        let prefix = inetnum::addr::Prefix::from_str("10.0.0.0/24").unwrap();
 
         // Two paths for one prefix, and an ADD-PATH withdrawal, built with
         // routecore's own encoder.

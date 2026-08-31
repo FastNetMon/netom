@@ -42,6 +42,63 @@ feature completeness and cleanup.
       internal-server error.
 - [ ] Add pagination or bounded streaming for queries that can cover the whole
       RIB.
+- [ ] Fix `Rib::match_ingress_id` silently dropping a peer's default route.
+      `iter_records_for_mui_v4/_v6` is a more-specifics walk anchored at the
+      family default route, and a more-specifics walk does not yield its own
+      anchor, so a peer that announces `0.0.0.0/0` or `::/0` has it missing
+      from the result while every other prefix is present. Nothing calls
+      `match_ingress_id` today, which is the only reason this has not bitten;
+      it is a trap for whoever implements `Rib::search_routes_for_ingress`
+      above, or wires the mui iterators into the jsonl dump. Found 2026-08-26
+      while benchmarking exactly that. Fix belongs in netom-store — have the
+      mui iterators include the anchor prefix — with a caller-side probe of
+      the family default route as the workaround until then.
+      `ingress_scoped_dump_matches_the_full_table_walk` in
+      `src/units/rib_unit/tests.rs` asserts that an `?ingressId=` dump keeps
+      the peer's `0.0.0.0/0`, so switching that walk over without fixing the
+      iterator fails the suite instead of quietly losing routes.
+- [ ] Make a per-peer route dump cheaper than a full-table scan. This needs a
+      change in netom-store, not here: `iter_records_for_mui_v4/_v6` looks
+      like an indexed lookup but is a more-specifics walk from the family
+      default route that visits every prefix and only filters each value
+      fetch by mui, so `?ingressId=` stays O(table) however it is driven
+      (measured on a 200k-prefix table with the queried peer holding 100
+      routes: 92ms before scoping the per-prefix fetch to the mui, 84ms
+      after, 80ms when driving the key walk from the mui iterator as well —
+      and that last variant holds an epoch guard across the whole scan,
+      which the guard-free key walk exists to avoid, and misses the peer's
+      own default route because a more-specifics iterator does not yield its
+      anchor). The fix is to prune subtrees during the walk using the
+      per-node mui bitmap the TreeBitMap already maintains
+      (`src/tree_bitmap/node_cht.rs`), i.e. teach `more_specific_prefix_iter_from`
+      to take a mui. `Rib::match_ingress_id` is the natural caller to build
+      on, and would then also give `Rib::search_routes_for_ingress` above a
+      real implementation.
+
+## 3a. RIB metric accounting
+
+- [ ] Fix `UpsertReport::mui_new` in netom-store, then count routes per record
+      rather than per prefix. In `prefix_cht/cht.rs::upsert_prefix`, the
+      "prefix already exists" branch initialises `mui_is_new = true` and only
+      ever *sets* it true (`if mui_count.is_none() { mui_is_new = true }`) --
+      the `else` that clears it on an overwrite is missing, so the report
+      reads `mui_new: true` even when an existing record was replaced. The
+      "new prefix" branch gets it right. Until that is fixed netom cannot
+      tell a second peer's path for a known prefix (a new route) from a
+      re-announcement of one it already had, which is why
+      `rib_unit_num_routes_announced` counts prefixes and
+      `rib_unit_num_modified_route_announcements` lumps both together. Found
+      2026-08-26 while fixing the announced-counter underflow; the netom side
+      is keyed on `prefix_new` with a comment pointing here
+      (`units/rib_unit/unit.rs`).
+- [ ] Count a repeated withdrawal of an already-withdrawn record only once.
+      `rib_unit_num_routes_withdrawn` counts every withdrawal the store
+      accepted, and a record that is already `Withdrawn` still exists, so a
+      peer that withdraws twice is counted twice. Telling them apart needs
+      the record's previous status, which is a store probe per withdrawal --
+      the cost `Rib::insert_prefix` deliberately pays only for peers that
+      have a stats entry. Cheap once the store can report the status it
+      replaced.
 
 ## 4. Bound memory and output backpressure
 
@@ -119,11 +176,14 @@ consumers). Remaining work:
       bgp_id, so rules under child muis were falsely Invalid), closing a
       pre-existing hole for unicast ADD-PATH too. Covered by unit tests and
       a flowspec leg in `scripts/e2e-addpath-bmp.sh`.
-- [ ] MRT ADD-PATH (RFC 8050): blocked on routecore — its MRT layer has no
-      `RIB_*_ADDPATH` subtypes (8–11) and `RibEntry::parse` reads no path
-      id. Once added there: extend `supported_rib_records` and the RIB-entry
-      match in `src/units/mrt_file_in/unit.rs`, and drop the permanent
-      path-id filter on its BGP4MP path.
+- [x] MRT ADD-PATH (done 2026-07-20): updated to routecore's RFC 8050
+      support for TABLE_DUMP_V2 subtypes 8–12 and BGP4MP subtypes 8–11.
+      `mrt-file-in` now admits those RIB records, retains path identifiers
+      from both snapshots and UPDATEs, and stores each `(peer, path_id)`
+      under a stable `BgpPath` child ingress so paths for one NLRI coexist
+      and bmp-out can reattach the identifier. Observed families are saved
+      on the MRT peer for synthesized cap-69 advertisement. The mrtgen
+      corpus regression covers both TABLE_DUMP_V2 and BGP4MP ADD-PATH.
 - [ ] exabgp e2e variant for BGP-in ADD-PATH (`add-path send/receive`
       toward `bgp-tcp-in`, two paths for one prefix, asserted via bmp-out) —
       the crafted-bytes harness covers the BMP pipeline only; Step 4's
@@ -134,11 +194,11 @@ consumers). Remaining work:
       family (see the commented-out `inverse_addpaths` idea in
       `src/common/routecore_extra.rs`), the stored families and the
       advertised cap-69 value must be refreshed alongside.
-- [ ] Multicast family collapse: bmp-out folds multicast NLRI into the
-      unicast NLRI space (pre-existing quirk, now inherited by ADD-PATH —
-      multicast paths are emitted with path ids inside the unicast family).
-      A proper MP_REACH SAFI-2 encoder would remove the collapse; document
-      or fix.
+- [ ] Proper multicast MRT/BMP support. `mrt-file-in` currently drops SAFI-2
+      TABLE_DUMP_V2 and BGP4MP routes, including ADD-PATH, rather than folding
+      them into unicast. Supporting them requires consistent SAFI-2 BMP
+      capability advertisement, UPDATE encoding, aggregation, and EoR
+      handling.
 - [x] Flaky `ingests_mrtgen_*` tests (fixed 2026-07-19): the temp-file name
       was derived from (pid, corpus length, extension), so the TableDumpV2
       and BGP4MP tests over the same corpus collided on one path in the

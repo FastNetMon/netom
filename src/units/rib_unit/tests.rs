@@ -69,6 +69,21 @@ const MRTGEN_E2E_ROUTES: &str = r#"[
     }
 ]"#;
 
+const MRTGEN_ADDPATH_ROUTES: &str = r#"[
+    {
+        "prefix": "198.51.100.0/24",
+        "nexthop": "192.0.2.1",
+        "as_path": [64500],
+        "path_id": 11
+    },
+    {
+        "prefix": "198.51.100.0/24",
+        "nexthop": "192.0.2.2",
+        "as_path": [64501],
+        "path_id": 22
+    }
+]"#;
+
 /// Diverse FlowSpec rules (RFC 8955/8956) covering every component type,
 /// both address families, rules with and without a destination prefix, and
 /// every traffic action mrtgen can encode. The unicast route comes first so
@@ -146,7 +161,7 @@ async fn ingest_mrtgen_routes_json(
 ) -> Arc<RibUnitRunner> {
     use crate::comms::{DirectLink, Gate};
     use crate::ingress;
-    use crate::units::mrt_file_in::unit::MrtInRunner;
+    use crate::units::mrt_file_in::unit::{MrtImportState, MrtInRunner};
     use mrtgen::{generate_from_routes, routes_from_json};
     use std::io::Write;
 
@@ -203,11 +218,16 @@ async fn ingest_mrtgen_routes_json(
 
     let ingresses = Arc::new(ingress::Register::new());
     let parent_id = ingresses.register();
+    let mut import_state = MrtImportState::default();
+    import_state
+        .preflight_file(&path)
+        .expect("MRT preflight should succeed");
     let result = MrtInRunner::process_file(
         update_gate,
         ingresses,
         parent_id,
         path.clone(),
+        &mut import_state,
     )
     .await;
     let _ = std::fs::remove_file(path);
@@ -215,6 +235,183 @@ async fn ingest_mrtgen_routes_json(
 
     result.expect("MRT input should reach the RIB through the gate");
     rib_runner
+}
+
+fn mrt_bgp4mp_v4_update(
+    path_id: Option<u32>,
+    prefix: [u8; 3],
+    announce: bool,
+) -> Vec<u8> {
+    let mut nlri = Vec::new();
+    if let Some(path_id) = path_id {
+        nlri.extend_from_slice(&path_id.to_be_bytes());
+    }
+    nlri.push(24);
+    nlri.extend_from_slice(&prefix);
+
+    let attrs = if announce {
+        vec![
+            0x40, 1, 1, 0, // ORIGIN IGP
+            0x40, 2, 6, 2, 1, 0, 0, 0xfc, 0x00, // AS_PATH 64512
+            0x40, 3, 4, 192, 0, 2, 1, // NEXT_HOP
+        ]
+    } else {
+        Vec::new()
+    };
+    let withdrawn = (!announce).then_some(nlri.as_slice()).unwrap_or(&[]);
+    let announced = announce.then_some(nlri.as_slice()).unwrap_or(&[]);
+
+    let bgp_len =
+        19 + 2 + withdrawn.len() + 2 + attrs.len() + announced.len();
+    let mut bgp = vec![0xff; 16];
+    bgp.extend_from_slice(&(bgp_len as u16).to_be_bytes());
+    bgp.push(2);
+    bgp.extend_from_slice(&(withdrawn.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(withdrawn);
+    bgp.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(&attrs);
+    bgp.extend_from_slice(announced);
+
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&[10, 0, 0, 1]);
+    body.extend_from_slice(&[10, 0, 0, 2]);
+    body.extend_from_slice(&bgp);
+
+    mrt_record(16, if path_id.is_some() { 9 } else { 4 }, &body)
+}
+
+fn mrt_bgp4mp_established_to_idle() -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    body.extend_from_slice(&[10, 0, 0, 1]);
+    body.extend_from_slice(&[10, 0, 0, 2]);
+    body.extend_from_slice(&6u16.to_be_bytes());
+    body.extend_from_slice(&1u16.to_be_bytes());
+    mrt_record(16, 5, &body)
+}
+
+fn mrt_bgp4mp_v6_multicast_update(
+    path_id: Option<u32>,
+    announce: bool,
+) -> Vec<u8> {
+    let mut nlri = Vec::new();
+    if let Some(path_id) = path_id {
+        nlri.extend_from_slice(&path_id.to_be_bytes());
+    }
+    nlri.push(48);
+    nlri.extend_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 1]);
+
+    let mut mp_value = vec![0, 2, 2]; // AFI IPv6, SAFI multicast
+    if announce {
+        mp_value.push(16);
+        mp_value.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        mp_value.push(0);
+    }
+    mp_value.extend_from_slice(&nlri);
+
+    let mut attrs = vec![
+        0x40,
+        1,
+        1,
+        0, // ORIGIN IGP
+        0x40,
+        2,
+        6,
+        2,
+        1,
+        0,
+        0,
+        0xfc,
+        0x00, // AS_PATH 64512
+        0x80,
+        if announce { 14 } else { 15 },
+        mp_value.len() as u8,
+    ];
+    attrs.extend_from_slice(&mp_value);
+
+    let bgp_len = 19 + 2 + 2 + attrs.len();
+    let mut bgp = vec![0xff; 16];
+    bgp.extend_from_slice(&(bgp_len as u16).to_be_bytes());
+    bgp.push(2);
+    bgp.extend_from_slice(&0u16.to_be_bytes());
+    bgp.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    bgp.extend_from_slice(&attrs);
+
+    let peer = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    let local = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    let mut body = Vec::new();
+    body.extend_from_slice(&64500u32.to_be_bytes());
+    body.extend_from_slice(&64496u32.to_be_bytes());
+    body.extend_from_slice(&0u16.to_be_bytes());
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&peer);
+    body.extend_from_slice(&local);
+    body.extend_from_slice(&bgp);
+    mrt_record(16, if path_id.is_some() { 9 } else { 4 }, &body)
+}
+
+fn mrt_record(mrt_type: u16, subtype: u16, body: &[u8]) -> Vec<u8> {
+    let mut record = Vec::with_capacity(12 + body.len());
+    record.extend_from_slice(&1_700_000_000u32.to_be_bytes());
+    record.extend_from_slice(&mrt_type.to_be_bytes());
+    record.extend_from_slice(&subtype.to_be_bytes());
+    record.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    record.extend_from_slice(body);
+    record
+}
+
+async fn ingest_mrt_byte_files(
+    files: &[Vec<u8>],
+) -> (Arc<RibUnitRunner>, Arc<crate::ingress::Register>) {
+    use crate::comms::{DirectLink, Gate};
+    use crate::units::mrt_file_in::unit::{MrtImportState, MrtInRunner};
+
+    static TMP_SEQ: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    let (mrt_gate, mut mrt_gate_agent) = Gate::new(0);
+    let update_gate = mrt_gate.clone();
+    let gate_task =
+        tokio::spawn(
+            async move { while mrt_gate.process().await.is_ok() {} },
+        );
+    let (rib_runner, _rib_gate_agent) = RibUnitRunner::mock("").unwrap();
+    let rib_runner = Arc::new(rib_runner);
+    let mut link: DirectLink = mrt_gate_agent.create_link().into();
+    link.connect(rib_runner.clone(), false).await.unwrap();
+
+    let ingresses = Arc::new(crate::ingress::Register::new());
+    let parent_id = ingresses.register();
+    let mut import_state = MrtImportState::default();
+    for bytes in files {
+        let path = std::env::temp_dir().join(format!(
+            "netom-mrt-lifecycle-{}-{}.mrt",
+            std::process::id(),
+            TMP_SEQ.fetch_add(1, SeqCst),
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let result = MrtInRunner::process_file(
+            update_gate.clone(),
+            ingresses.clone(),
+            parent_id,
+            path.clone(),
+            &mut import_state,
+        )
+        .await;
+        let _ = std::fs::remove_file(path);
+        result.expect("MRT input should reach the RIB through the gate");
+    }
+    gate_task.abort();
+    (rib_runner, ingresses)
 }
 
 fn assert_e2e_prefixes(runner: &RibUnitRunner) {
@@ -319,6 +516,163 @@ async fn ingests_mrtgen_bgp4mp_updates() {
     let runner =
         ingest_mrtgen_routes(mrtgen::RouteFormat::Bgp4mp, "mrt").await;
     assert_e2e_prefixes(&runner);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingests_mrtgen_addpath_paths_without_collapsing() {
+    for format in [
+        mrtgen::RouteFormat::TableDumpV2,
+        mrtgen::RouteFormat::Bgp4mp,
+    ] {
+        let runner =
+            ingest_mrtgen_routes_json(MRTGEN_ADDPATH_ROUTES, format, "mrt")
+                .await;
+        let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+        let options = MatchOptions {
+            match_type: MatchType::ExactMatch,
+            include_withdrawn: false,
+            include_less_specifics: false,
+            include_more_specifics: false,
+            mui: None,
+            include_history: IncludeHistory::None,
+        };
+        let result = runner.rib().match_prefix(&prefix, &options).unwrap();
+        assert_eq!(
+            result.records.len(),
+            2,
+            "ADD-PATH routes collapsed for {format:?}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_mrt_addpath_withdrawal_allocates_no_child_or_route() {
+    let withdrawal = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false);
+    let (runner, ingresses) = ingest_mrt_byte_files(&[withdrawal]).await;
+
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        0
+    );
+    assert!(!ingresses.cloned_info().values().any(|info| {
+        info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_addpath_announcement_and_withdrawal_reuse_child() {
+    let mut bytes = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], true);
+    bytes.extend(mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false));
+    let (runner, ingresses) = ingest_mrt_byte_files(&[bytes]).await;
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    let children: Vec<_> = ingresses
+        .cloned_info()
+        .into_iter()
+        .filter(|(_, info)| {
+            info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+        })
+        .collect();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].1.path_id, Some(77));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_addpath_child_identity_survives_sequential_files() {
+    let announce = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], true);
+    let withdraw = mrt_bgp4mp_v4_update(Some(77), [198, 51, 100], false);
+    let (runner, ingresses) =
+        ingest_mrt_byte_files(&[announce, withdraw]).await;
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    assert_eq!(stored_status(&runner, &prefix), RouteStatus::Withdrawn);
+    assert_eq!(
+        ingresses
+            .cloned_info()
+            .values()
+            .filter(|info| {
+                info.ingress_type
+                    == Some(crate::ingress::IngressType::BgpPath)
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_established_to_idle_withdraws_peer_and_path_children() {
+    let mut bytes = mrt_bgp4mp_v4_update(None, [203, 0, 113], true);
+    bytes.extend(mrt_bgp4mp_v4_update(Some(11), [198, 51, 100], true));
+    bytes.extend(mrt_bgp4mp_v4_update(Some(22), [198, 51, 100], true));
+    bytes.extend(mrt_bgp4mp_established_to_idle());
+    let (runner, ingresses) = ingest_mrt_byte_files(&[bytes]).await;
+
+    for prefix in ["203.0.113.0/24", "198.51.100.0/24"] {
+        let prefix = Prefix::from_str(prefix).unwrap();
+        let result = runner
+            .rib()
+            .match_prefix(&prefix, &match_options())
+            .unwrap();
+        assert!(!result.records.is_empty());
+        assert!(result
+            .records
+            .iter()
+            .all(|record| record.status == RouteStatus::Withdrawn));
+    }
+    assert_eq!(
+        ingresses
+            .cloned_info()
+            .values()
+            .filter(|info| {
+                info.ingress_type
+                    == Some(crate::ingress::IngressType::BgpPath)
+            })
+            .count(),
+        2
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mrt_multicast_records_create_no_routes_children_or_capabilities() {
+    use mrtgen::{generate, GeneratorConfig};
+
+    let corpus = generate(&GeneratorConfig {
+        include_skip: false,
+        include_combo: false,
+        include_attr_errors: false,
+        ..GeneratorConfig::default()
+    });
+    let mut table_dump = Vec::new();
+    for record in &corpus.manifest.records {
+        if record.kind == "peer_index_table"
+            || record.kind.contains("multicast")
+        {
+            let start = record.offset as usize;
+            let end = start + record.size as usize;
+            table_dump.extend_from_slice(&corpus.bytes[start..end]);
+        }
+    }
+
+    let mut bgp4mp = mrt_bgp4mp_v6_multicast_update(Some(9), true);
+    bgp4mp.extend(mrt_bgp4mp_v6_multicast_update(Some(9), false));
+    bgp4mp.extend(mrt_bgp4mp_v6_multicast_update(None, true));
+    let (runner, ingresses) =
+        ingest_mrt_byte_files(&[table_dump, bgp4mp]).await;
+
+    assert_eq!(
+        runner.rib().store().unwrap().prefixes_count().in_memory(),
+        0
+    );
+    let infos = ingresses.cloned_info();
+    assert!(!infos.values().any(|info| {
+        info.ingress_type == Some(crate::ingress::IngressType::BgpPath)
+    }));
+    assert!(!infos.values().any(|info| {
+        info.addpath_families.as_deref().is_some_and(|families| {
+            families.chunks_exact(4).any(|quad| quad[2] == 2)
+        })
+    }));
 }
 
 /// End-to-end FlowSpec via MRT: a mrtgen-generated BGP4MP file with diverse
@@ -443,9 +797,8 @@ async fn flowspec_validation_spans_addpath_child_muis() {
     );
 
     // Covering unicast route under the SESSION mui.
-    let ann =
-        Announcements::from_str("e [64500] 10.0.0.1 none 192.0.2.0/24")
-            .unwrap();
+    let ann = Announcements::from_str("e [64500] 10.0.0.1 none 192.0.2.0/24")
+        .unwrap();
     let bgp_update_bytes = mk_bgp_update(&Prefixes::default(), &ann, &[]);
     let update_msg = UpdateMessage::from_octets(
         bgp_update_bytes,
@@ -527,6 +880,258 @@ async fn unicast_api_exposes_addpath_session_path_and_internal_child() {
     assert_eq!(row["source"]["ingressId"], session);
     assert_eq!(row["source"]["pathId"], 77);
     assert_eq!(row["source"]["internalPathIngressId"], child);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unicast_api_filters_routes_by_ingress_type() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    // A locally terminated BGP session with one ADD-PATH child, ...
+    let bgp_session = register.register();
+    register.update_info(
+        bgp_session,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let bgp_child = register.register();
+    register.update_info(
+        bgp_child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(bgp_session)
+            .with_path_id(77u32),
+    );
+
+    // ... and a peer monitored through BMP, under its router.
+    let bmp_router = register.register();
+    register.update_info(
+        bmp_router,
+        IngressInfo::new().with_ingress_type(IngressType::Bmp),
+    );
+    let bmp_peer = register.register();
+    register.update_info(
+        bmp_peer,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpViaBmp)
+            .with_parent_ingress(bmp_router),
+    );
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    for ingress in [bgp_session, bgp_child, bmp_peer] {
+        rib.insert(&route, RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    }
+
+    let ingress_ids = |ingress_type: Option<IngressType>| {
+        let mut json = Vec::new();
+        rib.search_and_output_routes(
+            crate::representation::Json(&mut json),
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            super::QueryFilter {
+                ingress_type,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        let mut ids: Vec<u32> = json["data"]["routes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["ingress"]["id"].as_u64().unwrap() as u32)
+            .collect();
+        ids.sort();
+        ids
+    };
+
+    assert_eq!(
+        ingress_ids(None),
+        vec![bgp_session, bgp_child, bmp_peer],
+        "an unfiltered query still returns every origin"
+    );
+    assert_eq!(
+        ingress_ids(Some(IngressType::Bgp)),
+        vec![bgp_session, bgp_child],
+        "the session's ADD-PATH child counts as bgp, not as its own origin"
+    );
+    assert_eq!(
+        ingress_ids(Some(IngressType::Bmp)),
+        vec![bmp_peer],
+        "bmp reaches the peers under the monitored router"
+    );
+    assert_eq!(ingress_ids(Some(IngressType::BgpViaBmp)), vec![bmp_peer]);
+    assert_eq!(ingress_ids(Some(IngressType::BgpPath)), vec![bgp_child]);
+    assert!(ingress_ids(Some(IngressType::Mrt)).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_snapshots_only_the_ingresses_in_its_result() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let session = register.register();
+    register.update_info(
+        session,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let child = register.register();
+    register.update_info(
+        child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(77u32),
+    );
+
+    // A register far larger than any one query's result, as a collector's
+    // is: one entry per ADD-PATH (session, path_id).
+    for _ in 0..1_000 {
+        let bystander = register.register();
+        register.update_info(
+            bystander,
+            IngressInfo::new().with_ingress_type(IngressType::BgpViaBmp),
+        );
+    }
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    rib.insert(&route, RouteStatus::Active, 1, child, true, false)
+        .unwrap();
+
+    let result = rib
+        .search_routes(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            super::QueryFilter::default(),
+        )
+        .unwrap();
+
+    // The one record's mui and the session it resolves through -- not the
+    // thousand ingresses that have nothing to do with this prefix.
+    let mut ids: Vec<_> = result.ingress_info.keys().copied().collect();
+    ids.sort();
+    assert_eq!(ids, vec![session, child]);
+
+    // ... and the parent being there is the point: without it the record
+    // would report itself as its own source instead of the session's path.
+    let mut json = Vec::new();
+    rib.search_and_output_routes(
+        crate::representation::Json(&mut json),
+        AfiSafiType::Ipv4Unicast,
+        prefix,
+        super::QueryFilter::default(),
+    )
+    .unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    let row = &json["data"]["routes"][0];
+    assert_eq!(row["ingress"]["id"], child);
+    assert_eq!(row["source"]["ingressId"], session);
+    assert_eq!(row["source"]["pathId"], 77);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ingress_scoped_dump_matches_the_full_table_walk() {
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let peer_a = register.register();
+    register.update_info(
+        peer_a,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+    let peer_b = register.register();
+    register.update_info(
+        peer_b,
+        IngressInfo::new().with_ingress_type(IngressType::Bgp),
+    );
+
+    // A default route, a prefix both peers hold, and one each.
+    let insert = |prefix: &str, ingress| {
+        let prefix = inetnum::addr::Prefix::from_str(prefix).unwrap();
+        let route = RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        rib.insert(&route, RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    };
+    insert("0.0.0.0/0", peer_a);
+    insert("192.0.2.0/24", peer_a);
+    insert("198.51.100.0/24", peer_a);
+    insert("198.51.100.0/24", peer_b);
+    insert("203.0.113.0/24", peer_b);
+
+    let dump = |ingress_id| {
+        let mut out = Vec::new();
+        rib.write_jsonl_stream(
+            AfiSafiType::Ipv4Unicast,
+            inetnum::addr::Prefix::from_str("0.0.0.0/0").unwrap(),
+            super::QueryFilter {
+                ingress_id,
+                ..Default::default()
+            },
+            &mut out,
+        )
+        .unwrap_or_else(|_| panic!("jsonl dump for {ingress_id:?} failed"));
+        let mut lines: Vec<(String, u32)> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                let row: serde_json::Value =
+                    serde_json::from_str(line).unwrap();
+                (
+                    row["prefix"].as_str().unwrap().to_string(),
+                    row["ingress"]["id"].as_u64().unwrap() as u32,
+                )
+            })
+            .collect();
+        lines.sort();
+        lines
+    };
+
+    // The mui-indexed walk must return exactly what the full-table walk plus
+    // a post-filter would have returned -- the default route included, since
+    // it sits at the root the mui iterator starts from.
+    let full: Vec<(String, u32)> = dump(None);
+    for peer in [peer_a, peer_b] {
+        let expected: Vec<(String, u32)> =
+            full.iter().filter(|(_, id)| *id == peer).cloned().collect();
+        assert_eq!(dump(Some(peer)), expected, "ingress {peer}");
+        assert!(!expected.is_empty());
+    }
+
+    assert_eq!(
+        dump(Some(peer_a))
+            .iter()
+            .map(|(prefix, _)| prefix.as_str())
+            .collect::<Vec<_>>(),
+        vec!["0.0.0.0/0", "192.0.2.0/24", "198.51.100.0/24"]
+    );
+
+    // An ingress that holds nothing yields an empty dump, not the table.
+    let idle = register.register();
+    assert!(dump(Some(idle)).is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -665,8 +1270,11 @@ async fn process_update_same_route_twice() {
         1
     );
 
-    // And check that recorded metrics are correct
-    assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 0, 1, 1));
+    // And check that recorded metrics are correct. `announced` stays at 1:
+    // it counts announcements that brought a prefix in, and does not walk
+    // back down on withdrawal -- what the RIB holds now is `num_items`,
+    // read from the store. See `rib_counters_survive_withdrawal_churn`.
+    assert_eq!(query_metrics(&runner.status_reporter()), (1, 0, 1, 1, 1));
 }
 
 #[tokio::test]
@@ -1391,6 +1999,78 @@ async fn is_filtered(_runner: &RibUnitRunner, _update: Update) -> bool {
                 */
 }
 
+/// The RIB counters against a peer's normal churn.
+///
+/// The one that matters is `num_routes_announced`: it used to count prefixes
+/// on the way in and subtract *records* on the way out, so on any real feed
+/// it went below zero and, being unsigned, wrapped. A collector reported
+/// 18446744073709551615 - 342754275 after four days. Nothing here subtracts
+/// any more -- what the RIB currently holds is read from the store, which
+/// knows -- so the sequence below cannot produce that value however it is
+/// extended.
+#[tokio::test]
+async fn rib_counters_survive_withdrawal_churn() {
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let prefix = Prefix::from_str("127.0.0.1/32").unwrap();
+
+    let counters = || {
+        let m = get_testable_metrics_snapshot(
+            &runner.status_reporter().metrics().unwrap(),
+        );
+        (
+            m.with_name::<usize>("rib_unit_num_unique_prefixes"),
+            m.with_name::<usize>("rib_unit_num_items"),
+            m.with_name::<usize>("rib_unit_num_routes_announced"),
+            m.with_name::<usize>("rib_unit_num_routes_withdrawn"),
+            m.with_name::<usize>("rib_unit_num_modified_route_announcements"),
+        )
+    };
+    let apply = |as_path, ingress| {
+        runner.process_update(mk_route_update_with_ingress(
+            &prefix, as_path, ingress,
+        ))
+    };
+
+    assert_eq!(counters(), (0, 0, 0, 0, 0));
+
+    // One peer announces it: one prefix, one record.
+    apply(Some("[111]"), 1).await.unwrap();
+    assert_eq!(counters(), (1, 1, 1, 0, 0));
+
+    // A second peer announces the same prefix: still one prefix, but the
+    // store now holds two records, and no new prefix entered the RIB.
+    apply(Some("[222]"), 2).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 0, 1));
+
+    // A re-announcement with a different path -- BGP's implicit withdraw --
+    // replaces a record rather than adding one.
+    apply(Some("[333]"), 1).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 0, 2));
+
+    // Withdrawing counts a withdrawal and nothing else. The gauges keep
+    // reporting what the store holds, records included: the withdrawn one
+    // keeps its slot until it is compacted away.
+    apply(None, 1).await.unwrap();
+    assert_eq!(counters(), (1, 2, 1, 1, 2));
+
+    // Withdrawing again is where the old arithmetic wrapped.
+    apply(None, 1).await.unwrap();
+    let (_, _, announced, withdrawn, _) = counters();
+    assert_eq!(announced, 1, "announced must not go below zero");
+    assert_eq!(withdrawn, 2);
+
+    // A withdrawal for a prefix the RIB never held counts as neither.
+    runner
+        .process_update(mk_route_update_with_ingress(
+            &Prefix::from_str("10.9.9.0/24").unwrap(),
+            None,
+            1,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(counters(), (1, 2, 1, 2, 2));
+}
+
 fn query_metrics(
     status_reporter: &Arc<RibUnitStatusReporter>,
 ) -> (usize, usize, usize, usize, usize) {
@@ -1732,12 +2412,9 @@ async fn gc_reclaims_path_children_then_session() {
     let rib = runner.rib();
     let reg = &rib.ingress_register;
 
-    let mk = |typ: IngressType,
-              state: IngressState,
-              parent: Option<u32>| {
-        let mut info = IngressInfo::new()
-            .with_ingress_type(typ)
-            .with_state(state);
+    let mk = |typ: IngressType, state: IngressState, parent: Option<u32>| {
+        let mut info =
+            IngressInfo::new().with_ingress_type(typ).with_state(state);
         if let Some(parent) = parent {
             info = info.with_parent_ingress(parent);
         }
@@ -1828,4 +2505,266 @@ async fn gc_spares_router_that_reconnected_since_snapshot() {
         reg.get(10).is_some(),
         "reconnected (Connected) router was reclaimed"
     );
+}
+
+//------------ Adj-RIB-In gauge ----------------------------------------------
+
+/// `show ip bgp summary`'s prefix count is a gauge of what the peer currently
+/// has in the RIB, so it must survive BGP's implicit withdraw: a
+/// re-advertisement of a prefix the peer already announced arrives as a plain
+/// announcement with no matching UNREACH. Counting NLRIs as they arrived made
+/// a full-view peer report several times its real table size after a few
+/// hours of churn.
+mod adj_rib_in_gauge {
+    use super::*;
+    use crate::ingress::peer_stats;
+
+    /// Register a native-BGP-style stats entry, which is what makes the RIB
+    /// maintain a gauge for this mui at all. Ids are per-test so the
+    /// process-wide registry can't leak state between them.
+    fn peer(
+        ingress_id: crate::ingress::IngressId,
+    ) -> Arc<peer_stats::BgpPeerStats> {
+        let reg = peer_stats::registry();
+        reg.remove(ingress_id);
+        reg.get_or_create(ingress_id)
+    }
+
+    fn v4(prefix: &str) -> Prefix {
+        Prefix::from_str(prefix).unwrap()
+    }
+
+    #[tokio::test]
+    async fn readvertisement_does_not_inflate_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9001);
+        let prefix = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111,222]"),
+                9001,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        // Same prefix, different AS path: an implicit withdraw. The RIB
+        // replaces the record, so the peer still holds exactly one prefix.
+        for _ in 0..5 {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &prefix,
+                    Some("[111,333]"),
+                    9001,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.adj_rib_in_routes, 1,
+            "gauge grew with churn instead of tracking table size"
+        );
+        // The churn itself stays visible, just not as table size.
+        assert_eq!(snap.dup_prefix_advertisements, 5);
+        assert_eq!(snap.adj_rib_in_per_afi_safi, vec![((1, 1), 1)]);
+    }
+
+    #[tokio::test]
+    async fn distinct_prefixes_each_count_once() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9002);
+
+        for p in ["192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &v4(p),
+                    Some("[111]"),
+                    9002,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 3);
+        assert_eq!(snap.dup_prefix_advertisements, 0);
+    }
+
+    #[tokio::test]
+    async fn withdraw_decrements_once_and_only_for_held_prefixes() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9003);
+        let held = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &held,
+                Some("[111]"),
+                9003,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        // A withdrawal for a prefix this peer never announced must not
+        // move the gauge (and must not underflow it).
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("198.51.100.0/24"),
+                None,
+                9003,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 1);
+
+        runner
+            .process_update(mk_route_update_with_ingress(&held, None, 9003))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+
+        // Repeating the withdrawal is a no-op, not a second decrement.
+        runner
+            .process_update(mk_route_update_with_ingress(&held, None, 9003))
+            .await
+            .unwrap();
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+    }
+
+    #[tokio::test]
+    async fn reannounce_after_withdraw_counts_again() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9004);
+        let prefix = v4("192.0.2.0/24");
+
+        for as_path in [Some("[111]"), None, Some("[111]")] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &prefix, as_path, 9004,
+                ))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            stats.snapshot().adj_rib_in_routes,
+            1,
+            "a flapping prefix must be counted again once it is back"
+        );
+    }
+
+    #[tokio::test]
+    async fn peer_down_zeroes_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9005);
+
+        for p in ["192.0.2.0/24", "198.51.100.0/24"] {
+            runner
+                .process_update(mk_route_update_with_ingress(
+                    &v4(p),
+                    Some("[111]"),
+                    9005,
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 2);
+
+        runner.rib().withdraw_for_ingress(9005, None, true);
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 0);
+        assert!(snap.adj_rib_in_per_afi_safi.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reconnect_after_peer_down_rebuilds_the_gauge() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9006);
+        let prefix = v4("192.0.2.0/24");
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111]"),
+                9006,
+            ))
+            .await
+            .unwrap();
+        // Retain attributes: the record survives peer-down with its Active
+        // status intact and only the store-wide withdrawn bit set.
+        runner.rib().withdraw_for_ingress(9006, None, true);
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &prefix,
+                Some("[111]"),
+                9006,
+            ))
+            .await
+            .unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(
+            snap.adj_rib_in_routes, 1,
+            "re-announce after peer-down was mistaken for a duplicate"
+        );
+        assert_eq!(snap.dup_prefix_advertisements, 0);
+    }
+
+    #[tokio::test]
+    async fn families_are_counted_separately() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9007);
+
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("192.0.2.0/24"),
+                Some("[111]"),
+                9007,
+            ))
+            .await
+            .unwrap();
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &Prefix::from_str("2001:db8::/32").unwrap(),
+                Some("[111]"),
+                9007,
+            ))
+            .await
+            .unwrap();
+
+        let snap = stats.snapshot();
+        assert_eq!(snap.adj_rib_in_routes, 2);
+        let by_key: std::collections::HashMap<_, _> =
+            snap.adj_rib_in_per_afi_safi.iter().cloned().collect();
+        assert_eq!(by_key[&(1u16, 1u8)], 1);
+        assert_eq!(by_key[&(2u16, 1u8)], 1);
+    }
+
+    #[tokio::test]
+    async fn peers_without_stats_entries_are_untouched() {
+        let (runner, _) = RibUnitRunner::mock("").unwrap();
+        let stats = peer(9008);
+
+        // A BMP-observed peer has no registry entry; its routes must not
+        // land on someone else's gauge.
+        runner
+            .process_update(mk_route_update_with_ingress(
+                &v4("192.0.2.0/24"),
+                Some("[111]"),
+                9009,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.snapshot().adj_rib_in_routes, 0);
+        assert!(peer_stats::registry().get(9009).is_none());
+    }
 }

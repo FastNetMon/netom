@@ -1,0 +1,4 @@
+{"meta":null,"data":{"nlri":"10.0.0.0/24","routes":[
+{"status":"active","ingress":{"id":4,"ingress_type":"bgpPath","parent_ingress":3,"path_id":1},"rpki":{"rov":"notChecked"},"pathAttributes":[{"origin":"Igp"},{"asPath":["AS65001"]},{"conventionalNextHop":"192.0.2.1"}]},
+{"status":"active","ingress":{"id":5,"ingress_type":"bgpPath","parent_ingress":3,"path_id":2},"rpki":{"rov":"notChecked"},"pathAttributes":[{"origin":"Igp"},{"asPath":["AS65001","AS65010"]},{"conventionalNextHop":"192.0.2.2"}]}
+]},"included":{}}

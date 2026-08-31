@@ -1,0 +1,28 @@
+# Builds the netom .deb against a prebuilt toolchain image (pkg/Dockerfile.base).
+# The base carries rustup + cargo-deb, so nothing here recompiles the tooling.
+ARG BASE_IMAGE=netom-build-base:ubuntu-24-04
+FROM ${BASE_IMAGE} AS builder
+
+ARG DEB_VARIANT
+ARG NETOM_VERSION
+
+WORKDIR /build
+COPY . .
+
+# The registry and target dirs are BuildKit cache mounts, so dependency
+# compilation carries over between builds even though COPY invalidates the
+# layer. Everything that reads back out of target/ has to stay in this same
+# RUN -- the mount is gone once it exits, which is why /out is populated here.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,target=/build/target,sharing=locked \
+    mkdir -p target/debian \
+    && printf 'netom (%s) unstable; urgency=medium\n\n  * Release %s\n\n -- Package Builder <builder@localhost>  %s\n' \
+        "${NETOM_VERSION}" "${NETOM_VERSION}" "$(date -R)" \
+        > target/debian/changelog \
+    && if [ -n "${DEB_VARIANT}" ]; then \
+        cargo deb --variant "${DEB_VARIANT}"; \
+    else \
+        cargo deb; \
+    fi \
+    && mkdir /out \
+    && cp target/debian/*.deb /out/

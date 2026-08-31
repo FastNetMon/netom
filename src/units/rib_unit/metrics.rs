@@ -1,7 +1,7 @@
 use std::{
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering::SeqCst},
-        Arc,
+        Arc, OnceLock, Weak,
     },
     time::{Duration, Instant},
 };
@@ -18,13 +18,21 @@ use crate::{
     payload::RouterId,
 };
 
-use super::statistics::RibMergeUpdateStatistics;
+use super::{rib::Rib, statistics::RibMergeUpdateStatistics};
 
 #[derive(Debug, Default)]
 pub struct RibUnitMetrics {
     gate: Arc<GateMetrics>,
-    pub num_unique_prefixes: AtomicUsize,
-    pub num_items: AtomicUsize,
+    /// The RIB, for the gauges that are read from the store at scrape time
+    /// rather than accumulated: how many prefixes and records it holds is
+    /// something the store already knows exactly, and a counter maintained
+    /// alongside it can only drift -- as `num_routes_announced` did, all the
+    /// way past zero and around.
+    ///
+    /// Weak so that metrics never keep a replaced RIB alive across a
+    /// reconfigure; unset in tests that build no RIB, where both gauges read
+    /// zero.
+    rib: OnceLock<Weak<ArcSwap<Rib>>>,
     pub num_insert_retries: AtomicUsize,
     pub num_insert_hard_failures: AtomicUsize,
     pub num_routes_announced: AtomicUsize,
@@ -42,6 +50,22 @@ pub struct RibUnitMetrics {
 }
 
 impl RibUnitMetrics {
+    /// Point the store-sourced gauges at the RIB. Called once, after both
+    /// exist.
+    pub fn set_rib(&self, rib: &Arc<ArcSwap<Rib>>) {
+        let _ = self.rib.set(Arc::downgrade(rib));
+    }
+
+    /// Prefixes and records currently in the store, across every family.
+    /// `None` when there is no RIB to ask.
+    fn store_totals(&self) -> Option<(usize, usize)> {
+        let rib = self.rib.get()?.upgrade()?;
+        let counts = rib.load().store_counts();
+        Some(counts.iter().fold((0, 0), |(prefixes, routes), c| {
+            (prefixes + c.prefixes, routes + c.routes)
+        }))
+    }
+
     pub fn router_metrics(
         &self,
         //router_id: Arc<RouterId>,
@@ -75,13 +99,13 @@ impl Default for RouterMetrics {
 impl RibUnitMetrics {
     const NUM_UNIQUE_PREFIXES_METRIC: Metric = Metric::new(
         "rib_unit_num_unique_prefixes",
-        "the number of unique prefixes seen by the rib",
-        MetricType::Counter,
+        "the number of unique prefixes currently in the rib",
+        MetricType::Gauge,
         MetricUnit::Total,
     );
     const NUM_ITEMS_METRIC: Metric = Metric::new(
         "rib_unit_num_items",
-        "the total number of items (e.g. routes) stored (withdrawn or not) in the rib",
+        "the total number of records -- one per prefix and ingress -- stored (withdrawn or not) in the rib",
         MetricType::Gauge,
         MetricUnit::Total,
     );
@@ -99,19 +123,19 @@ impl RibUnitMetrics {
     );
     const NUM_ROUTES_ANNOUNCED_METRIC: Metric = Metric::new(
         "rib_unit_num_routes_announced",
-        "the number of announced routes stored in the rib",
+        "announcements that brought a new prefix into the rib (see rib_unit_num_items for what it currently holds)",
         MetricType::Counter,
         MetricUnit::Total,
     );
     const NUM_MODIFIED_ROUTE_ANNOUNCEMENTS_METRIC: Metric = Metric::new(
         "rib_unit_num_modified_route_announcements",
-        "the number of modified route announcements processed",
+        "announcements for a prefix the rib already held: another peer's path, or a re-announcement of one it had",
         MetricType::Counter,
         MetricUnit::Total,
     );
     const NUM_ROUTES_WITHDRAWN_METRIC: Metric = Metric::new(
         "rib_unit_num_routes_withdrawn",
-        "the number of withdrawn routes stored in the rib",
+        "withdrawals applied to a route the rib held (see rib_unit_num_items for what it currently holds)",
         MetricType::Counter,
         MetricUnit::Total,
     );
@@ -158,15 +182,16 @@ impl metrics::Source for RibUnitMetrics {
     fn append(&self, unit_name: &str, target: &mut metrics::Target) {
         self.gate.append(unit_name, target);
 
+        let (prefixes, routes) = self.store_totals().unwrap_or((0, 0));
         target.append_simple(
             &Self::NUM_UNIQUE_PREFIXES_METRIC,
             Some(unit_name),
-            self.num_unique_prefixes.load(SeqCst),
+            prefixes,
         );
         target.append_simple(
             &Self::NUM_ITEMS_METRIC,
             Some(unit_name),
-            self.num_items.load(SeqCst),
+            routes,
         );
         target.append_simple(
             &Self::NUM_INSERT_RETRIES_METRIC,

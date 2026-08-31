@@ -27,6 +27,51 @@ Released yyyy-mm-dd.
 
 ### New
 
+* `netom-cli`, a read-only operational CLI speaking router-style commands
+  over the HTTP API: `show ip bgp summary`, `show ip bgp neighbors [<ip>]`,
+  `show ip bgp [<prefix>]`, `show bmp routers`, `show bmp router <id>`,
+  `show ingresses`, `show version`, `show status`, `show running-config` and
+  `show filters`, for IPv4 and IPv6, unicast and FlowSpec. Keywords may be
+  abbreviated to any unambiguous prefix (`sh ip b sum`); `help` lists every
+  command, and `?` lists the keywords that may follow, marking a line that
+  is already runnable with `<cr>`. Runs one-shot, from repeated `-e` flags, from
+  piped stdin, or at an interactive `netom>` prompt with history and
+  tab-completion. `--json` emits the raw API response, and Cisco-style
+  `| include`/`| exclude`/`| begin`/`| count` filters are supported. The
+  endpoint comes from `--url`, `$NETOM_URL`, a config file's `http_listen`,
+  or `http://127.0.0.1:8080`, with wildcard listen addresses rewritten to
+  loopback. See `netom-cli(1)`.
+
+* New read-only HTTP API endpoints backing the CLI: `/api/v1/status`
+  (version, uptime, configured units and targets, RIB sizes, memory),
+  `/api/v1/config` (the running configuration as TOML, with BGP TCP-MD5
+  keys and MQTT passwords redacted), `/api/v1/filters` (Roto script and
+  entrypoints), and `/api/v1/bgp/neighbors[/{addr}]`.
+
+* Per-peer BGP session status. `/api/v1/bgp/neighbors` reports the RFC 4271
+  FSM state (Idle, Connect, Active, OpenSent, OpenConfirm, Established) for
+  `bgp-tcp-in` peers, alongside session uptime, UPDATE and NOTIFICATION
+  counts, prefix counts, and the last error. Configured peers that have
+  never established are now reported too — previously they had no ingress
+  entry and so appeared nowhere. Peers observed through BMP are included in
+  the same response, carrying the monitored router they were seen through.
+
+* Native BGP sessions now record `session_up_time` in the ingress register.
+  Besides giving those peers an uptime, this fixes the per-peer header of
+  the Peer Up that `bmp-tcp-out` synthesizes for restreamed native
+  sessions, which previously carried a zero timestamp.
+
+* Active mode for `bgp-tcp-in` peers: set `connect = true` on a peer to have
+  netom initiate the TCP connection instead of only waiting for the peer to
+  connect to the listener, for peers that will not accept us as a passive
+  neighbour. Optional `remote_port` (default 179), `source_addr`, and
+  `connect_retry_secs` (default 30) tune the outbound connection; `md5_key`
+  works in this direction too, installed on the socket before connecting.
+  Requires a peer keyed on an exact address; the listener stays active for
+  these peers as well, so whichever side connects first wins. New metrics:
+  `bgp_tcp_in_connection_initiated_count` and
+  `bgp_tcp_in_connect_error_count`. See `docs/bgp-active-mode.md`.
+
 * ADD-PATH (RFC 7911) support. Routes from ADD-PATH sessions (BMP-monitored
   and direct BGP) are no longer dropped: each `(session, path_id)` is stored
   under its own path-child ingress (`bgpPath` in the `/ingresses` output,
@@ -46,6 +91,22 @@ Released yyyy-mm-dd.
 
 ### Bug fixes
 
+* The per-peer prefix count — `State/PfxRcd` in `netom-cli show ip bgp
+  summary`, `prefixesReceived` in the HTTP API, and the Adj-RIB-In gauges
+  (RFC 7854 §4.8 stat types 7 and 9) in synthesized BMP Statistics
+  Reports — counted every accepted NLRI instead of tracking the size of
+  the peer's Adj-RIB-In. BGP's implicit withdraw re-advertises a prefix
+  that is already in the RIB as a plain announcement, with no matching
+  UNREACH to balance it, so the value climbed with churn and never
+  converged: a full-view peer read roughly 3.4M prefixes after six hours
+  on a table of about 1M.
+
+  The gauge is now maintained by the RIB, which moves it only on a real
+  transition of a `(prefix, peer)` into or out of the store. Announcements
+  that replace an existing route are counted as
+  `dupPrefixAdvertisements` (stat type 1) instead, which was previously
+  always zero — that counter is what makes the churn visible now that it
+  no longer distorts the table size.
 
 ### Other changes
 

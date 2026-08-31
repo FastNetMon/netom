@@ -97,10 +97,9 @@ async fn resolve_emit_target(
         return target;
     }
     let target = match ingress_register.get(ingress_id) {
-        Some(info) if info.ingress_type == Some(IngressType::BgpPath) => (
-            info.parent_ingress.unwrap_or(ingress_id),
-            info.path_id,
-        ),
+        Some(info) if info.ingress_type == Some(IngressType::BgpPath) => {
+            (info.parent_ingress.unwrap_or(ingress_id), info.path_id)
+        }
         Some(_) => (ingress_id, None),
         None => return (ingress_id, None),
     };
@@ -310,8 +309,7 @@ pub async fn perform_initial_dump(
                                     == Some(IngressType::BgpPath) =>
                             {
                                 (
-                                    info.parent_ingress
-                                        .unwrap_or(record_mui),
+                                    info.parent_ingress.unwrap_or(record_mui),
                                     info.path_id,
                                 )
                             }
@@ -364,9 +362,9 @@ pub async fn perform_initial_dump(
                 }
                 let pamap = &route_record.meta;
                 *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
-                if !aggregator.add(
-                    ingress_id, path_id, prefix, pamap, &mut sink,
-                ) {
+                if !aggregator
+                    .add(ingress_id, path_id, prefix, pamap, &mut sink)
+                {
                     // Consumer dropped (client disconnected). Bail out of the
                     // iteration so the walk stops promptly.
                     client_gone = true;
@@ -391,30 +389,29 @@ pub async fn perform_initial_dump(
                     // unicast walk above: rules under ADD-PATH path-children
                     // emit under their parent session's per-peer header with
                     // the path id re-attached to the NLRI.
-                    let (ingress_id, path_id) = match emit_targets
-                        .get(&record_mui)
-                    {
-                        Some(t) => *t,
-                        None => {
-                            let t = match ingress_register_for_walk
-                                .get(record_mui)
-                            {
-                                Some(info)
-                                    if info.ingress_type
-                                        == Some(IngressType::BgpPath) =>
+                    let (ingress_id, path_id) =
+                        match emit_targets.get(&record_mui) {
+                            Some(t) => *t,
+                            None => {
+                                let t = match ingress_register_for_walk
+                                    .get(record_mui)
                                 {
-                                    (
-                                        info.parent_ingress
-                                            .unwrap_or(record_mui),
-                                        info.path_id,
-                                    )
-                                }
-                                _ => (record_mui, None),
-                            };
-                            emit_targets.insert(record_mui, t);
-                            t
-                        }
-                    };
+                                    Some(info)
+                                        if info.ingress_type
+                                            == Some(IngressType::BgpPath) =>
+                                    {
+                                        (
+                                            info.parent_ingress
+                                                .unwrap_or(record_mui),
+                                            info.path_id,
+                                        )
+                                    }
+                                    _ => (record_mui, None),
+                                };
+                                emit_targets.insert(record_mui, t);
+                                t
+                            }
+                        };
                     let mut sink = |msg: Vec<u8>, n: usize| {
                         msg_tx.blocking_send((msg, n)).is_ok()
                     };
@@ -457,9 +454,8 @@ pub async fn perform_initial_dump(
                     }
                     let is_v4 = key_prefix.is_v4();
                     for rule in record.meta.iter() {
-                        *routes_per_ingress
-                            .entry(ingress_id)
-                            .or_insert(0) += 1;
+                        *routes_per_ingress.entry(ingress_id).or_insert(0) +=
+                            1;
                         if !aggregator.add_flowspec(
                             ingress_id,
                             path_id,
@@ -1015,12 +1011,9 @@ async fn send_payload_to_client(
     // header, with their path id re-attached to the NLRI. Everything below
     // (known_peers, PeerInfo cache, lazy Peer Up) keys on the emit id, so
     // sibling paths share one downstream peer.
-    let (ingress_id, path_id) = resolve_emit_target(
-        client,
-        ingress_register,
-        payload.ingress_id,
-    )
-    .await;
+    let (ingress_id, path_id) =
+        resolve_emit_target(client, ingress_register, payload.ingress_id)
+            .await;
 
     // Fast path: PeerInfo is constant per peer for the session, so once it is
     // cached (Peer Up already sent, header already built) every subsequent
@@ -1223,8 +1216,7 @@ mod tests {
                 let withdrawn_len =
                     u16::from_be_bytes([bgp[19], bgp[20]]) as usize;
                 let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
-                let has_nlri =
-                    bgp.len() > 23 + withdrawn_len + pa_len;
+                let has_nlri = bgp.len() > 23 + withdrawn_len + pa_len;
                 if withdrawn_len == 0 && pa_len == 0 {
                     return if has_nlri {
                         MsgKind::Route(1, 1)
@@ -1233,7 +1225,8 @@ mod tests {
                     };
                 }
                 // Walk attributes for MP_REACH (14) / MP_UNREACH (15).
-                let pas = &bgp[23 + withdrawn_len..23 + withdrawn_len + pa_len];
+                let pas =
+                    &bgp[23 + withdrawn_len..23 + withdrawn_len + pa_len];
                 let mut pos = 0;
                 while pos + 2 < pas.len() {
                     let flags = pas[pos];
@@ -1307,8 +1300,7 @@ mod tests {
 
         let register: Arc<register::Register> = Default::default();
         let ctx = Arc::new(Mutex::new(Ctx::empty()));
-        let rib =
-            Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
+        let rib = Arc::new(Rib::new(register.clone(), None, ctx).unwrap());
 
         // Peer 1: unicast + flowspec. Peer 2: flowspec-only.
         let peer1 = register.register();
@@ -1350,10 +1342,8 @@ mod tests {
         ));
         let gate = crate::comms::Gate::default();
         let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
-        let status_reporter = Arc::new(BmpTcpOutStatusReporter::new(
-            "test",
-            metrics.clone(),
-        ));
+        let status_reporter =
+            Arc::new(BmpTcpOutStatusReporter::new("test", metrics.clone()));
 
         let ok = perform_initial_dump(
             &client,
@@ -1378,8 +1368,7 @@ mod tests {
                 // Extract the MP_REACH NLRI: value[5..] after afi(2),
                 // safi(1), nh_len(1)=0, reserved(1).
                 let bgp = &msg[48..];
-                let pa_len =
-                    u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
+                let pa_len = u16::from_be_bytes([bgp[21], bgp[22]]) as usize;
                 let pas = &bgp[23..23 + pa_len];
                 let mut pos = 0;
                 while pos + 2 < pas.len() {
@@ -1387,10 +1376,8 @@ mod tests {
                     let type_code = pas[pos + 1];
                     let (attr_len, header_len) = if flags & 0x10 != 0 {
                         (
-                            u16::from_be_bytes([
-                                pas[pos + 2],
-                                pas[pos + 3],
-                            ]) as usize,
+                            u16::from_be_bytes([pas[pos + 2], pas[pos + 3]])
+                                as usize,
                             4,
                         )
                     } else {
@@ -1434,8 +1421,10 @@ mod tests {
             .position(|k| matches!(k, MsgKind::Eor(..)))
             .unwrap();
         assert!(last_route < first_eor);
-        let last_unicast_route =
-            kinds.iter().rposition(|k| *k == MsgKind::Route(1, 1)).unwrap();
+        let last_unicast_route = kinds
+            .iter()
+            .rposition(|k| *k == MsgKind::Route(1, 1))
+            .unwrap();
         let first_fs_route = kinds
             .iter()
             .position(|k| *k == MsgKind::Route(1, 133))
@@ -1450,10 +1439,7 @@ mod tests {
             })
             .collect();
         assert_eq!(eors.len(), 4);
-        assert_eq!(
-            eors.iter().filter(|(_, safi)| *safi == 133).count(),
-            2
-        );
+        assert_eq!(eors.iter().filter(|(_, safi)| *safi == 133).count(), 2);
     }
 
     /// Full dump with an ADD-PATH session (two path-children holding one
@@ -1498,9 +1484,7 @@ mod tests {
                     .with_parent_ingress(session)
                     .with_path_id(path_id)
                     .with_state(IngressState::Connected)
-                    .with_remote_addr(
-                        "10.9.9.1".parse::<IpAddr>().unwrap(),
-                    )
+                    .with_remote_addr("10.9.9.1".parse::<IpAddr>().unwrap())
                     .with_remote_asn(Asn::from_u32(65001)),
             );
             children.push(child);
@@ -1586,9 +1570,7 @@ mod tests {
             let kind = classify(&msg);
             if kind == MsgKind::PeerUp {
                 peer_up_cap69_counts.push(
-                    msg.windows(cap69.len())
-                        .filter(|w| *w == cap69)
-                        .count(),
+                    msg.windows(cap69.len()).filter(|w| *w == cap69).count(),
                 );
             }
             if kind == MsgKind::Route(1, 1) {
@@ -1617,9 +1599,8 @@ mod tests {
                 if let Some(anns) = parsed_addpath {
                     for n in anns {
                         if let Nlri::Ipv4UnicastAddpath(a) = n {
-                            addpath_pids.extend(
-                                IsPrefix::path_id(&a).map(|p| p.0),
-                            );
+                            addpath_pids
+                                .extend(IsPrefix::path_id(&a).map(|p| p.0));
                         }
                     }
                 } else {
@@ -1665,6 +1646,232 @@ mod tests {
             .position(|k| matches!(k, MsgKind::Eor(..)))
             .unwrap();
         assert!(last_route < first_eor);
+    }
+
+    /// Preflight must discover ADD-PATH in a later file before the first
+    /// route from an earlier file can cause bmp-out to synthesize Peer Up.
+    /// The resulting Peer Up and UPDATEs must agree on IPv6 ADD-PATH.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mrt_preflight_keeps_peer_up_and_update_addpath_in_sync() {
+        use crate::comms::{DirectLink, Gate};
+        use crate::units::mrt_file_in::unit::{MrtImportState, MrtInRunner};
+        use crate::units::rib_unit::unit::RibUnitRunner;
+        use bytes::Bytes;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        use routecore::bgp::nlri::afisafi::{IsPrefix, Nlri};
+
+        fn bgp_update(attrs: &[u8], nlri: &[u8]) -> Vec<u8> {
+            let len = 19 + 2 + 2 + attrs.len() + nlri.len();
+            let mut bgp = vec![0xff; 16];
+            bgp.extend_from_slice(&(len as u16).to_be_bytes());
+            bgp.push(2);
+            bgp.extend_from_slice(&0u16.to_be_bytes());
+            bgp.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+            bgp.extend_from_slice(attrs);
+            bgp.extend_from_slice(nlri);
+            bgp
+        }
+
+        fn mrt_record(bgp: &[u8], addpath: bool) -> Vec<u8> {
+            let peer =
+                [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+            let local =
+                [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+            let mut body = Vec::new();
+            body.extend_from_slice(&64500u32.to_be_bytes());
+            body.extend_from_slice(&64496u32.to_be_bytes());
+            body.extend_from_slice(&0u16.to_be_bytes());
+            body.extend_from_slice(&2u16.to_be_bytes());
+            body.extend_from_slice(&peer);
+            body.extend_from_slice(&local);
+            body.extend_from_slice(bgp);
+
+            let mut record = Vec::new();
+            record.extend_from_slice(&1_700_000_000u32.to_be_bytes());
+            record.extend_from_slice(&16u16.to_be_bytes());
+            record.extend_from_slice(
+                &(if addpath { 9u16 } else { 4u16 }).to_be_bytes(),
+            );
+            record.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            record.extend_from_slice(&body);
+            record
+        }
+
+        let common_attrs = [
+            0x40, 1, 1, 0, // ORIGIN IGP
+            0x40, 2, 6, 2, 1, 0, 0, 0xfc, 0x00, // AS_PATH 64512
+        ];
+        let mut v4_attrs = common_attrs.to_vec();
+        v4_attrs.extend_from_slice(&[0x40, 3, 4, 192, 0, 2, 1]);
+        let first =
+            mrt_record(&bgp_update(&v4_attrs, &[24, 198, 51, 100]), false);
+
+        let mut mp_value = vec![0, 2, 1, 16];
+        mp_value.extend_from_slice(&[
+            0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ]);
+        mp_value.push(0);
+        mp_value.extend_from_slice(&4242u32.to_be_bytes());
+        mp_value.extend_from_slice(&[48, 0x20, 0x01, 0x0d, 0xb8, 1, 0]);
+        let mut v6_attrs = common_attrs.to_vec();
+        v6_attrs.extend_from_slice(&[0x80, 14, mp_value.len() as u8]);
+        v6_attrs.extend_from_slice(&mp_value);
+        let second = mrt_record(&bgp_update(&v6_attrs, &[]), true);
+
+        let seq = std::sync::atomic::AtomicUsize::new(0);
+        let paths: Vec<_> = [first, second]
+            .into_iter()
+            .map(|bytes| {
+                let path = std::env::temp_dir().join(format!(
+                    "netom-mrt-preflight-wire-{}-{}.mrt",
+                    std::process::id(),
+                    seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                ));
+                std::fs::write(&path, bytes).unwrap();
+                path
+            })
+            .collect();
+
+        let register: Arc<register::Register> = Default::default();
+        let parent_id = register.register();
+        let mut import_state = MrtImportState::default();
+        for path in &paths {
+            import_state.preflight_file(path).unwrap();
+        }
+
+        let (mrt_gate, mut mrt_gate_agent) = Gate::new(0);
+        let update_gate = mrt_gate.clone();
+        let gate_task =
+            tokio::spawn(
+                async move { while mrt_gate.process().await.is_ok() {} },
+            );
+        let (rib_runner, _rib_agent) = RibUnitRunner::mock("").unwrap();
+        let rib_runner = Arc::new(rib_runner);
+        let mut link: DirectLink = mrt_gate_agent.create_link().into();
+        link.connect(rib_runner.clone(), false).await.unwrap();
+
+        MrtInRunner::process_file(
+            update_gate.clone(),
+            register.clone(),
+            parent_id,
+            paths[0].clone(),
+            &mut import_state,
+        )
+        .await
+        .unwrap();
+
+        let peer_info = register
+            .cloned_info()
+            .into_values()
+            .find(|info| info.ingress_type == Some(IngressType::Mrt))
+            .expect("first file must register the MRT peer");
+        assert_eq!(peer_info.addpath_families, Some(vec![0, 2, 1, 3]));
+        let early_peer_up = bmp_builder::build_peer_up(
+            &bmp_builder::PeerInfo::from_ingress_info(&peer_info),
+            false,
+        );
+        let v6_cap69 = [69u8, 4, 0, 2, 1, 3];
+        assert_eq!(
+            early_peer_up
+                .windows(v6_cap69.len())
+                .filter(|window| *window == v6_cap69)
+                .count(),
+            2,
+            "the first possible Peer Up must already advertise later-file IPv6 ADD-PATH"
+        );
+
+        MrtInRunner::process_file(
+            update_gate,
+            register.clone(),
+            parent_id,
+            paths[1].clone(),
+            &mut import_state,
+        )
+        .await
+        .unwrap();
+        gate_task.abort();
+        for path in paths {
+            let _ = std::fs::remove_file(path);
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+        let client = Arc::new(ClientState::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+            10_000,
+            10 * 1024 * 1024,
+        ));
+        let gate = Gate::default();
+        let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
+        let status_reporter =
+            Arc::new(BmpTcpOutStatusReporter::new("test", metrics.clone()));
+        assert!(
+            perform_initial_dump(
+                &client,
+                &rib_runner.rib(),
+                &register,
+                "test-sys",
+                "test-descr",
+                false,
+                FanInPeerDistinguisher::Off,
+                &metrics,
+                &status_reporter,
+            )
+            .await
+        );
+        drop(client);
+
+        let mut config = SessionConfig::modern();
+        config.add_addpath_rxtx(AfiSafiType::Ipv6Unicast);
+        let mut peer_ups = 0;
+        let mut saw_plain_v4 = false;
+        let mut v6_path_ids = Vec::new();
+        while let Ok(message) = rx.try_recv() {
+            match classify(&message) {
+                MsgKind::PeerUp => {
+                    peer_ups += 1;
+                    assert_eq!(
+                        message
+                            .windows(v6_cap69.len())
+                            .filter(|window| *window == v6_cap69)
+                            .count(),
+                        2
+                    );
+                }
+                MsgKind::Route(1, 1) => {
+                    let update = UpdateMessage::from_octets(
+                        Bytes::copy_from_slice(&message[48..]),
+                        &config,
+                    )
+                    .expect("plain IPv4 UPDATE must parse with only IPv6 ADD-PATH enabled");
+                    saw_plain_v4 = update
+                        .announcements()
+                        .unwrap()
+                        .any(|nlri| matches!(nlri, Ok(Nlri::Ipv4Unicast(_))));
+                }
+                MsgKind::Route(2, 1) => {
+                    let update = UpdateMessage::from_octets(
+                        Bytes::copy_from_slice(&message[48..]),
+                        &config,
+                    )
+                    .expect(
+                        "IPv6 ADD-PATH UPDATE must match Peer Up negotiation",
+                    );
+                    for nlri in update.announcements().unwrap() {
+                        if let Nlri::Ipv6UnicastAddpath(nlri) = nlri.unwrap()
+                        {
+                            v6_path_ids.extend(
+                                IsPrefix::path_id(&nlri).map(|id| id.0),
+                            );
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(peer_ups, 1);
+        assert!(saw_plain_v4);
+        assert_eq!(v6_path_ids, vec![4242]);
     }
 
     /// Build the same peer (same peer_ip, peer_asn) attributed to two

@@ -96,6 +96,162 @@ pub type QueueEntry = (
     Option<oneshot::Sender<Result<String, String>>>,
 );
 
+/// State owned by one `mrt-file-in` unit and shared by all of its files.
+#[derive(Default)]
+pub(crate) struct MrtImportState {
+    path_children: HashMap<(IngressId, u32), IngressId>,
+    addpath_families:
+        HashMap<(std::net::IpAddr, inetnum::asn::Asn), Vec<AfiSafiType>>,
+}
+
+impl MrtImportState {
+    fn path_child(
+        &self,
+        parent: IngressId,
+        path_id: u32,
+    ) -> Option<IngressId> {
+        self.path_children.get(&(parent, path_id)).copied()
+    }
+
+    fn path_children(
+        &self,
+        parent: IngressId,
+    ) -> impl Iterator<Item = IngressId> + '_ {
+        self.path_children.iter().filter_map(
+            move |(&(candidate, _), &child)| {
+                (candidate == parent).then_some(child)
+            },
+        )
+    }
+
+    fn note_addpath_family(
+        &mut self,
+        peer: (std::net::IpAddr, inetnum::asn::Asn),
+        afisafi: AfiSafiType,
+    ) {
+        if !is_supported_afisafi(afisafi) {
+            return;
+        }
+        let families = self.addpath_families.entry(peer).or_default();
+        if !families.contains(&afisafi) {
+            families.push(afisafi);
+        }
+    }
+
+    fn encoded_addpath_families(
+        &self,
+        peer: (std::net::IpAddr, inetnum::asn::Asn),
+    ) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        for afisafi in self.addpath_families.get(&peer).into_iter().flatten()
+        {
+            let (afi, safi): (u16, u8) = (*afisafi).into();
+            encoded.extend_from_slice(&[
+                afi.to_be_bytes()[0],
+                afi.to_be_bytes()[1],
+                safi,
+                3,
+            ]);
+        }
+        encoded
+    }
+
+    fn note_ingress_addpath_family(
+        &mut self,
+        ingresses: &ingress::Register,
+        ingress_id: IngressId,
+        afisafi: AfiSafiType,
+    ) {
+        let Some(info) = ingresses.get(ingress_id) else {
+            return;
+        };
+        let (Some(addr), Some(asn)) = (info.remote_addr, info.remote_asn)
+        else {
+            return;
+        };
+        self.note_addpath_family((addr, asn), afisafi);
+        let families = self.encoded_addpath_families((addr, asn));
+        ingresses.update_info(
+            ingress_id,
+            IngressInfo::new().with_addpath_families(families),
+        );
+    }
+
+    pub(crate) fn preflight_file(
+        &mut self,
+        filename: &PathBuf,
+    ) -> Result<(), MrtError> {
+        let file = std::fs::File::open(filename)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mut decompressed = Vec::new();
+        let bytes = match filename
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+        {
+            Some("gz") => {
+                GzDecoder::new(&mmap[..])
+                    .read_to_end(&mut decompressed)
+                    .map_err(|_| MrtError::other("gz decoding failed"))?;
+                &decompressed[..]
+            }
+            Some("bz2") => {
+                BzDecoder::new(&mmap[..])
+                    .read_to_end(&mut decompressed)
+                    .map_err(|_| MrtError::other("bz2 decoding failed"))?;
+                &decompressed[..]
+            }
+            _ => &mmap[..],
+        };
+        self.preflight_bytes(bytes)
+    }
+
+    fn preflight_bytes(&mut self, bytes: &[u8]) -> Result<(), MrtError> {
+        let rib_bytes = supported_rib_records(bytes)?;
+        if !rib_bytes.is_empty() {
+            let rib_file = MrtFile::new(&rib_bytes);
+            let _peer_index = rib_file.pi()?;
+            for entry in rib_file.rib_entries()? {
+                let (afisafi, _peer_id, peer, _nlri, path_id, _attrs) =
+                    entry?;
+                if path_id.is_some() && is_supported_afisafi(afisafi) {
+                    self.note_addpath_family((peer.addr, peer.asn), afisafi);
+                }
+            }
+        }
+
+        for message in MrtFile::new(bytes).messages() {
+            use routecore::mrt::Bgp4Mp;
+            let message = match message {
+                Bgp4Mp::Message(message) => message.into(),
+                Bgp4Mp::MessageAs4(message) => message,
+                Bgp4Mp::StateChange(_) | Bgp4Mp::StateChangeAs4(_) => {
+                    continue
+                }
+            };
+            let bgp_msg = match message.bgp_msg() {
+                Ok(message) => message,
+                Err(err) => {
+                    debug!("preflight skipped malformed BGP message: {err}");
+                    continue;
+                }
+            };
+            if let BgpMsg::Update(update) = bgp_msg {
+                let mut routes = explode_announcements(&update)?;
+                routes.extend(explode_withdrawals(&update)?);
+                for (route, path_id) in routes {
+                    if path_id.is_some() && is_supported_route(&route) {
+                        self.note_addpath_family(
+                            (message.peer_addr(), message.peer_asn()),
+                            route_afisafi(&route),
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl MrtFileIn {
     pub async fn run(
         self,
@@ -104,9 +260,6 @@ impl MrtFileIn {
         mut waitpoint: WaitPoint,
     ) -> Result<(), crate::comms::Terminated> {
         gate.process_until(waitpoint.ready()).await?;
-        waitpoint.running().await;
-
-        let (queue_tx, queue_rx) = mpsc::channel::<QueueEntry>(1024);
 
         let ingresses = component.ingresses().clone();
         let parent_id = ingresses.register();
@@ -117,12 +270,26 @@ impl MrtFileIn {
                 .with_desc("mrt-file-in unit"),
         );
 
-        for f in self.filename.iter() {
+        let files: Vec<_> = self.filename.iter().collect();
+        let mut import_state = MrtImportState::default();
+        for filename in &files {
+            if let Err(err) = import_state.preflight_file(filename) {
+                error!(
+                    "MRT preflight failed for {}: {err}; no routes emitted",
+                    filename.to_string_lossy()
+                );
+                return Err(Terminated);
+            }
+        }
+
+        waitpoint.running().await;
+        let (queue_tx, queue_rx) = mpsc::channel::<QueueEntry>(1024);
+        for f in files {
             let _ = queue_tx.send((f, None)).await;
         }
 
         MrtInRunner::new(self, gate, ingresses, parent_id, queue_tx)
-            .run(queue_rx)
+            .run(queue_rx, import_state)
             .await
     }
 }
@@ -149,6 +316,8 @@ impl MrtInRunner {
     async fn process_state_change(
         gate: &Gate,
         ingresses: &Arc<ingress::Register>,
+        parent_id: IngressId,
+        import_state: &MrtImportState,
         sc: routecore::mrt::StateChangeAs4,
     ) {
         match (sc.old_state(), sc.new_state()) {
@@ -159,13 +328,22 @@ impl MrtInRunner {
                 if let Some((ingress_id, _info)) = ingresses
                     .find_existing_peer(
                         &IngressInfo::new()
+                            .with_parent_ingress(parent_id)
                             .with_remote_addr(sc.peer_addr())
-                            .with_remote_asn(sc.peer_asn()),
+                            .with_remote_asn(sc.peer_asn())
+                            .with_ingress_type(IngressType::Mrt),
                     )
                 {
-                    let update = Update::Withdraw(ingress_id, None);
+                    let mut entries = SmallVec::new();
+                    entries.push((ingress_id, None));
+                    entries.extend(
+                        import_state
+                            .path_children(ingress_id)
+                            .map(|child| (child, None)),
+                    );
+                    let update = Update::WithdrawBulk(Box::new(entries));
                     gate.update_data(update).await;
-                    debug!("Withdraw for {ingress_id} sent");
+                    debug!("Bulk withdraw for MRT peer {ingress_id} sent");
                 } else {
                     debug!(
                         "No IngressInfo for {} {} going Established -> Idle",
@@ -189,6 +367,7 @@ impl MrtInRunner {
         gate: &Gate,
         ingresses: &Arc<ingress::Register>,
         parent_id: IngressId,
+        import_state: &mut MrtImportState,
         msg: routecore::mrt::MessageAs4<'_, &[u8]>,
     ) -> Result<(usize, usize), MrtError> {
         let bgp_msg = match msg.bgp_msg() {
@@ -206,12 +385,17 @@ impl MrtInRunner {
                 let received = std::time::Instant::now();
                 let mut payloads = SmallVec::new();
                 let rr_reach: Vec<_> = explode_announcements(&upd)?
-                    .into_iter().collect();
+                    .into_iter()
+                    .filter(|(rr, _)| is_supported_route(rr))
+                    .collect();
                 let rr_unreach: Vec<_> = explode_withdrawals(&upd)?
-                    .into_iter().collect();
+                    .into_iter()
+                    .filter(|(rr, _)| is_supported_route(rr))
+                    .collect();
 
-                announcements_sent += rr_reach.len();
-                withdrawals_sent += rr_unreach.len();
+                if rr_reach.is_empty() && rr_unreach.is_empty() {
+                    return Ok((0, 0));
+                }
 
                 let ingress_query = IngressInfo::new()
                     .with_parent_ingress(parent_id)
@@ -219,34 +403,33 @@ impl MrtInRunner {
                     .with_remote_asn(msg.peer_asn())
                     .with_ingress_type(IngressType::Mrt);
 
-                let ingress_id = if let Some((id, _info)) =
-                    ingresses.find_existing_peer(&ingress_query)
+                let existing = ingresses.find_existing_peer(&ingress_query);
+                if existing.is_none()
+                    && rr_reach.is_empty()
+                    && rr_unreach.iter().all(|(_, path_id)| path_id.is_some())
                 {
-                    id
-                } else {
-                    let new_id = ingresses.register();
-                    ingresses.update_info(new_id, ingress_query);
-                    warn!("no ingress info found, regged {new_id}");
-                    new_id
-                };
+                    return Ok((0, 0));
+                }
+
+                let ingress_id = Self::peer_ingress(
+                    ingresses,
+                    import_state,
+                    parent_id,
+                    msg.peer_addr(),
+                    msg.peer_asn(),
+                    None,
+                );
 
                 for (rr, path_id) in rr_reach {
                     let effective_id = match path_id {
                         None => ingress_id,
-                        Some(path_id) => {
-                            let existing = ingresses.ids_for_parent(ingress_id)
-                                .into_iter()
-                                .find(|id| ingresses.get(*id)
-                                    .is_some_and(|info| info.path_id == Some(path_id.0)));
-                            existing.unwrap_or_else(|| {
-                                let id = ingresses.register();
-                                ingresses.update_info(id, IngressInfo::new()
-                                    .with_parent_ingress(ingress_id)
-                                    .with_ingress_type(IngressType::BgpPath)
-                                    .with_path_id(path_id.0));
-                                id
-                            })
-                        }
+                        Some(path_id) => Self::mrt_path_ingress(
+                            ingresses,
+                            import_state,
+                            ingress_id,
+                            path_id.0,
+                            route_afisafi(&rr),
+                        ),
                     };
                     payloads.push(Payload::with_received(
                         rr,
@@ -255,18 +438,24 @@ impl MrtInRunner {
                         effective_id,
                         RouteStatus::Active,
                     ));
+                    announcements_sent += 1;
                 }
 
                 for (rr, path_id) in rr_unreach {
                     let effective_id = match path_id {
                         None => ingress_id,
-                        Some(path_id) => match ingresses.ids_for_parent(ingress_id)
-                            .into_iter()
-                            .find(|id| ingresses.get(*id)
-                                .is_some_and(|info| info.path_id == Some(path_id.0))) {
-                                Some(id) => id,
-                                None => continue,
+                        Some(path_id) => match import_state
+                            .path_child(ingress_id, path_id.0)
+                        {
+                            Some(child) => child,
+                            None => {
+                                debug!(
+                                    "dropping unknown MRT ADD-PATH withdrawal for peer {} path {}",
+                                    ingress_id, path_id.0
+                                );
+                                continue;
                             }
+                        },
                     };
                     payloads.push(Payload::with_received(
                         rr,
@@ -275,9 +464,12 @@ impl MrtInRunner {
                         effective_id,
                         RouteStatus::Withdrawn,
                     ));
+                    withdrawals_sent += 1;
                 }
-                let update = payloads.into();
-                gate.update_data(update).await;
+                if !payloads.is_empty() {
+                    let update = payloads.into();
+                    gate.update_data(update).await;
+                }
             }
             BgpMsg::Open(_open_message) => {
                 warn!("BGP OPEN in MRT, skipping");
@@ -295,11 +487,96 @@ impl MrtInRunner {
         Ok((announcements_sent, withdrawals_sent))
     }
 
+    /// Resolve the stable child ingress used to store one RFC 7911 path from
+    /// an MRT peer. The parent remains the synthetic MRT peer advertised by
+    /// bmp-out; the child prevents paths for the same NLRI from overwriting
+    /// one another and carries the identifier bmp-out reattaches on encode.
+    fn mrt_path_ingress(
+        ingresses: &Arc<ingress::Register>,
+        import_state: &mut MrtImportState,
+        parent_id: IngressId,
+        path_id: u32,
+        afisafi: AfiSafiType,
+    ) -> IngressId {
+        import_state
+            .note_ingress_addpath_family(ingresses, parent_id, afisafi);
+
+        if let Some(id) = import_state.path_child(parent_id, path_id) {
+            return id;
+        }
+
+        let child_id = ingresses.register();
+        let mut child_info = IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(parent_id)
+            .with_path_id(path_id)
+            .with_state(ingress::register::IngressState::NonNetwork);
+        if let Some(parent) = ingresses.get(parent_id) {
+            if let Some(addr) = parent.remote_addr {
+                child_info = child_info.with_remote_addr(addr);
+            }
+            if let Some(asn) = parent.remote_asn {
+                child_info = child_info.with_remote_asn(asn);
+            }
+            if let Some(bgp_id) = parent.bgp_id {
+                child_info = child_info.with_bgp_id(bgp_id);
+            }
+            if let Some(filename) = parent.filename {
+                child_info = child_info.with_filename(filename);
+            }
+        }
+        ingresses.update_info(child_id, child_info);
+        import_state
+            .path_children
+            .insert((parent_id, path_id), child_id);
+        child_id
+    }
+
+    fn peer_ingress(
+        ingresses: &Arc<ingress::Register>,
+        import_state: &MrtImportState,
+        unit_parent: IngressId,
+        remote_addr: std::net::IpAddr,
+        remote_asn: inetnum::asn::Asn,
+        filename: Option<&PathBuf>,
+    ) -> IngressId {
+        let query = IngressInfo::new()
+            .with_parent_ingress(unit_parent)
+            .with_remote_addr(remote_addr)
+            .with_remote_asn(remote_asn)
+            .with_ingress_type(IngressType::Mrt);
+        let families =
+            import_state.encoded_addpath_families((remote_addr, remote_asn));
+        if let Some((id, _)) = ingresses.find_existing_peer(&query) {
+            let mut update = IngressInfo::new();
+            if let Some(filename) = filename {
+                update = update.with_filename(filename.clone());
+            }
+            if !families.is_empty() {
+                update = update.with_addpath_families(families);
+            }
+            ingresses.update_info(id, update);
+            id
+        } else {
+            let id = ingresses.register();
+            let mut query = query;
+            if let Some(filename) = filename {
+                query = query.with_filename(filename.clone());
+            }
+            if !families.is_empty() {
+                query = query.with_addpath_families(families);
+            }
+            ingresses.update_info(id, query);
+            id
+        }
+    }
+
     pub(crate) async fn process_file(
         gate: Gate,
         ingresses: Arc<ingress::Register>,
         parent_id: IngressId,
         filename: PathBuf,
+        import_state: &mut MrtImportState,
     ) -> Result<(), MrtError> {
         info!(
             "processing {} on thread {:?}",
@@ -361,23 +638,21 @@ impl MrtInRunner {
             );
             let mut ingress_map = Vec::with_capacity(peer_index_table.len());
             for peer_entry in &peer_index_table[..] {
-                let id = ingresses.register();
-                ingresses.update_info(
-                    id,
-                    IngressInfo::new()
-                        .with_parent_ingress(parent_id)
-                        .with_remote_addr(peer_entry.addr)
-                        .with_remote_asn(peer_entry.asn)
-                        .with_filename(filename.clone())
-                        .with_ingress_type(IngressType::Mrt),
+                let id = Self::peer_ingress(
+                    &ingresses,
+                    import_state,
+                    parent_id,
+                    peer_entry.addr,
+                    peer_entry.asn,
+                    Some(&filename),
                 );
                 ingress_map.push(id);
             }
 
             let rib_entries = rib_file.rib_entries()?;
-            let mut path_ingresses = HashMap::new();
             for entry in rib_entries {
-                let (afisafi, peer_id, peer_entry, nlri, path_id, raw_attr) = entry?;
+                let (afisafi, peer_id, _peer_entry, nlri, path_id, raw_attr) =
+                    entry?;
                 let rr = match (afisafi, nlri) {
                     (AfiSafiType::Ipv4Unicast, RibEntryNlri::Prefix(prefix)) => {
                         RotondaRoute::Ipv4Unicast(
@@ -426,23 +701,15 @@ impl MrtInRunner {
                     }
                 };
                 let peer_ingress_id = ingress_map[usize::from(peer_id)];
-                let ingress_id = if let Some(path_id) = path_id {
-                    *path_ingresses.entry((peer_id, path_id)).or_insert_with(|| {
-                        let id = ingresses.register();
-                        ingresses.update_info(
-                            id,
-                            IngressInfo::new()
-                                .with_parent_ingress(peer_ingress_id)
-                                .with_remote_addr(peer_entry.addr)
-                                .with_remote_asn(peer_entry.asn)
-                                .with_filename(filename.clone())
-                                .with_ingress_type(IngressType::Mrt)
-                                .with_path_id(path_id),
-                        );
-                        id
-                    })
-                } else {
-                    peer_ingress_id
+                let ingress_id = match path_id {
+                    None => peer_ingress_id,
+                    Some(path_id) => Self::mrt_path_ingress(
+                        &ingresses,
+                        import_state,
+                        peer_ingress_id,
+                        path_id,
+                        afisafi,
+                    ),
                 };
                 let update = Update::Single(Payload::new(
                     rr,
@@ -477,19 +744,28 @@ impl MrtInRunner {
                     MrtInRunner::process_state_change(
                         &gate,
                         &ingresses,
+                        parent_id,
+                        import_state,
                         sc.into(),
                     )
                     .await;
                 }
                 Bgp4Mp::StateChangeAs4(sc) => {
-                    MrtInRunner::process_state_change(&gate, &ingresses, sc)
-                        .await;
+                    MrtInRunner::process_state_change(
+                        &gate,
+                        &ingresses,
+                        parent_id,
+                        import_state,
+                        sc,
+                    )
+                    .await;
                 }
                 Bgp4Mp::Message(msg) => {
                     let (reach, unreach) = MrtInRunner::process_message(
                         &gate,
                         &ingresses,
                         parent_id,
+                        import_state,
                         msg.into(),
                     )
                     .await?;
@@ -498,7 +774,11 @@ impl MrtInRunner {
                 }
                 Bgp4Mp::MessageAs4(msg) => {
                     let (reach, unreach) = MrtInRunner::process_message(
-                        &gate, &ingresses, parent_id, msg,
+                        &gate,
+                        &ingresses,
+                        parent_id,
+                        import_state,
+                        msg,
                     )
                     .await?;
                     announcements_sent += reach;
@@ -529,6 +809,7 @@ impl MrtInRunner {
     async fn run(
         mut self,
         mut queue: mpsc::Receiver<QueueEntry>,
+        mut import_state: MrtImportState,
     ) -> Result<(), Terminated> {
         let gate = self.gate.clone();
         let ingresses = self.ingresses.clone();
@@ -560,6 +841,7 @@ impl MrtInRunner {
                     ingresses,
                     self.parent_id,
                     p.clone(),
+                    &mut import_state,
                 )
                 .await
                 .map(|_| p)
@@ -638,6 +920,11 @@ impl MrtInRunner {
                                     ..
                                 }),
                         } => {
+                            // Dynamic MRT reload remains intentionally
+                            // disabled. Any future implementation must gather
+                            // and preflight the complete replacement batch
+                            // before queueing its first file, just like
+                            // initial startup does above.
                             /*
                             if new_filename != self.config.filename {
                                 info!("Reloading mrt-in, processing new file {}", &new_filename.to_string_lossy());
@@ -682,6 +969,31 @@ impl MrtInRunner {
             }
         }
     }
+}
+
+fn route_afisafi(route: &RotondaRoute) -> AfiSafiType {
+    match route {
+        RotondaRoute::Ipv4Unicast(..) => AfiSafiType::Ipv4Unicast,
+        RotondaRoute::Ipv6Unicast(..) => AfiSafiType::Ipv6Unicast,
+        RotondaRoute::Ipv4Multicast(..) => AfiSafiType::Ipv4Multicast,
+        RotondaRoute::Ipv6Multicast(..) => AfiSafiType::Ipv6Multicast,
+        RotondaRoute::Ipv4FlowSpec(..) => AfiSafiType::Ipv4FlowSpec,
+        RotondaRoute::Ipv6FlowSpec(..) => AfiSafiType::Ipv6FlowSpec,
+    }
+}
+
+fn is_supported_route(route: &RotondaRoute) -> bool {
+    is_supported_afisafi(route_afisafi(route))
+}
+
+fn is_supported_afisafi(afisafi: AfiSafiType) -> bool {
+    matches!(
+        afisafi,
+        AfiSafiType::Ipv4Unicast
+            | AfiSafiType::Ipv6Unicast
+            | AfiSafiType::Ipv4FlowSpec
+            | AfiSafiType::Ipv6FlowSpec
+    )
 }
 
 /// Rewrite a TABLE_DUMP_V2 MRT path-attribute blob so its MP_REACH_NLRI is in
@@ -876,12 +1188,13 @@ fn mk_flowspec_route(
     }
 }
 
-/// Return a TABLE_DUMP_V2 stream containing the RIB record families decoded
-/// by routecore's `rib_entries()` iterator.
+/// Return a TABLE_DUMP_V2 stream containing only records relevant to
+/// Routecore's `rib_entries()` iterator.
 ///
 /// A real MRT file can mix the peer-index table and IPv4/IPv6 unicast RIBs
-/// with unrelated MRT record types. Filtering by framed record boundaries
-/// retains all supported unicast, multicast, generic, and ADD-PATH RIBs.
+/// with unrelated MRT record types. Filtering by the fallible `records()`
+/// iterator's framed boundaries keeps the peer index and every legacy/RFC
+/// 8050 RIB subtype together while excluding non-RIB records.
 fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
     let file = MrtFile::new(raw);
     let mut offset = 0usize;
@@ -909,9 +1222,7 @@ fn supported_rib_records(raw: &[u8]) -> Result<Vec<u8>, MrtError> {
                     // generic families it cannot frame.
                     | TableDumpv2SubType::RibGeneric
                     | TableDumpv2SubType::RibIpv4UnicastAddpath
-                    | TableDumpv2SubType::RibIpv4MulticastAddpath
                     | TableDumpv2SubType::RibIpv6UnicastAddpath
-                    | TableDumpv2SubType::RibIpv6MulticastAddpath
                     | TableDumpv2SubType::RibGenericAddpath
             )
         ) {
@@ -957,6 +1268,7 @@ mod tests {
             ingresses.clone(),
             parent_id,
             path.clone(),
+            &mut MrtImportState::default(),
         )
         .await;
         let _ = std::fs::remove_file(path);
@@ -964,5 +1276,33 @@ mod tests {
         result.expect("Rotonda should process mrtgen's valid MRT corpus");
         assert!(metrics.num_updates.load(Ordering::SeqCst) > 0);
         assert!(ingresses.memory_summary().total > 0);
+
+        let infos = ingresses.cloned_info();
+        let path_children: Vec<_> = infos
+            .values()
+            .filter(|info| info.ingress_type == Some(IngressType::BgpPath))
+            .collect();
+        assert!(!path_children.is_empty(), "RFC 8050 paths were discarded");
+        assert!(path_children.iter().any(|info| info.path_id == Some(103)));
+        assert!(path_children.iter().any(|info| info.path_id == Some(12)));
+        assert!(path_children.iter().any(|info| info.path_id == Some(7)));
+        assert!(
+            path_children.iter().any(|info| {
+                info.path_id == Some(3)
+                    && info.remote_addr
+                        == Some("2001:db8::1".parse().expect("test address"))
+            }),
+            "BGP4MP ADD-PATH route was discarded"
+        );
+        for child in path_children {
+            let parent = infos
+                .get(&child.parent_ingress.expect("path child parent"))
+                .expect("registered path parent");
+            assert_eq!(parent.ingress_type, Some(IngressType::Mrt));
+            assert!(parent
+                .addpath_families
+                .as_ref()
+                .is_some_and(|families| !families.is_empty()));
+        }
     }
 }

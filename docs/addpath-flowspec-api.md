@@ -6,6 +6,10 @@ this document are captured from a live instance fed a BMP session that
 negotiated ADD-PATH for IPv4 unicast + IPv4 flowspec and announced one
 prefix and two flowspec rules under two path ids.
 
+For the query API itself — every endpoint, the full filter list, response
+shapes and dump limits — see `docs/rib-query-api.md`. This document covers
+only what ADD-PATH and FlowSpec add on top.
+
 ## Data model: sessions and path-child ingresses
 
 Every route in the RIB is stored under an *ingress id* (the store's `mui`).
@@ -140,6 +144,20 @@ To enumerate the paths of a session: filter the list on
 A route from a non-ADD-PATH session looks the same except that `ingress` is
 the session entry itself (`bgpViaBmp`/`bgp`, no `path_id`).
 
+Every route also carries a `source` object, elided from the capture above,
+which states the same identity without a second lookup:
+
+```json
+"source": { "ingressId": 3, "pathId": 1, "internalPathIngressId": 4 }
+```
+
+`ingressId` is the owning **session**, `pathId` the RFC 7911 identifier, and
+`internalPathIngressId` the child mui — the last two present only for
+ADD-PATH records. So `source.pathId != null` selects the ADD-PATH routes out
+of any result, and grouping on `source.ingressId` collapses a peer's paths
+back into one peer. `ingress.id` is the child for those rows, not the
+session.
+
 ## FlowSpec rules
 
 `GET /api/v1/ribs/ipv4flowspec/routes` (or `ipv6flowspec`; add
@@ -152,8 +170,9 @@ traffic `actions`, and the RFC 8955 §6 `validity`.
 ### FlowSpec over ADD-PATH
 
 For a rule received on an ADD-PATH session, `ingressId` is the `bgpPath`
-child — resolve it via `/api/v1/ingresses` to get the `path_id` and the
-owning session. Two rules from paths 1 and 2 of the session above:
+child; the rule's `source` object (elided from the capture below, same shape
+as for unicast) resolves it to the owning session and path id. Two rules
+from paths 1 and 2 of the session above:
 
 ```json
 {
@@ -208,20 +227,25 @@ the covering `10.0.0.0/24` unicast routes of the same session.
 
 ## Filtering by ingress
 
-Both the unicast and flowspec endpoints accept `?ingressId=<id>` (note:
-plain `ingressId`, unlike the `filter[...]`-style parameters):
+`?ingressId=<id>` and `filter[ingressType]=<type>` are documented in
+`docs/rib-query-api.md`; what follows is only what they mean for a peer with
+ADD-PATH.
 
-```
-GET /api/v1/ribs/ipv4unicast/routes/10.0.0.0/24?ingressId=5
-GET /api/v1/ribs/ipv4flowspec/routes?ingressId=5
-```
+`?ingressId=` selects one exact store mui, and an ADD-PATH peer's routes live
+under its children. So **filtering by a child id gives you one path**, while
+filtering by the *session* id returns only what the session stored directly
+— its non-ADD-PATH families — and does not aggregate the children. To get
+everything one peer contributed this way, collect the session id plus its
+`bgpPath` children from `/api/v1/ingresses` and query per id.
 
-Each returns only the records stored under that exact mui. For ADD-PATH
-sessions this means: **filter by the child id to get one path**. Filtering
-by the *session* id returns only routes the session stored directly (i.e.
-non-ADD-PATH families) — it does not aggregate the children. To get
-everything a peer contributed, collect the session id plus its `bgpPath`
-children from `/api/v1/ingresses` and query per id.
+`filter[ingressType]=` is the opposite: it resolves a child through
+`parent_ingress` and judges it by its session, so `bgp` returns every path of
+an ADD-PATH BGP peer rather than dropping them all. `bgpPath` selects the
+path-children themselves, across every session type.
+
+Neither filter changes the identity in the response: a row returned under
+`filter[ingressType]=bgp` still reports `ingress.ingress_type: "bgpPath"`,
+with the session in `source.ingressId`.
 
 ## On the wire (bmp-out)
 

@@ -1264,23 +1264,23 @@ where
                         // after an alternate-config retry the router's own
                         // claim is known to be wrong, and downstream relies
                         // on this flag to decode the verbatim UPDATE.
-                        let raw =
-                            saved_self.details.get_peer_ingress_id(&pph).map(
-                                |ingress_id| {
-                                    let mut body = msg.as_ref()
-                                        [BMP_COMMON_HDR_LEN..]
-                                        .to_vec();
-                                    if peer_config.four_octet_enabled() {
-                                        body[1] &= !0x20;
-                                    } else {
-                                        body[1] |= 0x20;
-                                    }
-                                    Update::RouteMonitoringRaw {
-                                        ingress_id,
-                                        body: Bytes::from(body),
-                                    }
-                                },
-                            );
+                        let raw = saved_self
+                            .details
+                            .get_peer_ingress_id(&pph)
+                            .map(|ingress_id| {
+                                let mut body = msg.as_ref()
+                                    [BMP_COMMON_HDR_LEN..]
+                                    .to_vec();
+                                if peer_config.four_octet_enabled() {
+                                    body[1] &= !0x20;
+                                } else {
+                                    body[1] |= 0x20;
+                                }
+                                Update::RouteMonitoringRaw {
+                                    ingress_id,
+                                    body: Bytes::from(body),
+                                }
+                            });
 
                         saved_self.mk_routing_update_result_with_raw(
                             Update::Bulk(Box::new(payloads)),
@@ -1368,10 +1368,9 @@ where
                 ) {
                     Some((child_id, minted)) => {
                         if minted {
-                            self.status_reporter
-                                .addpath_path_child_minted(
-                                    self.router_id.clone(),
-                                );
+                            self.status_reporter.addpath_path_child_minted(
+                                self.router_id.clone(),
+                            );
                         }
                         child_id
                     }

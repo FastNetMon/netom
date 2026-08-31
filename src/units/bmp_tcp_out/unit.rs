@@ -409,9 +409,9 @@ impl DirectUpdate for BmpTcpOutRunner {
             // session id, so resolve child -> session first.
             Update::Single(payload) => {
                 if self.fastpath
-                    && self.raw_covered.contains(
-                        &self.raw_session_of(payload.ingress_id),
-                    )
+                    && self
+                        .raw_covered
+                        .contains(&self.raw_session_of(payload.ingress_id))
                 {
                     return;
                 }
@@ -583,9 +583,7 @@ impl BmpTcpOutRunner {
         }
         use crate::ingress::IngressType;
         let session = match self.ingress_register.get(ingress_id) {
-            Some(info)
-                if info.ingress_type == Some(IngressType::BgpPath) =>
-            {
+            Some(info) if info.ingress_type == Some(IngressType::BgpPath) => {
                 info.parent_ingress.unwrap_or(ingress_id)
             }
             Some(_) => ingress_id,

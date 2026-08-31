@@ -39,6 +39,16 @@ impl BgpTcpInStatusReporter {
         self.metrics.connection_accepted_count.fetch_add(1, SeqCst);
     }
 
+    pub fn connection_initiated(&self, peer_addr: SocketAddr) {
+        sr_log!(info: self, "Connected to peer {}", peer_addr);
+        self.metrics.connection_initiated_count.fetch_add(1, SeqCst);
+    }
+
+    pub fn connect_error<T: Display>(&self, peer_addr: SocketAddr, err: T) {
+        sr_log!(warn: self, "Error while connecting to peer {}: {}", peer_addr, err);
+        self.metrics.connect_error_count.fetch_add(1, SeqCst);
+    }
+
     pub fn listener_io_error<T: Display>(&self, err: T) {
         sr_log!(warn: self, "Error while listening for connections: {}", err);
     }

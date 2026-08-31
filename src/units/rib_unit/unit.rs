@@ -353,6 +353,7 @@ impl RibUnitRunner {
             &gate,
             rib_merge_update_stats.clone(),
         ));
+        metrics.set_rib(&rib);
         component.register_metrics(metrics.clone());
 
         // Setup status reporting
@@ -438,7 +439,8 @@ impl RibUnitRunner {
         let ingress_register: Arc<ingress::Register> = Default::default();
         let ctx = Arc::new(Mutex::new(Ctx::empty()));
         let rib = Rib::new(ingress_register.clone(), None, ctx.clone())?;
-        let status_reporter = RibUnitStatusReporter::default().into();
+        let status_reporter: Arc<RibUnitStatusReporter> =
+            RibUnitStatusReporter::default().into();
         let filter_name =
             Arc::new(ArcSwap::from_pointee(FilterName::default()));
         let _process_metrics = Arc::new(TokioTaskMetrics::new());
@@ -446,6 +448,7 @@ impl RibUnitRunner {
             Default::default();
 
         let shared_rib = Arc::new(ArcSwap::new(Arc::new(rib)));
+        status_reporter.set_rib(&shared_rib);
         let tracer = Arc::new(Tracer::new());
         let retain_withdrawn_attributes =
             Arc::new(AtomicBool::new(retain_withdrawn_attributes));
@@ -481,7 +484,7 @@ impl RibUnitRunner {
     }
 
     #[cfg(test)]
-    pub(super) fn rib(&self) -> Arc<Rib> {
+    pub(crate) fn rib(&self) -> Arc<Rib> {
         self.rib.load().clone()
     }
 
@@ -539,10 +542,7 @@ impl RibUnitRunner {
     /// roaring bitmap atomic and serialises through `withdraw_lock`, so
     /// running it inline on a tokio worker can stall the pipeline while
     /// waiting for the lock and/or while doing the bitmap walk itself.
-    async fn reset_ingress_blocking(
-        &self,
-        ingress_id: ingress::IngressId,
-    ) {
+    async fn reset_ingress_blocking(&self, ingress_id: ingress::IngressId) {
         let rib = self.rib.load().clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
             rib.remove_for_ingresses(&[ingress_id]);
@@ -613,6 +613,77 @@ impl RibUnitRunner {
                         };
                 }
             });
+        }
+
+        // Sweep the path-attribute interner, one shard per tick.
+        //
+        // `intern` prunes only the bucket it touches, so blobs whose hash
+        // never recurs leave their dead `Weak` -- and the `HashMap` entry
+        // around it -- in place forever. On a collector with real churn that
+        // was the whole of the observed leak: 153.4M weak slots against
+        // 51.8M live blobs, growing ~13M slots (~2.3 GiB) per day, while the
+        // RIB's own record count barely moved.
+        //
+        // One shard per tick keeps each lock hold to 1/64 of the table and
+        // spreads a full pass over ~30 minutes, which is far quicker than
+        // dead slots accumulate. It runs on the blocking pool: the sweep is
+        // CPU-bound and takes a mutex the insert path also wants.
+        {
+            let sweep_rib = Arc::downgrade(&arc_self.rib);
+            crate::tokio::spawn(
+                &"pa-interner-sweep".to_string(),
+                async move {
+                    const SWEEP_INTERVAL: std::time::Duration =
+                        std::time::Duration::from_secs(30);
+                    let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+                    interval.tick().await; // consume the immediate first tick
+                    let mut shard = 0usize;
+                    let mut pass_slots = 0usize;
+                    let mut pass_buckets = 0usize;
+                    loop {
+                        interval.tick().await;
+                        let Some(rib_swap) = sweep_rib.upgrade() else {
+                            break; // rib unit gone; stop sweeping
+                        };
+                        let rib = rib_swap.load().clone();
+                        drop(rib_swap);
+
+                        let shards = rib.path_attribute_interner_shards();
+                        if shards == 0 {
+                            continue;
+                        }
+                        let index = shard % shards;
+                        match tokio::task::spawn_blocking(move || {
+                            rib.sweep_path_attribute_interner(index)
+                        })
+                        .await
+                        {
+                            Ok((slots, buckets)) => {
+                                pass_slots += slots;
+                                pass_buckets += buckets;
+                            }
+                            Err(e) => {
+                                error!("pa-interner sweep task failed: {e}");
+                            }
+                        }
+
+                        shard += 1;
+                        // Report per full pass rather than per shard, so the log
+                        // says how much a pass is actually reclaiming.
+                        if shard.is_multiple_of(shards) {
+                            if pass_slots > 0 || pass_buckets > 0 {
+                                info!(
+                                "pa-interner sweep: dropped {pass_slots} dead \
+                                 weak slots and {pass_buckets} buckets over \
+                                 the last full pass"
+                            );
+                            }
+                            pass_slots = 0;
+                            pass_buckets = 0;
+                        }
+                    }
+                },
+            );
         }
 
         // Periodic memory report: log a consolidated snapshot of the main
@@ -1448,7 +1519,26 @@ impl RibUnitRunner {
                 let propagation_delay =
                     payload.received.duration_since(post_insert);
 
-                let change = if report.prefix_new {
+                // A withdrawal is reported only as a withdrawal. Reporting
+                // it as an announcement effect as well -- which is what
+                // happened before -- inflated the modified-announcements
+                // counter with every peer's withdrawals.
+                //
+                // `report.mui_count` is zero when there was nothing to
+                // withdraw: a withdrawal for a {prefix, mui} the store never
+                // held, which must not be counted as one.
+                //
+                // These stay keyed on `prefix_new` rather than the
+                // per-record `mui_new`, which would be the better signal:
+                // the store sets `mui_new` unconditionally for a prefix it
+                // already holds, so it reads true even when an existing
+                // record was overwritten. See the RIB metrics item in
+                // TODO.md.
+                let change = if route_status == RouteStatus::Withdrawn {
+                    StoreInsertionEffect::RoutesWithdrawn(usize::from(
+                        report.mui_count > 0,
+                    ))
+                } else if report.prefix_new {
                     StoreInsertionEffect::RouteAdded
                 } else {
                     StoreInsertionEffect::RouteUpdated
@@ -1461,16 +1551,6 @@ impl RibUnitRunner {
                     report.cas_count.try_into().unwrap_or(u32::MAX),
                     change,
                 );
-                if route_status == RouteStatus::Withdrawn {
-                    self.status_reporter.insert_ok(
-                        ingress_id,
-                        store_op_delay,
-                        propagation_delay,
-                        //num_retries,
-                        report.cas_count.try_into().unwrap_or(u32::MAX),
-                        StoreInsertionEffect::RoutesWithdrawn(1),
-                    );
-                }
 
                 // XXX re-introduce sometime later
                 //if let Some(ref roto_function) = self.roto_function_post {

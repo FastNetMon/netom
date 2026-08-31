@@ -12,7 +12,11 @@
 # Logs, archives and local data
 *.log
 *.gz
-/test-data
+# Local MRT dumps and other bulk test inputs live here and stay untracked,
+# but the small captured API responses the netom-cli renderer tests
+# include_str! must be in the repository or `cargo test` cannot build.
+/test-data/*
+!/test-data/cli/
 /rotonda
 
 # Local-only configs, deploy scripts and scratch notes

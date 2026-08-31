@@ -293,8 +293,7 @@ impl LogConfig {
             Ok(_) => self.log_level.0.min(LevelFilter::Trace),
             Err(_) => self.log_level.0.min(LevelFilter::Warn),
         };
-        let rotonda_store_log_level = match std::env::var("NETOM_STORE_LOG")
-        {
+        let rotonda_store_log_level = match std::env::var("NETOM_STORE_LOG") {
             Ok(_) => self.log_level.0.min(LevelFilter::Trace),
             Err(_) => self.log_level.0.min(LevelFilter::Warn),
         };

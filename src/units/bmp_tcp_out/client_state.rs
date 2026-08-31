@@ -163,8 +163,7 @@ impl ClientState {
             return BufferUpdateResult::Overflow;
         }
         buf.push(update);
-        self.buffered_bytes
-            .fetch_add(upd_bytes, Ordering::Relaxed);
+        self.buffered_bytes.fetch_add(upd_bytes, Ordering::Relaxed);
         // Mirror into the process-wide bmp-out accounting (see mem_stats).
         mem_stats::BMP_OUT_BUFFERED_BYTES
             .fetch_add(upd_bytes, Ordering::Relaxed);
@@ -331,7 +330,11 @@ impl ClientState {
         &self,
         ingress_id: IngressId,
     ) -> Option<(IngressId, Option<u32>)> {
-        self.emit_target_cache.read().await.get(&ingress_id).copied()
+        self.emit_target_cache
+            .read()
+            .await
+            .get(&ingress_id)
+            .copied()
     }
 
     /// Memoize the emit target for an ingress id.

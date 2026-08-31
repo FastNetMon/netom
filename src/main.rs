@@ -230,7 +230,6 @@ mod tests {
 
     use atomic_enum::atomic_enum;
     use inetnum::{addr::Prefix, asn::Asn};
-    use prometheus_parse::Value;
     use netom::{
         bgp::encode::{
             mk_initiation_msg, mk_peer_down_notification_msg,
@@ -241,6 +240,7 @@ mod tests {
         metrics::{self, OutputFormat},
         tests::util::assert_json_eq,
     };
+    use prometheus_parse::Value;
     use routecore::bmp::message::PeerType;
     use rumqttd::{local::LinkRx, Broker, Notification};
     use serde_json::Number;
