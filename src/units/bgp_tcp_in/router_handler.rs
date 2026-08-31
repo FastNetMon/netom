@@ -672,6 +672,13 @@ impl Processor {
                                     //.with_name("some-bgp-session".to_string())
                                     .with_remote_addr(negotiated.remote_addr())
                                     .with_remote_asn(negotiated.remote_asn())
+                                    // The local end of the session, needed
+                                    // to classify it as EBGP or IBGP for
+                                    // the RIB's best-path decision process
+                                    // (RFC 4271 9.1.2.2 step d). Nothing
+                                    // else in netom knows the local ASN by
+                                    // the time a route reaches the RIB.
+                                    .with_local_asn(self.unit_cfg.my_asn)
                                     // Until now only the BMP path set this,
                                     // so native BGP peers had no Up/Down
                                     // value at all. bmp-tcp-out also reads

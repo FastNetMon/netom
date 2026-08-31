@@ -6,6 +6,7 @@ use std::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use inetnum::addr::Prefix;
+use inetnum::asn::Asn;
 use log::debug;
 use routecore::bgp::nlri::afisafi::Nlri;
 use routecore::bgp::{
@@ -389,6 +390,7 @@ impl PeerAware for Dumping {
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
         local_addr: IpAddr,
+        local_asn: Option<Asn>,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         tlv_iter: InformationTlvIter,
@@ -400,6 +402,7 @@ impl PeerAware for Dumping {
             local_capabilities,
             remote_capabilities,
             local_addr,
+            local_asn,
             ingress_register,
             bmp_ingress_id,
             tlv_iter,

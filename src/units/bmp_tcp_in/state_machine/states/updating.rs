@@ -7,6 +7,7 @@ use chrono::{DateTime, Utc};
 use log::debug;
 //use roto::types::builtin::NlriStatus;
 use inetnum::addr::Prefix;
+use inetnum::asn::Asn;
 use routecore::{
     bgp::{
         message::{SessionConfig, UpdateMessage},
@@ -228,6 +229,7 @@ impl PeerAware for Updating {
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
         local_addr: IpAddr,
+        local_asn: Option<Asn>,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         tlv_iter: InformationTlvIter,
@@ -239,6 +241,7 @@ impl PeerAware for Updating {
             local_capabilities,
             remote_capabilities,
             local_addr,
+            local_asn,
             ingress_register,
             bmp_ingress_id,
             tlv_iter,

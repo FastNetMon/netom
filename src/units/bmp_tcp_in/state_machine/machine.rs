@@ -27,6 +27,7 @@ use log::{debug, error, info, warn};
 /// lead to fixes in one place and not in another which should be avoided be
 /// factoring the common code out.
 use inetnum::addr::Prefix;
+use inetnum::asn::Asn;
 use rotonda_store::prefix_record::RouteStatus;
 use routecore::bgp::fsm::session;
 use routecore::bmp::message::InformationTlvIter;
@@ -508,6 +509,7 @@ pub trait PeerAware {
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
         local_addr: IpAddr,
+        local_asn: Option<Asn>,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         tlv_iter: InformationTlvIter,
@@ -645,6 +647,13 @@ where
         // for this peering). The peer/remote end lives in the PPH.
         let local_addr = msg.local_address();
 
+        // The monitored router's own ASN, from the OPEN it sent. The
+        // per-peer header carries only the remote ASN, so this is the only
+        // place the local end of a monitored session is observable — and
+        // without it the RIB cannot tell an IBGP route from an EBGP one for
+        // best-path step d (RFC 4271 9.1.2.2).
+        let local_asn = Some(msg.bgp_open_sent().my_asn());
+
         let tlv_iter = msg.information_tlvs();
 
         let (peer_added, existing_peer_ingress_id) =
@@ -655,6 +664,7 @@ where
                 local_capabilities,
                 remote_capabilities,
                 local_addr,
+                local_asn,
                 self.ingress_register.clone(),
                 self.ingress_id,
                 tlv_iter,
@@ -1865,6 +1875,7 @@ impl PeerAware for PeerStates {
         local_capabilities: Vec<u8>,
         remote_capabilities: Vec<u8>,
         local_addr: IpAddr,
+        local_asn: Option<Asn>,
         ingress_register: Arc<ingress::Register>,
         bmp_ingress_id: ingress::IngressId,
         mut tlv_iter: InformationTlvIter,
@@ -1970,6 +1981,13 @@ impl PeerAware for PeerStates {
                 &session_config,
                 pph.rib_type(),
             ));
+        // The monitored router's own ASN for this peering, from the OPEN it
+        // sent in the Peer Up. Only set when the Peer Up carried a parseable
+        // sent-OPEN; a monitored session with no local ASN is classified as
+        // EBGP-or-unknown by the best-path decision process.
+        if let Some(local_asn) = local_asn {
+            query_ingress = query_ingress.with_local_asn(local_asn);
+        }
         use routecore::bmp::message::PeerType;
         match pph.peer_type() {
             PeerType::GlobalInstance => { /* no Peer Distinguisher to set */ }
