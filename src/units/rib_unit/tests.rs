@@ -3027,3 +3027,117 @@ async fn best_path_does_not_consider_withdrawn_routes() {
     assert_eq!(json["counts"]["total"], 1, "the withdrawn record is not a candidate");
     assert_eq!(json["ineligible"].as_array().unwrap().len(), 0);
 }
+
+/// IPv6 has its own endpoint, its own store and its own longest-match path,
+/// and none of it was exercised: every other best-path test is v4.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_works_for_ipv6_including_the_address_form() {
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::{BestPathOptions, DecisionStep};
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let long = best_path_peer(&register, 65001, "2001:db8::1", [10, 0, 0, 1]);
+    let short = best_path_peer(&register, 65001, "2001:db8::2", [10, 0, 0, 2]);
+
+    // A covering /32 and a more specific /48, so the address form has
+    // something to choose between.
+    let covering = Prefix::from_str("2001:db8::/32").unwrap();
+    let specific = Prefix::from_str("2001:db8:1::/48").unwrap();
+    let v6 = |prefix: Prefix, asns: &[u32]| {
+        RotondaRoute::Ipv6Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(asns),
+        )
+    };
+
+    rib.insert(&v6(covering, &[65001]), RouteStatus::Active, 1, short, true, false)
+        .unwrap();
+    for (ingress, asns) in
+        [(long, &[65001u32, 65002][..]), (short, &[65001][..])]
+    {
+        rib.insert(&v6(specific, asns), RouteStatus::Active, 1, ingress, true, false)
+            .unwrap();
+    }
+
+    let exact = rib
+        .best_path(
+            AfiSafiType::Ipv6Unicast,
+            specific,
+            None,
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(exact.best_mui(), Some(short));
+    let json = serde_json::to_value(&exact).unwrap();
+    assert_eq!(json["nlri"], "2001:db8:1::/48");
+    assert_eq!(json["best"]["decidedBy"], DecisionStep::AsPathLength.as_str());
+
+    // The address form must land on the /48, not the covering /32.
+    let addr: IpAddr = "2001:db8:1::7".parse().unwrap();
+    let lookup = rib
+        .best_path(
+            AfiSafiType::Ipv6Unicast,
+            Prefix::from_str("2001:db8:1::7/128").unwrap(),
+            Some(addr),
+            super::QueryFilter::default(),
+            BestPathOptions::default(),
+        )
+        .unwrap();
+    let json = serde_json::to_value(&lookup).unwrap();
+    assert_eq!(json["nlri"], "2001:db8:1::/48");
+    assert_eq!(json["queryAddress"], "2001:db8:1::7");
+    assert_eq!(json["matchType"], "longestMatch");
+}
+
+/// `fields[pathAttributes]` shapes a best-path row the same way it shapes a
+/// `/routes` row -- the rows are the same shape, so the parameter has to keep
+/// working across both.
+#[tokio::test(flavor = "multi_thread")]
+async fn best_path_honours_the_path_attribute_field_filter() {
+    use crate::payload::RotondaRoute;
+    use crate::units::rib_unit::best_path::BestPathOptions;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+    let peer = best_path_peer(&register, 65001, "10.0.0.1", [10, 0, 0, 1]);
+
+    let prefix = Prefix::from_str("198.51.100.0/24").unwrap();
+    rib.insert(
+        &RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            best_path_pamap(&[65001]),
+        ),
+        RouteStatus::Active,
+        1,
+        peer,
+        true,
+        false,
+    )
+    .unwrap();
+
+    // Ask for ORIGIN (1) only; AS_PATH (2) must not come back even though the
+    // decision process read it.
+    let filter = super::QueryFilter {
+        fields_path_attributes: Some(vec![1]),
+        ..Default::default()
+    };
+    let result = rib
+        .best_path(
+            AfiSafiType::Ipv4Unicast,
+            prefix,
+            None,
+            filter,
+            BestPathOptions::default(),
+        )
+        .unwrap();
+
+    let json = serde_json::to_value(&result).unwrap();
+    let attrs = json["best"]["pathAttributes"].to_string();
+    assert!(attrs.contains("origin"), "{attrs}");
+    assert!(!attrs.contains("asPath"), "{attrs}");
+}
