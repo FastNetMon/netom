@@ -260,7 +260,21 @@ assert best.get("decidedBy") is None, best
 for key in ("status", "source", "pathAttributes"):
     assert key in best, (key, sorted(best))
 assert d["alternatives"] == [], d["alternatives"]
+# A lone candidate is trivially the whole equal-cost set.
+assert d["counts"]["equalCost"] == 1, d["counts"]
+# The peer identifier now comes off the negotiated session, so step f has a
+# real value to compare and nothing has to be assumed.
+assert "assumed" not in best, best
 ' || fail "best path JSON shape"
+
+# ... and the identifier that makes that true is on the ingress.
+cli --json show ingresses | python3 -c '
+import json, sys
+bgp = [i for i in json.load(sys.stdin)["data"] if i.get("ingress_type") == "bgp"]
+assert bgp, "no natively terminated session"
+assert all(i.get("bgp_id") for i in bgp), bgp
+assert all(i.get("local_asn") == 64512 for i in bgp), bgp
+' || fail "session ingress is missing bgp_id or local_asn"
 
 # skipMed is the other decision process routecore offers; with one candidate
 # it changes nothing, but the parameter must be accepted rather than 400.

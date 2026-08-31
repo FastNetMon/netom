@@ -43,6 +43,28 @@ Released yyyy-mm-dd.
   scanned, so an AS inside an AS_SET or an AS_CONFED segment counts. Skipped
   for MRT-replayed peers, which record no local ASN.
 
+* Best path implements RFC 5065 section 5.3 for confederations: AS_CONFED
+  segments are excluded from the AS_PATH length, the neighbour AS for the MED
+  comparison is the leftmost AS of the first AS_SEQUENCE past them (or the
+  local AS for a wholly internal path), and a confederation peer counts as
+  internal, so its LOCAL_PREF is weighed. Membership is inferred from the
+  presence of AS_CONFED segments, which RFC 5065 requires to be stripped
+  before a route leaves a confederation.
+
+* Best path reports equal-cost paths: anything tied with the winner through
+  step e carries `equalCost`, and `counts.equalCost` says how many there are.
+  More than one means the winner was picked by a tie-breaker rather than
+  preferred over the rest. `netom-cli` marks those rows with `=`.
+
+* AS_PATH loop detection reads AS4_PATH as well as AS_PATH (RFC 6793 section
+  4.2.3). On a session without four-octet ASN support a four-octet local AS
+  appears in AS_PATH only as AS_TRANS, so its loops are visible nowhere else.
+
+* BGP session ingresses record the peer's BGP Identifier, so best-path step f
+  works for sessions netom terminates itself rather than falling back to a
+  placeholder. Requires the `remote_bgp_id` accessor added to the routecore
+  fork.
+
 * `netom-cli`: `show ip bgp <prefix> best` and `show ip bgp best <address>`,
   rendering the above with the conventional `>` best marker.
 

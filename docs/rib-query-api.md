@@ -187,9 +187,10 @@ nothing to stream.
     "queryAddress": "10.0.0.7",
     "matchType": "longestMatch",
     "strategy": "rfc4271",
-    "counts": {"total": 4, "eligible": 3, "ineligible": 1, "reported": 3},
+    "counts": {"total": 4, "eligible": 3, "ineligible": 1, "reported": 3, "equalCost": 1},
     "best": {
       "rank": 1,
+      "equalCost": true,
       "decidedBy": "asPathLength",
       "status": "active",
       "ingress": {"id": 3, "ingress_type": "bgp"},
@@ -213,6 +214,20 @@ so anything that renders `/routes` renders these.
 
 `counts.eligible` is the whole candidate set, `counts.reported` is how many of
 them this response lists — they differ when `alternatives=<n>` capped it.
+
+### Equal-cost paths
+
+`equalCost` on a row means it is tied with the best path through step e — that
+is, on every criterion the RFC treats as a real preference. Steps f and g (the
+BGP Identifier and the peer address) exist only to force a single winner out of
+routes already found equally good, so an equal-cost route is one a router doing
+multipath would install alongside the winner.
+
+`counts.equalCost` is how many of the listed routes, the best path included,
+are in that set. **`1` means the winner won on merit; more means it was picked
+by a tie-breaker** and the choice is arbitrary in everything but its
+determinism. netom does not do multipath itself — this reports what a router
+would have to decide.
 
 ### The deciding step
 
@@ -241,7 +256,7 @@ which it lost **to the best path**, not to the row above it.
 | --- | --- |
 | `missingOrigin` | Mandatory ORIGIN absent |
 | `missingAsPath` | Mandatory AS_PATH absent |
-| `ebgpWithoutNeighbour` | An EBGP route whose AS_PATH names no neighbour AS — also what a confederation-external route looks like, see below |
+| `ebgpWithoutNeighbour` | An EBGP route whose AS_PATH names no neighbour AS |
 | `asPathLoop` | The AS_PATH contains the session's local AS (RFC 4271 §9.1.2) |
 | `malformedPathAttributes` | The stored attribute blob would not parse |
 | `unknownIngress` | The record's mui has no ingress register entry |
@@ -271,20 +286,23 @@ netom applies no import policy:
   to.
 * **A missing MULTI_EXIT_DISC is the lowest MED**, per step c. The widespread
   "MED missing as worst" behaviour is a vendor option, not the RFC.
-* **Confederation-external routes are not selectable.** Their AS_PATH begins
-  with an AS_CONFED_SEQUENCE, which names no neighbour ASN, so routecore's
-  eligibility check rejects them as `ebgpWithoutNeighbour`. RFC 5065
-  deployments get no best path for those routes today. AS_CONFED segments are
-  handled correctly everywhere else: they are excluded from the step a path
-  length (RFC 5065 §5.3) and scanned for loops.
+* **Confederations follow RFC 5065 §5.3.** AS_CONFED segments are excluded
+  from the step a length (rule 3); the neighbour AS for step c is the leftmost
+  AS of the first AS_SEQUENCE past them (rule 2), or the local AS for a path
+  entirely internal to the confederation (rule 1); and a confederation peer
+  counts as *internal* at step d, so its LOCAL_PREF is weighed (rule 4).
+  Membership is inferred from the presence of AS_CONFED segments, since RFC
+  5065 §4.1 requires them to be stripped before a route leaves a
+  confederation — netom has no confederation identifier in its configuration.
 * **Step g across address families.** A v6 session can carry v4 NLRI, so peer
   addresses of both families can meet at step g. The RFC says nothing about
   ordering between them; every IPv4 address sorts before every IPv6 one. It is
   arbitrary, but stable.
-* **AS4_PATH is not merged.** On a session without four-octet ASN support the
-  AS_PATH carries AS_TRANS placeholders and the real path is in AS4_PATH (RFC
-  6793); step a counts the AS_PATH as received. Every modern session negotiates
-  four-octet ASNs, so this is unlikely to be reached.
+* **AS4_PATH is read for loop detection but not merged.** RFC 6793 §4.2.3's
+  reconstruction preserves the AS count, so step a is unaffected either way,
+  and loop detection reads both attributes as the RFC requires. What is not
+  reconstructed is step c's neighbour AS, which stays the one in the AS_PATH as
+  received; a row carrying AS4_PATH says so via `assumed`.
 
 ### Assumptions
 
@@ -296,8 +314,14 @@ not disqualifying:
   local end at all.
 * `bgpIdentifier` — the peer's BGP Identifier is unknown, so step f used
   `255.255.255.255`; an unknown identifier loses a tie rather than winning it.
-  Expect this on natively terminated sessions, where routecore does not expose
-  the negotiated `remote_bgp_id`.
+  Both natively terminated and BMP-monitored peers record one, so in practice
+  this appears only for MRT replay and for sessions registered by an older
+  netom.
+* `as4Path` — the route carries AS4_PATH (RFC 6793), so it crossed a speaker
+  without four-octet ASN support and its AS_PATH holds AS_TRANS placeholders.
+  Step a is unaffected, since the RFC's reconstruction preserves the AS count,
+  and loop detection reads both attributes — but step c's neighbour AS comes
+  from the AS_PATH as received.
 
 ## Whole-table dumps
 

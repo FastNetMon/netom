@@ -64,11 +64,12 @@ Where a value is missing but not disqualifying, the candidate says so in an
   treated as EBGP. Sessions now record it (native BGP from the unit's `my_asn`,
   BMP from the Peer Up's sent OPEN), but MRT replay has no local end at all.
 - **no `bgp_id`** for the peer — step f uses `255.255.255.255`, so an unknown
-  identifier loses a tie rather than winning it. This is the common case for
-  natively terminated sessions: routecore's `NegotiatedConfig` holds
-  `remote_bgp_id` but exposes no accessor for it, so netom cannot read the
-  peer's identifier off its own sessions. BMP-monitored peers have it from the
-  per-peer header.
+  identifier loses a tie rather than winning it. Both natively terminated
+  sessions (from `NegotiatedConfig::remote_bgp_id`) and BMP-monitored peers
+  (from the per-peer header) record one, so this now means MRT replay, or a
+  session registered by an older netom.
+- **`as4Path`** — the route crossed a speaker without four-octet ASN support,
+  so step c's neighbour AS is the AS_PATH's as received. See Known gaps.
 
 ## What routecore provides
 
@@ -112,7 +113,10 @@ netom maps those three onto `missingOrigin`, `missingAsPath` and
 
 `asPathLoop` is the other half of §9.1.2's candidate rule, which routecore
 declares but never applies: a route whose AS_PATH contains the local AS is
-excluded from Phase 2. netom can run it now that sessions record their local
+excluded from Phase 2. AS4_PATH is scanned alongside AS_PATH, per RFC 6793
+§4.2.3 — on a session without four-octet ASN support a four-octet local AS
+appears in AS_PATH only as AS_TRANS, so its own loops are visible nowhere
+else. netom can run it now that sessions record their local
 ASN — for a BMP-monitored peer that is the monitored router's ASN, so the check
 reproduces that router's view. The full path is scanned, so an AS inside an
 AS_SET or an AS_CONFED segment counts, and the check runs *before* routecore's
@@ -137,13 +141,22 @@ Inherited from routecore, and unchanged by this:
 - **NEXT_HOP resolvability (§9.1.2.1) is not checked.** A candidate with an
   unreachable next hop is still ranked. netom has no FIB or IGP view, so there
   is nothing to resolve against.
-- **Confederation-external routes are not selectable.** Their AS_PATH begins
-  with an AS_CONFED_SEQUENCE, so `neighbor_path_selection()` returns `None` and
-  routecore's eligibility rejects them as "expected non-empty AS_PATH". Fixing
-  it means teaching routecore to look past a leading confed segment. AS_CONFED
-  handling is correct elsewhere: excluded from the step a length per RFC 5065
-  §5.3, and scanned for loops.
-- **AS4_PATH (RFC 6793) is not merged into AS_PATH** for the step a count.
+- **AS4_PATH (RFC 6793) is not merged into AS_PATH.** §4.2.3's reconstruction
+  preserves the AS count, so step a is unaffected, and loop detection reads
+  both attributes as the RFC requires. Only step c's neighbour AS is left as
+  received; a candidate carrying AS4_PATH reports `as4Path` in `assumed`.
+  Merging properly means implementing the segment-prepending rule, including
+  its confederation-adjacency clause, on a code path no session negotiated
+  since roughly 2012 can reach — so it is flagged rather than guessed at, and
+  can be built against a real sample if one ever appears.
+- **RFC 5004 (prefer the incumbent external path) cannot be implemented here.**
+  It is defined against the *existing* best path, and this API is stateless:
+  each query recomputes from the RIB, with no memory of what it answered
+  before. Implementing it would mean storing a chosen path per prefix and
+  keeping it current, which is the store-level design ruled out above.
+- **No multipath**, but equal-cost paths are reported. Anything tied with the
+  winner through step e carries `equalCost`, so an operator can see that the
+  winner was picked by a tie-breaker rather than preferred.
 - **Vendor-style import defaults are absent**, which changes outcomes rather
   than just omitting a feature: an EBGP route's degree of preference is 0
   because §9.1.1 leaves it to local policy and netom has none, so any IBGP
@@ -158,6 +171,33 @@ Inherited from routecore, and unchanged by this:
 - **Vendor extras are absent**: Cisco-style `weight`, and the "oldest route
   wins" rule several vendors insert between steps e and f. Neither is in RFC
   4271.
+
+## Confederations (RFC 5065)
+
+All four of §5.3's rules are applied:
+
+| Rule | Handled by |
+| --- | --- |
+| 1 — a path made only of AS_CONFED segments takes the local AS as its neighbour | Normalising to an empty path, which routecore falls back on `TiebreakerInfo.local_asn` for |
+| 2 — otherwise the neighbour is the leftmost AS of the first AS_SEQUENCE past the confederation segments | Stripping the leading AS_CONFED segments from the comparison copy of the path |
+| 3 — AS_CONFED segments are not counted in the AS_PATH length | routecore's `hop_count_path_selection()`, which already skips them |
+| 4 — a peer in the same confederation counts as *internal* | `classify` sets `RouteSource::Ibgp` when the path carries AS_CONFED segments |
+
+Two things are worth being explicit about.
+
+**Membership is inferred, not configured.** netom has no confederation
+identifier, so "this peer is in our confederation" is read off the presence of
+AS_CONFED segments in the route. That is sound because RFC 5065 §4.1 requires
+those segments to be stripped before a route leaves the confederation, so
+receiving one means the sender is inside it. A peer that violates that would
+have its routes treated as internal.
+
+**Only the comparison copy is normalised.** `classify` strips the leading
+AS_CONFED segments from the `PaMap` the decision process reads, never from the
+stored record — the API still renders the attributes as they arrived. Rule 3
+makes the rewrite safe for step a, since the stripped segments were not being
+counted anyway. Loop detection deliberately runs on the *unnormalised* path:
+our own Member-AS inside an AS_CONFED segment is a loop like any other.
 
 ## Keeping the explanation honest
 

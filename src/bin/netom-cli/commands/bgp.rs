@@ -575,10 +575,29 @@ pub fn render_best_path<W: Write>(
 
     if let Some(alternatives) = data["alternatives"].as_array() {
         for alt in alternatives {
-            row(" ", alt, alt["lostAt"].as_str().unwrap_or("-"))?;
+            // `=` marks a route tied with the winner through step e: a
+            // router doing multipath would install it too.
+            let marker = match alt["equalCost"].as_bool() {
+                Some(true) => "=",
+                _ => " ",
+            };
+            row(marker, alt, alt["lostAt"].as_str().unwrap_or("-"))?;
         }
     }
     table.finish()?;
+
+    // When the winner was not actually better, say so: `>` on its own reads
+    // as a decision, and steps f and g are tie-breakers, not preferences.
+    if let Some(n) = data["counts"]["equalCost"].as_u64() {
+        if n > 1 {
+            writeln!(
+                out,
+                "  {n} paths are equal-cost (=); the winner was picked by \
+                 {}, not preferred over them",
+                best["decidedBy"].as_str().unwrap_or("a tie-breaker")
+            )?;
+        }
+    }
 
     // Anything the decision process could not weigh is worth showing: a
     // silently missing route looks like a RIB bug from the outside.
@@ -850,6 +869,39 @@ mod tests {
         let out = best(excluded);
         assert!(out.contains("No eligible path"), "{out}");
         assert!(out.contains("unknownIngress"), "{out}");
+    }
+
+    /// A winner picked by a tie-breaker rather than on merit must say so —
+    /// `>` on its own reads as a decision.
+    #[test]
+    fn best_path_flags_equal_cost_paths() {
+        let body = BEST_PATH
+            .replace(r#""reported": 3, "equalCost": 1"#, r#""reported": 3, "equalCost": 2"#)
+            .replace(
+                r#""equalCost": false,
+        "lostAt": "asPathLength","#,
+                r#""equalCost": true,
+        "lostAt": "bgpIdentifier","#,
+            )
+            .replace(r#""decidedBy": "asPathLength","#, r#""decidedBy": "bgpIdentifier","#);
+        let out = best(&body);
+
+        let marked: Vec<&str> =
+            out.lines().filter(|l| l.trim_start().starts_with('=')).collect();
+        assert_eq!(marked.len(), 1, "{out}");
+        assert!(out.contains("2 paths are equal-cost"), "{out}");
+        assert!(out.contains("bgpIdentifier"), "{out}");
+    }
+
+    /// ... and a winner that beat the field on merit must not.
+    #[test]
+    fn best_path_does_not_claim_equal_cost_for_a_clear_winner() {
+        let out = best(BEST_PATH);
+        assert!(!out.contains("equal-cost"), "{out}");
+        assert!(
+            !out.lines().any(|l| l.trim_start().starts_with('=')),
+            "{out}"
+        );
     }
 
     /// `best` is a narrowing keyword, so it reaches `routes` as a flag and

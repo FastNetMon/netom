@@ -3,9 +3,10 @@
   "data": {
     "nlri": "198.51.100.0/24",
     "strategy": "rfc4271",
-    "counts": { "total": 4, "eligible": 3, "ineligible": 1, "reported": 3 },
+    "counts": { "total": 4, "eligible": 3, "ineligible": 1, "reported": 3, "equalCost": 1 },
     "best": {
       "rank": 1,
+      "equalCost": true,
       "decidedBy": "asPathLength",
       "status": "active",
       "ingress": { "id": 3, "ingress_type": "bgp" },
@@ -20,6 +21,7 @@
     "alternatives": [
       {
         "rank": 2,
+        "equalCost": false,
         "lostAt": "asPathLength",
         "status": "active",
         "ingress": { "id": 4, "ingress_type": "bgpPath", "parent_ingress": 2 },
@@ -33,6 +35,7 @@
       },
       {
         "rank": 3,
+        "equalCost": false,
         "lostAt": "med",
         "assumed": ["bgpIdentifier"],
         "status": "active",

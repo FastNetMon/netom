@@ -30,7 +30,7 @@ use std::{cmp::Ordering, collections::HashMap, fmt, net::IpAddr, str::FromStr};
 use inetnum::{addr::Prefix, asn::Asn};
 use rotonda_store::prefix_record::{Record, RouteStatus};
 use routecore::bgp::{
-    aspath::{Hop, HopPath},
+    aspath::{Hop, HopPath, OwnedHop, SegmentType},
     path_attributes::{
         BgpIdentifier, ClusterIds, PaMap, PathAttribute, WireformatPathAttribute,
     },
@@ -38,7 +38,7 @@ use routecore::bgp::{
         DecisionError, DegreeOfPreference, OrdRoute,
         RouteSource as OrdRouteSource, TiebreakerInfo,
     },
-    types::{LocalPref, MultiExitDisc, Origin, OriginatorId},
+    types::{As4Path, LocalPref, MultiExitDisc, Origin, OriginatorId},
 };
 use serde::{Serialize, Serializer};
 
@@ -244,6 +244,12 @@ pub enum Assumed {
     /// No BGP Identifier for the peer, so step f used 255.255.255.255 — an
     /// unknown identifier loses a tie rather than winning it.
     BgpIdentifier,
+    /// The route carries AS4_PATH, so it crossed a speaker without four-octet
+    /// ASN support and its AS_PATH holds AS_TRANS placeholders. Step a is
+    /// unaffected — RFC 6793 section 4.2.3's reconstruction preserves the AS
+    /// count — and loop detection reads both attributes, but step c's
+    /// neighbour AS is taken from the AS_PATH as received.
+    As4Path,
 }
 
 impl Assumed {
@@ -251,6 +257,7 @@ impl Assumed {
         match self {
             Assumed::RouteSource => "routeSource",
             Assumed::BgpIdentifier => "bgpIdentifier",
+            Assumed::As4Path => "as4Path",
         }
     }
 }
@@ -381,11 +388,24 @@ fn classify(
 
     let mut assumed = Vec::new();
 
+    // A route carrying AS_CONFED segments came from inside our own
+    // confederation: RFC 5065 section 4.1 requires them to be stripped before
+    // a route leaves one, so seeing them means the sender is a member. That is
+    // the only signal available — netom has no confederation identifier in its
+    // configuration — and it is what rule 4 turns on.
+    let confederation = pa_map
+        .get::<HopPath>()
+        .is_some_and(|path| path.iter().any(is_confed));
+
     // EBGP vs IBGP needs both ends of the session. `local_asn` is recorded at
     // session establishment (native BGP) or from the Peer Up's sent OPEN
     // (BMP); MRT replay has no local end at all, and neither did any session
     // registered by an older netom.
     let route_source = match (info.local_asn, info.remote_asn) {
+        // RFC 5065 section 5.3 rule 4: a peer in the same confederation
+        // counts as internal for step d even though its Member-AS number
+        // differs from ours.
+        _ if confederation => OrdRouteSource::Ibgp,
         (Some(local), Some(remote)) if local == remote => OrdRouteSource::Ibgp,
         (Some(_), Some(_)) => OrdRouteSource::Ebgp,
         _ => {
@@ -410,6 +430,29 @@ fn classify(
             UNKNOWN_BGP_ID
         }
     };
+
+    // Loop detection scans the path as received, confederation segments
+    // included: our own Member-AS appearing in one is a loop like any other.
+    let original_path = pa_map.get::<HopPath>();
+
+    // RFC 6793 section 4.2.3: when AS4_PATH is present "the information
+    // carried by both of the attributes will be considered for AS path loop
+    // detection". This is not pedantry — on a session without four-octet ASN
+    // support a four-octet local AS appears in AS_PATH only as AS_TRANS, so
+    // its own loops are visible in AS4_PATH and nowhere else.
+    let as4_path = pa_map.get::<As4Path>().map(|a| a.0);
+    if as4_path.is_some() {
+        assumed.push(Assumed::As4Path);
+    }
+
+    // Only the copy the decision process compares on is normalised; the
+    // response still renders the attributes as they were received.
+    let mut pa_map = pa_map;
+    if let Some(stripped) =
+        pa_map.get::<HopPath>().as_ref().and_then(strip_leading_confed)
+    {
+        pa_map.set::<HopPath>(stripped);
+    }
 
     let candidate = Candidate {
         mui: record.multi_uniq_id,
@@ -437,10 +480,12 @@ fn classify(
     // looped path that begins with an AS_SET or AS_CONFED_SEQUENCE as
     // `EbgpWithoutNeighbour`. Both exclude the route; the loop is the more
     // specific and more actionable answer.
-    if let (Some(local), Some(path)) =
-        (info.local_asn, candidate.pa_map.get::<HopPath>())
-    {
-        if as_path_contains(&path, local) {
+    if let Some(local) = info.local_asn {
+        let loops = original_path
+            .iter()
+            .chain(as4_path.iter())
+            .any(|path| as_path_contains(path, local));
+        if loops {
             return Err(exclude(IneligibleReason::AsPathLoop));
         }
     }
@@ -450,6 +495,44 @@ fn classify(
     }
 
     Ok(candidate)
+}
+
+/// Whether a hop is an AS_CONFED_SEQUENCE or AS_CONFED_SET segment.
+fn is_confed(hop: &OwnedHop) -> bool {
+    matches!(
+        hop,
+        Hop::Segment(segment)
+            if matches!(
+                segment.stype(),
+                SegmentType::ConfedSequence | SegmentType::ConfedSet
+            )
+    )
+}
+
+/// Normalise an AS_PATH for the decision process by dropping the leading
+/// AS_CONFED segments, if there are any.
+///
+/// RFC 5065 section 5.3 rules 1 and 2 define the neighbour AS of a
+/// confederation route as the leftmost AS of the first AS_SEQUENCE past the
+/// confederation segments, or the local AS when the path is entirely internal
+/// to the confederation. routecore reads the neighbour off the *first* hop, so
+/// it sees a confederation route as having no neighbour at all — which both
+/// gives step c the wrong answer and makes eligibility reject the route.
+///
+/// Dropping the leading confederation segments leaves routecore looking at
+/// exactly the hop the RFC names. It cannot change the step a length, since
+/// `hop_count_path_selection` already skips confederation segments (rule 3),
+/// and an all-confederation path normalises to an empty one, which falls back
+/// to the local ASN — rule 1.
+///
+/// Returns `None` when there is nothing to strip.
+fn strip_leading_confed(path: &HopPath) -> Option<HopPath> {
+    if !path.iter().next().is_some_and(is_confed) {
+        return None;
+    }
+    Some(HopPath::from(
+        path.iter().skip_while(|hop| is_confed(hop)).cloned().collect::<Vec<_>>(),
+    ))
 }
 
 /// Whether `asn` appears anywhere in the AS_PATH.
@@ -621,11 +704,37 @@ pub(crate) fn decisive_step(
     (Ordering::Equal, DecisionStep::Tie)
 }
 
+/// Whether two candidates are indistinguishable through step e, i.e. tied on
+/// every criterion the RFC treats as a real preference.
+///
+/// Steps f and g — the BGP Identifier and the peer address — exist only to
+/// force a single winner out of routes the process has already found equally
+/// good. RFC 4271 section 9.1.2.2's own note on step e says routes reaching
+/// it with equal cost are equal-cost, and it is those a router installs
+/// together for multipath. Reporting them lets an operator see that the
+/// "winner" was picked arbitrarily rather than on merit.
+fn equal_through_step_e(
+    a: &Candidate,
+    b: &Candidate,
+    strategy: Strategy,
+) -> bool {
+    matches!(
+        decisive_step(a, b, strategy).1,
+        DecisionStep::BgpIdentifier
+            | DecisionStep::ClusterListLength
+            | DecisionStep::PeerAddress
+            | DecisionStep::Tie
+    )
+}
+
 //------------ Result --------------------------------------------------------
 
 /// A ranked route, with the step that placed it there.
 pub(crate) struct Ranked {
     pub(crate) rank: usize,
+    /// Tied with the best path through step e, so a router doing multipath
+    /// would install this alongside it. Always true of the best path itself.
+    pub(crate) equal_cost: bool,
     /// For the best path, the step that separated it from the runner-up. For
     /// an alternative, the step at which it lost to the best path. `None` when
     /// there is nothing to compare against (a single candidate).
@@ -726,6 +835,11 @@ pub(crate) fn select(
             decisive_step(&best_candidate, &candidate, options.strategy);
         alternatives.push(Ranked {
             rank: rank + 1,
+            equal_cost: equal_through_step_e(
+                &best_candidate,
+                &candidate,
+                options.strategy,
+            ),
             step: Some(step),
             candidate,
         });
@@ -733,6 +847,7 @@ pub(crate) fn select(
 
     let best = Ranked {
         rank: 1,
+        equal_cost: true,
         step: decided_by,
         candidate: best_candidate,
     };
@@ -746,6 +861,7 @@ pub(crate) fn select(
 struct RowWrapper<'a> {
     result: &'a BestPathResult,
     rank: Option<usize>,
+    equal_cost: Option<bool>,
     step_key: &'static str,
     step: Option<DecisionStep>,
     reason: Option<IneligibleReason>,
@@ -762,6 +878,9 @@ impl Serialize for RowWrapper<'_> {
         let mut map = serializer.serialize_map(None)?;
         if let Some(rank) = self.rank {
             map.serialize_entry("rank", &rank)?;
+        }
+        if let Some(equal_cost) = self.equal_cost {
+            map.serialize_entry("equalCost", &equal_cost)?;
         }
         if let Some(step) = self.step {
             map.serialize_entry(self.step_key, &step)?;
@@ -820,6 +939,7 @@ impl BestPathResult {
         RowWrapper {
             result: self,
             rank: Some(ranked.rank),
+            equal_cost: Some(ranked.equal_cost),
             step_key,
             step: ranked.step,
             reason: None,
@@ -866,6 +986,17 @@ impl Serialize for BestPathResult {
                 eligible: self.total - self.excluded.len(),
                 ineligible: self.excluded.len(),
                 reported: eligible,
+                // The best path counts itself, but only when there is one.
+                equal_cost: match self.best {
+                    None => 0,
+                    Some(_) => {
+                        1 + self
+                            .alternatives
+                            .iter()
+                            .filter(|a| a.equal_cost)
+                            .count()
+                    }
+                },
             },
         )?;
 
@@ -889,6 +1020,7 @@ impl Serialize for BestPathResult {
             .map(|e| RowWrapper {
                 result: self,
                 rank: None,
+                equal_cost: None,
                 step_key: "lostAt",
                 step: None,
                 reason: Some(e.reason),
@@ -912,6 +1044,12 @@ struct Counts {
     /// How many eligible routes this response actually lists, which is lower
     /// than `eligible` when `alternatives=<n>` capped it.
     reported: usize,
+    /// How many of the *listed* routes, the best path included, are tied with
+    /// it through step e — the set a router doing multipath would install.
+    /// `1` means the winner won on merit; more means steps f and g picked it.
+    /// Counted over what is reported, so `alternatives=<n>` caps it too.
+    #[serde(rename = "equalCost")]
+    equal_cost: usize,
 }
 
 //------------ Tests ---------------------------------------------------------
@@ -1791,17 +1929,13 @@ mod tests {
         assert_eq!(out.decided_by(), Some(DecisionStep::Med));
     }
 
-    /// A confederation-external peer's routes begin with an
-    /// AS_CONFED_SEQUENCE, which names no neighbour ASN, so routecore's
-    /// eligibility check rejects them as `ebgpWithoutNeighbour`. RFC 5065
-    /// deployments therefore do not get best-path selection for
-    /// confederation-external routes today.
-    ///
-    /// Pinned as a known limitation rather than asserted as correct: if
-    /// routecore learns to read a neighbour out of an AS_CONFED_SEQUENCE this
-    /// test should be the one that fails and gets updated.
+    //--- RFC 5065 confederations --------------------------------------------
+
+    /// Rule 2: the neighbour AS is the leftmost AS of the first AS_SEQUENCE
+    /// past the confederation segments, so a confederation-external route is
+    /// selectable rather than rejected for naming no neighbour.
     #[test]
-    fn confed_external_routes_are_currently_ineligible() {
+    fn a_confed_external_route_is_selectable() {
         let records = [record(
             1,
             pamap(&[
@@ -1809,16 +1943,344 @@ mod tests {
                 as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]),
             ]),
         )];
-        // A confederation member AS, distinct from ours, so the session reads
-        // as EBGP.
+        // Another Member-AS of our confederation.
         let info = registry(vec![(1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1]))]);
 
         let out = rfc4271(&records, &info);
-        assert!(out.best.is_none());
-        assert_eq!(
-            out.excluded[0].reason,
-            IneligibleReason::EbgpWithoutNeighbour
+        assert_eq!(out.best_mui(), 1);
+        assert!(out.excluded.is_empty(), "{:?}", out.excluded[0].reason);
+    }
+
+    /// Rule 2 again, where it changes an outcome: two confederation routes
+    /// whose real neighbour AS differs must not have their MEDs compared,
+    /// even though both paths begin with a confederation segment.
+    #[test]
+    fn confed_routes_take_the_neighbour_as_from_past_the_confed_segments() {
+        let records = [
+            record(
+                1,
+                pamap(&[
+                    origin(0),
+                    as_path_segments(&[
+                        (CONFED_SEQ, &[65101]),
+                        (SEQ, &[65001]),
+                    ]),
+                    med(500),
+                ]),
+            ),
+            record(
+                2,
+                pamap(&[
+                    origin(0),
+                    as_path_segments(&[
+                        (CONFED_SEQ, &[65102]),
+                        (SEQ, &[65002]),
+                    ]),
+                    med(10),
+                ]),
+            ),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65102, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_ne!(
+            out.decided_by(),
+            Some(DecisionStep::Med),
+            "65001 and 65002 are different neighbour ASes"
         );
+        assert_eq!(out.best_mui(), 1, "lower BGP identifier decides instead");
+        assert_eq!(out.decided_by(), Some(DecisionStep::BgpIdentifier));
+    }
+
+    /// ... and when the neighbour AS past the confederation segments *is* the
+    /// same, the MEDs are comparable after all.
+    #[test]
+    fn confed_routes_with_one_neighbour_as_compare_their_meds() {
+        let path = as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]);
+        let records = [
+            record(1, pamap(&[origin(0), path.clone(), med(500)])),
+            record(2, pamap(&[origin(0), path, med(10)])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65102, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::Med));
+    }
+
+    /// Rule 1: a path made only of confederation segments is internal to the
+    /// confederation, so the neighbour AS is the local AS -- which makes two
+    /// such routes MED-comparable.
+    #[test]
+    fn a_wholly_internal_confed_path_uses_the_local_as_as_neighbour() {
+        let path = as_path_segments(&[(CONFED_SEQ, &[65101, 65102])]);
+        let records = [
+            record(1, pamap(&[origin(0), path.clone(), med(300)])),
+            record(2, pamap(&[origin(0), path, med(7)])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65102, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::Med));
+    }
+
+    /// Rule 4: a peer in the same confederation counts as internal at step d,
+    /// even though its Member-AS number differs from ours. Here the true
+    /// external route must win step d over the confederation one.
+    #[test]
+    fn a_confed_peer_counts_as_internal_at_step_d() {
+        let records = [
+            record(
+                1,
+                pamap(&[
+                    origin(0),
+                    as_path_segments(&[
+                        (CONFED_SEQ, &[65101]),
+                        (SEQ, &[65001]),
+                    ]),
+                ]),
+            ),
+            record(2, plain(&[65001])),
+        ];
+        // Peer 1 has the lower BGP identifier and the lower address, so only
+        // step d can put the external route first.
+        let info = registry(vec![
+            (1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 2);
+        assert_eq!(out.decided_by(), Some(DecisionStep::PeerType));
+    }
+
+    /// Being treated as internal also means LOCAL_PREF is weighed, which
+    /// RFC 5065 section 5.2 explicitly allows across Member-AS boundaries.
+    #[test]
+    fn local_pref_is_weighed_on_a_confed_route() {
+        let confed = as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]);
+        let records = [
+            record(1, pamap(&[origin(0), confed, local_pref(300)])),
+            record(2, plain(&[65001])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1, "LOCAL_PREF beats the external route");
+        assert_eq!(out.decided_by(), Some(DecisionStep::DegreeOfPreference));
+    }
+
+    /// Normalising the path for comparison must not change what the response
+    /// reports: the confederation segments are still in the rendered
+    /// attributes.
+    #[test]
+    fn normalisation_does_not_alter_the_reported_attributes() {
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]),
+            ]),
+        )];
+        let info = registry(vec![(1, ebgp(65101, "10.0.0.1", [10, 0, 0, 1]))]);
+
+        let (best, alternatives, excluded) = select(
+            &records,
+            &info,
+            BestPathOptions::default(),
+        );
+        let result = BestPathResult {
+            prefix: None,
+            query_addr: None,
+            exact_match: true,
+            strategy: Strategy::Rfc4271,
+            best,
+            alternatives,
+            excluded,
+            total: 1,
+            ingress_info: info,
+            query_filter: QueryFilter::default(),
+        };
+        let json = serde_json::to_value(&result).unwrap();
+        let rendered = json["best"]["pathAttributes"].to_string();
+        assert!(
+            rendered.contains("65101"),
+            "the confed segment must survive into the response: {rendered}"
+        );
+    }
+
+    //--- RFC 6793 four-octet ASNs -------------------------------------------
+
+    /// AS4_PATH (type 17), carrying the true four-octet path.
+    fn as4_path(asns: &[u32]) -> Vec<u8> {
+        let mut value = vec![SEQ, asns.len() as u8];
+        for asn in asns {
+            value.extend_from_slice(&asn.to_be_bytes());
+        }
+        let mut out = vec![0xc0, 17, value.len() as u8];
+        out.extend_from_slice(&value);
+        out
+    }
+
+    /// RFC 6793 §4.2.3: "the information carried by both of the attributes
+    /// will be considered for AS path loop detection".
+    ///
+    /// This is the case that matters. On a session without four-octet ASN
+    /// support a four-octet local AS is AS_TRANS (23456) in the AS_PATH, so
+    /// its own loop is visible only in AS4_PATH — reading AS_PATH alone would
+    /// install a looped route.
+    #[test]
+    fn a_loop_visible_only_in_as4_path_is_found() {
+        const AS_TRANS: u32 = 23456;
+        let local = 196_608; // four-octet, so it cannot appear in AS_PATH
+
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path(&[65001, AS_TRANS, 65002]),
+                as4_path(&[65001, local, 65002]),
+            ]),
+        )];
+        let info = registry(vec![(
+            1,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::Bgp)
+                .with_local_asn(Asn::from_u32(local))
+                .with_remote_asn(Asn::from_u32(65001))
+                .with_remote_addr("10.0.0.1".parse::<IpAddr>().unwrap())
+                .with_bgp_id([10, 0, 0, 1]),
+        )]);
+
+        let out = rfc4271(&records, &info);
+        assert!(out.best.is_none(), "the route loops through the local AS");
+        assert_eq!(out.excluded[0].reason, IneligibleReason::AsPathLoop);
+    }
+
+    /// A route carrying AS4_PATH is still selectable — step a is unaffected,
+    /// since the RFC's reconstruction preserves the AS count — but it says
+    /// that its AS_PATH is not the whole story.
+    #[test]
+    fn a_route_with_as4_path_is_selectable_and_says_so() {
+        let records = [record(
+            1,
+            pamap(&[
+                origin(0),
+                as_path(&[65001, 23456]),
+                as4_path(&[65001, 196_608]),
+            ]),
+        )];
+        let info = registry(vec![(1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1]))]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.best_mui(), 1);
+        assert!(out
+            .best
+            .as_ref()
+            .unwrap()
+            .candidate
+            .assumed
+            .contains(&Assumed::As4Path));
+    }
+
+    //--- Equal-cost paths ---------------------------------------------------
+
+    /// Two routes identical until the BGP Identifier are equal-cost: a router
+    /// doing multipath would install both, and the "winner" was picked
+    /// arbitrarily rather than on merit.
+    #[test]
+    fn routes_separated_only_by_step_f_are_equal_cost() {
+        let records =
+            [record(1, plain(&[65001])), record(2, plain(&[65001]))];
+        let info = registry(vec![
+            (1, ebgp(65001, "10.0.0.1", [10, 0, 0, 9])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 1])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.decided_by(), Some(DecisionStep::BgpIdentifier));
+        assert!(out.best.as_ref().unwrap().equal_cost);
+        assert!(out.alternatives[0].equal_cost);
+    }
+
+    /// A route that lost on a real preference is not equal-cost, however
+    /// close the rest of its attributes are.
+    #[test]
+    fn a_route_that_lost_on_merit_is_not_equal_cost() {
+        let records = [
+            record(1, plain(&[65001])),
+            record(2, plain(&[65001, 65002])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+        ]);
+
+        let out = rfc4271(&records, &info);
+        assert_eq!(out.decided_by(), Some(DecisionStep::AsPathLength));
+        assert!(!out.alternatives[0].equal_cost);
+    }
+
+    /// The count is over the whole reported set, and reads 1 when the winner
+    /// genuinely beat everything else.
+    #[test]
+    fn the_equal_cost_count_covers_the_reported_set() {
+        let counts = |records: &[Record<RotondaPaMap>],
+                      info: &HashMap<IngressId, IngressInfo>| {
+            let (best, alternatives, excluded) =
+                select(records, info, BestPathOptions::default());
+            let result = BestPathResult {
+                prefix: None,
+                query_addr: None,
+                exact_match: true,
+                strategy: Strategy::Rfc4271,
+                best,
+                alternatives,
+                excluded,
+                total: records.len(),
+                ingress_info: info.clone(),
+                query_filter: QueryFilter::default(),
+            };
+            serde_json::to_value(&result).unwrap()["counts"]["equalCost"]
+                .as_u64()
+                .unwrap()
+        };
+
+        // Three routes, two of them tied through step e.
+        let tied = [
+            record(1, plain(&[65001])),
+            record(2, plain(&[65001])),
+            record(3, plain(&[65001, 65002])),
+        ];
+        let info = registry(vec![
+            (1, ebgp(65001, "10.0.0.1", [10, 0, 0, 1])),
+            (2, ebgp(65001, "10.0.0.2", [10, 0, 0, 2])),
+            (3, ebgp(65001, "10.0.0.3", [10, 0, 0, 3])),
+        ]);
+        assert_eq!(counts(&tied, &info), 2);
+
+        // A clear winner counts only itself.
+        let clear = [
+            record(1, plain(&[65001])),
+            record(2, plain(&[65001, 65002])),
+        ];
+        assert_eq!(counts(&clear, &info), 1);
+
+        // No best path, nothing equal-cost.
+        assert_eq!(counts(&[], &registry(vec![])), 0);
     }
 
     //--- The explanation must not drift from the ranking --------------------
@@ -1844,6 +2306,22 @@ mod tests {
                 origin(0),
                 as_path(&[65001]),
                 cluster_list(&[[9, 9, 9, 9], [8, 8, 8, 8]]),
+            ]),
+            // Confederation and AS_SET paths, whose normalisation and hop
+            // counting are where an explanation is most likely to drift.
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(CONFED_SEQ, &[65101]), (SEQ, &[65001])]),
+            ]),
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(CONFED_SEQ, &[65102]), (SEQ, &[65002])]),
+                med(20),
+            ]),
+            pamap(&[origin(0), as_path_segments(&[(CONFED_SEQ, &[65101])])]),
+            pamap(&[
+                origin(0),
+                as_path_segments(&[(SEQ, &[65001]), (SET, &[65003, 65004])]),
             ]),
         ];
 

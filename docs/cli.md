@@ -203,6 +203,22 @@ separated it from the runner-up; on the others, the step at which they lost to
 the winner. `Peer` is the owning session, so an ADD-PATH peer's paths are
 attributed to the peer rather than to the internal path-child id.
 
+`=` marks a path tied with the winner through step e — equally good on every
+criterion the RFC treats as a preference, and separated only by the BGP
+Identifier or the peer address. Those are tie-breakers, not preferences, so a
+line below the table says when the winner was picked by one rather than earned
+it:
+
+```
+netom> show ip bgp 10.0.0.0/24 best
+BGP routing table entry for 10.0.0.0/24
+    Network              Next Hop             Path    Peer   Decided by
+>   10.0.0.0/24          192.0.2.2            65001   2      bgpIdentifier
+=   10.0.0.0/24          192.0.2.1            65001   1      bgpIdentifier
+  2 paths are equal-cost (=); the winner was picked by bgpIdentifier, not
+  preferred over them
+```
+
 Routes that could not be weighed at all are listed separately with the reason,
 rather than silently omitted:
 
@@ -211,9 +227,9 @@ rather than silently omitted:
     peer 9 - missingAsPath
 ```
 
-A `note:` line appears when a tiebreaker had to be assumed — most often
-`bgpIdentifier` on a session netom terminates itself, whose peer identifier it
-cannot read. `docs/rib-query-api.md` lists every step, reason and assumption.
+A `note:` line appears when a tiebreaker had to be assumed — an MRT-replayed
+peer has neither a local ASN nor a BGP Identifier, so step d and step f fall
+back. `docs/rib-query-api.md` lists every step, reason and assumption.
 
 `source`, `ingress`, `origin-as` and `community` work here too, narrowing the
 *candidates*: `show ip bgp 10.0.0.0/24 best source bgp` asks what the best path

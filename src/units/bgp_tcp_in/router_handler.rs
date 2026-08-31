@@ -679,6 +679,14 @@ impl Processor {
                                     // else in netom knows the local ASN by
                                     // the time a route reaches the RIB.
                                     .with_local_asn(self.unit_cfg.my_asn)
+                                    // The peer's BGP Identifier from its
+                                    // OPEN. Best-path step f (RFC 4271
+                                    // 9.1.2.2) compares on it, and unlike a
+                                    // BMP-monitored peer -- whose id arrives
+                                    // in every per-peer header -- a session
+                                    // netom terminates itself has no other
+                                    // source for it.
+                                    .with_bgp_id(negotiated.remote_bgp_id())
                                     // Until now only the BMP path set this,
                                     // so native BGP peers had no Up/Down
                                     // value at all. bmp-tcp-out also reads
