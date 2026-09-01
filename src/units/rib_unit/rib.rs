@@ -1733,6 +1733,106 @@ impl Rib {
     /// set seen Disconnected on the previous sweep; any still Disconnected now
     /// have been idle for >= one interval and are reclaimed. Returns the set
     /// to pass to the next sweep.
+    /// Retire ADD-PATH path-children that no longer own an active route.
+    ///
+    /// A child is minted per `(session, path_id)` and, until this ran, was
+    /// only ever reclaimed when its *session* went down: `get_or_create_path_child`
+    /// registers it `Connected`, and [`gc_disconnected_bmp_peers`](
+    /// Self::gc_disconnected_bmp_peers) considers `Disconnected` entries only.
+    /// A router that allocates path ids monotonically and never reuses them --
+    /// which is what the ones in the field do -- therefore grows the register
+    /// for as long as the session stays up. A production collector reached
+    /// 1.34M children, one peer holding 110,914 of them, against a table that
+    /// was not growing; `scripts/addpath-churn.sh` reproduces it at 100% of
+    /// churn retained.
+    ///
+    /// Withdrawing a path leaves its child owning nothing but tombstones, so
+    /// "owns no active record" is the retirement condition. This marks such
+    /// children `Disconnected` and leaves the reclaiming to the GC above,
+    /// which already knows how to drop a path-child's register entry and its
+    /// leftover records together.
+    ///
+    /// Two-pass, like the GC: a child is retired only if it owned nothing in
+    /// this sweep *and* the previous one, so a child minted mid-walk whose
+    /// first announcement is still in flight is not retired from under the
+    /// session. Returns this sweep's candidate set, to be passed back next
+    /// time.
+    pub fn reap_idle_path_children(
+        &self,
+        prev: HashSet<IngressId>,
+    ) -> HashSet<IngressId> {
+        let children: HashMap<IngressId, ()> = self
+            .ingress_register
+            .cloned_info()
+            .into_iter()
+            .filter(|(_, info)| {
+                info.ingress_type == Some(ingress::IngressType::BgpPath)
+                    && info.state
+                        == Some(ingress::register::IngressState::Connected)
+            })
+            .map(|(id, _)| (id, ()))
+            .collect();
+        if children.is_empty() {
+            return HashSet::new();
+        }
+
+        // Which muis still own an active record. Walked prefix-major and in
+        // chunks under short-lived guards, the way the jsonl dump does it:
+        // one guard held across the whole table would pin concurrent churn
+        // garbage for the length of the walk.
+        let mut active_muis: HashSet<IngressId> = HashSet::new();
+        for store in [self.unicast.as_ref(), self.multicast.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            let keys: Vec<Prefix> = store
+                .prefixes_keys_iter_v4()
+                .chain(store.prefixes_keys_iter_v6())
+                .collect();
+            for chunk in keys.chunks(DUMP_KEY_CHUNK) {
+                for &prefix in chunk {
+                    // include_withdrawn = false: a child holding only
+                    // tombstones owns nothing worth keeping it for.
+                    if let Ok(Some(records)) =
+                        store.get_records_for_prefix(&prefix, None, false)
+                    {
+                        for r in records {
+                            active_muis.insert(r.multi_uniq_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        let idle: HashSet<IngressId> = children
+            .keys()
+            .copied()
+            .filter(|id| !active_muis.contains(id))
+            .collect();
+
+        let retire: Vec<IngressId> =
+            idle.intersection(&prev).copied().collect();
+        if !retire.is_empty() {
+            for id in &retire {
+                self.ingress_register.update_info(
+                    *id,
+                    ingress::IngressInfo::new().with_state(
+                        ingress::register::IngressState::Disconnected,
+                    ),
+                );
+            }
+            info!(
+                "rib reap: retired {} ADD-PATH path-child ingress(es) \
+                 with no active routes ({} children, {} still routing)",
+                retire.len(),
+                children.len(),
+                active_muis.len(),
+            );
+        }
+
+        idle
+    }
+
     pub fn gc_disconnected_bmp_peers(
         &self,
         prev: HashSet<IngressId>,

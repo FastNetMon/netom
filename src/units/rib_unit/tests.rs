@@ -1046,6 +1046,86 @@ async fn a_query_snapshots_only_the_ingresses_in_its_result() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn reap_retires_only_path_children_that_stopped_routing() {
+    use crate::ingress::register::IngressState;
+    use crate::ingress::{IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+    use std::collections::HashSet;
+
+    let (runner, _agent) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let register = rib.ingress_register.clone();
+
+    let session = register.register();
+    register.update_info(
+        session,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bgp)
+            .with_state(IngressState::Connected),
+    );
+    let child = |path_id: u32| {
+        let id = register.register();
+        register.update_info(
+            id,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(session)
+                .with_path_id(path_id)
+                .with_state(IngressState::Connected),
+        );
+        id
+    };
+    let live = child(1);
+    let retired = child(2);
+
+    let prefix = inetnum::addr::Prefix::from_str("198.51.100.0/24").unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    for id in [live, retired] {
+        rib.insert(&route, RouteStatus::Active, 1, id, true, false)
+            .unwrap();
+    }
+
+    let state = |id| register.get(id).and_then(|info| info.state);
+
+    // Both are routing, so neither is even a candidate.
+    let candidates = rib.reap_idle_path_children(HashSet::new());
+    assert!(candidates.is_empty());
+    let candidates = rib.reap_idle_path_children(candidates);
+    assert!(candidates.is_empty());
+    assert_eq!(state(live), Some(IngressState::Connected));
+    assert_eq!(state(retired), Some(IngressState::Connected));
+
+    // Withdraw one path. Its records become tombstones, which do not count
+    // as routing, so it becomes a candidate -- but one sweep is not enough.
+    rib.insert(&route, RouteStatus::Withdrawn, 2, retired, false, false)
+        .unwrap();
+    let candidates = rib.reap_idle_path_children(HashSet::new());
+    assert_eq!(
+        candidates.iter().copied().collect::<Vec<_>>(),
+        vec![retired],
+        "the withdrawn path's child is a candidate"
+    );
+    assert_eq!(
+        state(retired),
+        Some(IngressState::Connected),
+        "one sweep must not retire: the child could have been minted \
+         mid-walk with its first announcement still in flight"
+    );
+
+    // Second sweep agrees, so it is retired for the GC to reclaim.
+    rib.reap_idle_path_children(candidates);
+    assert_eq!(state(retired), Some(IngressState::Disconnected));
+    assert_eq!(
+        state(live),
+        Some(IngressState::Connected),
+        "the path still carrying a route is untouched"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ingress_scoped_dump_matches_the_full_table_walk() {
     use crate::ingress::{IngressInfo, IngressType};
     use crate::payload::{RotondaPaMap, RotondaRoute};

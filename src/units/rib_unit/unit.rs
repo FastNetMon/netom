@@ -587,30 +587,68 @@ impl RibUnitRunner {
             crate::tokio::spawn(&"rib-gc".to_string(), async move {
                 const GC_INTERVAL: std::time::Duration =
                     std::time::Duration::from_secs(300);
-                let mut interval = tokio::time::interval(GC_INTERVAL);
+                // Overridable so `scripts/addpath-churn.sh` can watch a reap
+                // cycle complete in seconds instead of half an hour. Not a
+                // documented knob: production wants the constants.
+                let gc_interval = std::env::var("NETOM_RIB_GC_INTERVAL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(std::time::Duration::from_secs)
+                    .unwrap_or(GC_INTERVAL);
+                let mut interval = tokio::time::interval(gc_interval);
                 interval.tick().await; // consume the immediate first tick
                 let mut candidates: HashSet<ingress::IngressId> =
                     HashSet::new();
+                // Path-children that owned no active route last reap; a
+                // child is retired only after two consecutive sweeps agree.
+                let mut idle_children: HashSet<ingress::IngressId> =
+                    HashSet::new();
+                // The reap walks the whole table, so it runs on a multiple of
+                // the GC interval: children accrue at hundreds per hour, not
+                // per second, and a 30-minute lag costs nothing.
+                const REAP_EVERY: u32 = 6;
+                let reap_every = std::env::var("NETOM_RIB_REAP_EVERY_TICKS")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .filter(|v| *v > 0)
+                    .unwrap_or(REAP_EVERY);
+                let mut tick: u32 = 0;
                 loop {
                     interval.tick().await;
+                    tick = tick.wrapping_add(1);
+                    let reap_now = tick % reap_every == 0;
                     let Some(rib_swap) = gc_rib.upgrade() else {
                         break; // rib unit gone; stop sweeping
                     };
                     let rib = rib_swap.load().clone();
                     drop(rib_swap);
                     let prev = std::mem::take(&mut candidates);
-                    candidates =
+                    let prev_idle = std::mem::take(&mut idle_children);
+                    // Retire path-children that no longer route anything
+                    // before the GC runs: the reap marks them Disconnected
+                    // and the GC is what actually reclaims them, so doing it
+                    // in this order costs one interval less per child.
+                    // The walk is heavier than the GC's snapshot, so it runs
+                    // every REAP_EVERY ticks rather than every tick.
+                    let (next_candidates, next_idle) =
                         match tokio::task::spawn_blocking(move || {
-                            rib.gc_disconnected_bmp_peers(prev)
+                            let idle = if reap_now {
+                                rib.reap_idle_path_children(prev_idle)
+                            } else {
+                                prev_idle
+                            };
+                            (rib.gc_disconnected_bmp_peers(prev), idle)
                         })
                         .await
                         {
                             Ok(next) => next,
                             Err(e) => {
                                 error!("rib GC sweep task failed: {e}");
-                                HashSet::new()
+                                (HashSet::new(), HashSet::new())
                             }
                         };
+                    candidates = next_candidates;
+                    idle_children = next_idle;
                 }
             });
         }

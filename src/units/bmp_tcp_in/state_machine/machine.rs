@@ -206,6 +206,8 @@ pub struct PeerState {
     /// child mui, keeping (prefix, mui) unique per path. Teardown must
     /// disconnect and withdraw these together with the peer itself.
     pub path_children: HashMap<PathId, ingress::IngressId>,
+    /// Mints since this peer came up, to amortise the `path_children` prune.
+    pub path_children_minted: usize,
 }
 
 impl std::fmt::Debug for PeerState {
@@ -2059,6 +2061,7 @@ impl PeerAware for PeerStates {
                 ingress_id: peer_ingress_id,
                 synthesized: false,
                 path_children: HashMap::new(),
+                path_children_minted: 0,
             }
         });
         (added, existing_peer_ingress_id)
@@ -2111,6 +2114,27 @@ impl PeerAware for PeerStates {
                 .with_bgp_id(pph.bgp_id()),
         );
         peer_state.path_children.insert(path_id, child_id);
+
+        // Drop cache entries for children the reap has retired. Path ids are
+        // not reused, so a stale entry is never looked up again -- it would
+        // just grow the map for the life of the session, which on a peer
+        // that mints six figures of path ids is the same leak in miniature.
+        // Amortised: one pass per PRUNE_EVERY mints, one register read lock.
+        const PRUNE_EVERY: usize = 4096;
+        peer_state.path_children_minted += 1;
+        if peer_state.path_children_minted % PRUNE_EVERY == 0 {
+            let before = peer_state.path_children.len();
+            register.prune_missing(&mut peer_state.path_children);
+            let dropped = before - peer_state.path_children.len();
+            if dropped > 0 {
+                debug!(
+                    "bmp-in: pruned {dropped} retired path-child cache                      entries for peer {} ({} left)",
+                    pph.address(),
+                    peer_state.path_children.len()
+                );
+            }
+        }
+
         Some((child_id, minted))
     }
 

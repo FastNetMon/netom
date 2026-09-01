@@ -140,6 +140,8 @@ struct Processor {
     /// (`IngressType::BgpPath`, `parent_ingress` = the session's ingress).
     /// Reset on SessionNegotiated; torn down with the session.
     path_children: std::collections::HashMap<PathId, ingress::IngressId>,
+    /// Mints on this session, to amortise the `path_children` prune.
+    path_children_minted: usize,
 
     /// Handle to abort this connection's task during collision resolution.
     /// Populated after the task is spawned.
@@ -180,6 +182,7 @@ impl Processor {
             sessions: super::session_status::registry(),
             ingress_id,
             path_children: Default::default(),
+            path_children_minted: 0,
             abort_handle,
             rtr_cache: Default::default(),
         }
@@ -206,6 +209,7 @@ impl Processor {
             sessions: Default::default(),
             ingress_id: 0,
             path_children: Default::default(),
+            path_children_minted: 0,
             abort_handle: Arc::new(Mutex::new(None)),
             rtr_cache: Default::default(),
         };
@@ -1013,6 +1017,25 @@ impl Processor {
         // matching how `show ip bgp summary` lists it as a single neighbor.
         self.peer_stats.alias(child_id, session_id);
         self.path_children.insert(path_id, child_id);
+
+        // See the BMP state machine's copy of this: entries for children the
+        // reap has retired are never looked up again (path ids do not
+        // repeat), so prune them periodically rather than let the cache grow
+        // for the life of the session.
+        const PRUNE_EVERY: usize = 4096;
+        self.path_children_minted += 1;
+        if self.path_children_minted % PRUNE_EVERY == 0 {
+            let before = self.path_children.len();
+            self.ingresses.prune_missing(&mut self.path_children);
+            let dropped = before - self.path_children.len();
+            if dropped > 0 {
+                debug!(
+                    "bgp-in: pruned {dropped} retired path-child cache                      entries ({} left)",
+                    self.path_children.len()
+                );
+            }
+        }
+
         child_id
     }
 }

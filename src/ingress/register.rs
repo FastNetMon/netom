@@ -281,6 +281,20 @@ impl Register {
         self.info.read().unwrap().clone()
     }
 
+    /// Drop entries of a caller's `… -> IngressId` map whose id no longer
+    /// exists in the register, taking the read lock once.
+    ///
+    /// The BMP state machine and the BGP router handler each cache
+    /// `path_id -> child ingress` per peer. Once the reap retires a child
+    /// (see `Rib::reap_idle_path_children`) that cache entry is stale, and
+    /// since path ids are not reused it would never be looked up again --
+    /// it would simply sit there, growing the map for the life of the
+    /// session. Callers prune periodically rather than per update.
+    pub fn prune_missing<K>(&self, map: &mut HashMap<K, IngressId>) {
+        let lock = self.info.read().unwrap();
+        map.retain(|_, id| lock.contains_key(id));
+    }
+
     /// Snapshot the info for just these ingresses, plus the parent each one
     /// resolves through.
     ///

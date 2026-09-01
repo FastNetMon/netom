@@ -51,6 +51,11 @@ type = "null-out"
 sources = ["rib"]
 EOF
 
+# Shorten the GC/reap cycle so a reap completes inside the test rather than
+# in half an hour. Production uses the constants in units/rib_unit/unit.rs.
+export NETOM_RIB_GC_INTERVAL_SECS="${NETOM_RIB_GC_INTERVAL_SECS:-2}"
+export NETOM_RIB_REAP_EVERY_TICKS="${NETOM_RIB_REAP_EVERY_TICKS:-1}"
+
 "$NETOM_BIN" --config "$WORKDIR/netom.conf" > "$WORKDIR/netom.log" 2>&1 &
 NETOM_PID=$!
 

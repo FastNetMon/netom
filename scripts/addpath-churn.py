@@ -42,6 +42,8 @@ CHURN = int(os.environ.get("CHURN", "2000"))
 # when its last route leaves should keep this near zero; anything above a
 # few percent of the iteration count is the leak.
 TOLERANCE = float(os.environ.get("TOLERANCE", "0.05"))
+# How long to wait for the reap to catch up after the churn stops.
+REAP_WAIT = float(os.environ.get("REAP_WAIT", "120"))
 
 PEER_AS = 65001
 PEER_IP = "10.99.0.1"
@@ -162,8 +164,8 @@ def metrics():
     return out
 
 
-def settle(feeder, seen_before, timeout=30):
-    """Wait until the register stops moving, so counts are not read mid-flight."""
+def settle(timeout=30):
+    """Wait until the counters stop moving, so they are not read mid-flight."""
     last = None
     stable = 0
     end = time.monotonic() + timeout
@@ -180,6 +182,31 @@ def settle(feeder, seen_before, timeout=30):
     return metrics()
 
 
+def wait_for_reap(baseline_children, timeout=REAP_WAIT):
+    """Poll until the reap has retired the idle children, or give up.
+
+    Retirement takes several sweeps by design: the reap needs two passes to
+    confirm a child owns nothing, and the GC then needs two more to reclaim
+    a Disconnected entry. The script shortens both intervals through
+    NETOM_RIB_GC_INTERVAL_SECS / NETOM_RIB_REAP_EVERY_TICKS.
+    """
+    end = time.monotonic() + timeout
+    best = metrics()
+    print(f"waiting up to {timeout}s for the reap to retire idle children...")
+    while time.monotonic() < end:
+        now = metrics()
+        if now["children"] != best["children"]:
+            print(
+                f"  children={now['children']} entries={now['entries']} "
+                f"records={now['records']}"
+            )
+            best = now
+        if now["children"] <= baseline_children:
+            return now
+        time.sleep(1.0)
+    return metrics()
+
+
 def main():
     feeder = connect(BMP_IN_ADDR)
     feeder.sendall(initiation())
@@ -188,7 +215,7 @@ def main():
     # One announcement to establish the session and its first child.
     feeder.sendall(announce(1))
     feeder.sendall(withdraw(1))
-    base = settle(feeder, None)
+    base = settle()
     print(
         f"baseline: entries={base['entries']} children={base['children']} "
         f"prefixes={base['prefixes']} records={base['records']}"
@@ -209,7 +236,13 @@ def main():
             )
     elapsed = time.monotonic() - t0
 
-    after = settle(feeder, base)
+    peak = settle()
+    print(
+        f"peak:     entries={peak['entries']} children={peak['children']} "
+        f"prefixes={peak['prefixes']} records={peak['records']}"
+    )
+
+    after = wait_for_reap(base["children"])
     grown = after["children"] - base["children"]
     ratio = grown / CHURN
 
@@ -223,15 +256,26 @@ def main():
         f"after:    entries={after['entries']} children={after['children']} "
         f"prefixes={after['prefixes']} records={after['records']}"
     )
-    print(f"growth:   +{grown} children for {CHURN} withdrawn paths "
-          f"({ratio:.0%} of churn)")
+    retained = peak["children"] - after["children"]
+    print(
+        f"minted:   {peak['children'] - base['children']} children for "
+        f"{CHURN} path ids"
+    )
+    print(
+        f"reclaimed:{retained} of them after the paths were withdrawn "
+        f"({ratio:+.0%} of churn still held)"
+    )
 
-    # The RIB must be unchanged: one prefix, and the records under it are
-    # the withdrawn leftovers, not live routes.
-    if after["prefixes"] != base["prefixes"]:
+    # Checked at the peak, not after the reap: during the churn the RIB must
+    # hold exactly the prefix that was announced. If it grew, cap 69 was not
+    # negotiated and each path id became its own prefix -- the run would then
+    # be measuring nothing. (After the reap the prefix legitimately goes away
+    # with the last route.)
+    if peak["prefixes"] != base["prefixes"]:
         print(
-            f"FAIL: prefix count moved ({base['prefixes']} -> "
-            f"{after['prefixes']}); the churn was not prefix-neutral"
+            f"FAIL: prefix count moved during churn ({base['prefixes']} -> "
+            f"{peak['prefixes']}); ADD-PATH was probably not negotiated, so "
+            "each path id became a separate prefix"
         )
         return 1
 
@@ -256,7 +300,11 @@ def main():
         return 1
 
     print()
-    print(f"OK: register growth {ratio:.1%} of churn, within {TOLERANCE:.0%}")
+    print(
+        f"OK: {peak['children'] - base['children']} children minted and "
+        f"reclaimed; register growth {max(ratio, 0.0):.1%} of churn, within "
+        f"{TOLERANCE:.0%}"
+    )
     return 0
 
 
