@@ -18,6 +18,7 @@
 mod file;
 mod mqtt;
 mod null;
+mod clickhouse;
 
 pub use mqtt::DEF_MQTT_PORT;
 
