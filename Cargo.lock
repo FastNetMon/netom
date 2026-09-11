@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "netom"
-version = "0.6.0-fnm13"
+version = "0.6.0-fnm14"
 dependencies = [
  "allocator-api2",
  "anyhow",
