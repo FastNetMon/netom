@@ -570,20 +570,33 @@ impl Register {
     ///
     /// Unlike [`find_existing_peer`], this does not require `parent_ingress`
     /// (which BGP sessions don't have). It matches on `remote_addr`,
-    /// `remote_asn`, and `ingress_type`.
-    pub fn find_existing_bgp_session(
+    /// `remote_asn`, and `ingress_type`. Claims the entry under the write
+    /// lock so GC cannot reclaim it while the session is being negotiated.
+    pub fn find_existing_bgp_session_and_claim(
         &self,
         query: &IngressInfo,
     ) -> Option<(IngressId, IngressInfo)> {
-        let lock = self.info.read().unwrap();
-        for (id, info) in lock.iter() {
+        let mut lock = self.info.write().unwrap();
+        for (id, info) in lock.iter_mut() {
             if find_existing_for!(info, query,
                 {remote_addr, remote_asn, ingress_type},
             ) {
+                info.state = Some(IngressState::Connected);
                 return Some((*id, info.clone()));
             }
         }
         None
+    }
+
+    /// Mark an existing ingress down without resurrecting a GC'd child
+    /// that remains in an input handler's cache until its next prune.
+    pub fn mark_disconnected(&self, id: IngressId) -> bool {
+        let mut lock = self.info.write().unwrap();
+        let Some(info) = lock.get_mut(&id) else {
+            return false;
+        };
+        info.state = Some(IngressState::Disconnected);
+        true
     }
 
     /// Find all [`IngressId`]s that are children of the given `parent`
@@ -1141,8 +1154,11 @@ mod tests {
             .with_remote_asn(Asn::from_u32(65000))
             .with_ingress_type(IngressType::Bgp);
 
-        let found = res.find_existing_bgp_session(&query);
-        assert_eq!(found, Some((id, info)));
+        let found = res.find_existing_bgp_session_and_claim(&query);
+        let connected = info.with_state(IngressState::Connected);
+        assert_eq!(found, Some((id, connected.clone())));
+        assert_eq!(res.get(id), Some(connected));
+        assert!(res.remove_if_disconnected(id).is_none());
     }
 
     #[test]
@@ -1160,7 +1176,7 @@ mod tests {
             .with_remote_asn(Asn::from_u32(65001))
             .with_ingress_type(IngressType::Bgp);
 
-        assert_eq!(res.find_existing_bgp_session(&query), None);
+        assert_eq!(res.find_existing_bgp_session_and_claim(&query), None);
     }
 
     #[test]
@@ -1178,7 +1194,7 @@ mod tests {
             .with_remote_asn(Asn::from_u32(65000))
             .with_ingress_type(IngressType::Bgp);
 
-        assert_eq!(res.find_existing_bgp_session(&query), None);
+        assert_eq!(res.find_existing_bgp_session_and_claim(&query), None);
     }
 
     /// Mint a `BgpPath` child under `parent` in the given state.

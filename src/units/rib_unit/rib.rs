@@ -1697,42 +1697,6 @@ impl Rib {
         added
     }
 
-    /// Layer C garbage-collection sweep. Reclaims idle register entries that
-    /// have stayed `Disconnected` across at least one full sweep interval —
-    /// i.e. were torn down and did not reconnect:
-    ///
-    /// * BMP-monitored peers (`IngressType::BgpViaBmp`): their mark-withdrawn
-    ///   RIB records are physically reclaimed (`remove_for_ingresses`).
-    ///   Without this, the peers that Layer D keeps as Disconnected (for mui
-    ///   reuse) would hold their records forever if they never came back.
-    ///   Deferred while any ADD-PATH path-child still references the peer as
-    ///   `parent_ingress` — reclaiming the parent first would leave children
-    ///   whose claim identity dangles; children go first, the session follows
-    ///   one sweep later.
-    ///
-    /// * ADD-PATH path-children (`IngressType::BgpPath`, of both BMP-monitored
-    ///   and direct BGP sessions): they hold RIB records under their own mui,
-    ///   so they take the same record-reclaiming path as `BgpViaBmp` peers.
-    ///   This also reaps children whose path id simply stopped being announced
-    ///   across a session flap (the rebind claim leaves them Disconnected).
-    ///
-    /// * BMP routers (`IngressType::Bmp`, the parent entries) that have **no
-    ///   children left in the register**. These hold no RIB records of their
-    ///   own (routes live under their `BgpViaBmp` children), so only the
-    ///   register entry is removed. A router parent is kept while any child
-    ///   (`parent_ingress == this id`) still exists so a reconnecting peer can
-    ///   rebind to it; once the last child is gone the parent has no reuse
-    ///   value left. Without this path, every torn-down router leaks a
-    ///   permanent `Disconnected` entry — including every TCP connection that
-    ///   drops before sending Initiation (port scan, TLS probe, half-open RST,
-    ///   each minting a childless provisional entry) and every
-    ///   NAT/IP-renumber/sysName change — because the sweep otherwise only
-    ///   reaped `BgpViaBmp`.
-    ///
-    /// Uses a two-sweep set rather than per-entry timestamps: `prev` is the
-    /// set seen Disconnected on the previous sweep; any still Disconnected now
-    /// have been idle for >= one interval and are reclaimed. Returns the set
-    /// to pass to the next sweep.
     /// Retire ADD-PATH path-children that no longer own an active route.
     ///
     /// A child is minted per `(session, path_id)` and, until this ran, was
@@ -1833,6 +1797,42 @@ impl Rib {
         idle
     }
 
+    /// Layer C garbage-collection sweep. Reclaims idle register entries that
+    /// have stayed `Disconnected` across at least one full sweep interval —
+    /// i.e. were torn down and did not reconnect:
+    ///
+    /// * Native and BMP-monitored BGP peers: their mark-withdrawn
+    ///   RIB records are physically reclaimed (`remove_for_ingresses`).
+    ///   Without this, the peers that Layer D keeps as Disconnected (for mui
+    ///   reuse) would hold their records forever if they never came back.
+    ///   Deferred while any ADD-PATH path-child still references the peer as
+    ///   `parent_ingress` — reclaiming the parent first would leave children
+    ///   whose claim identity dangles; children go first, the session follows
+    ///   one sweep later.
+    ///
+    /// * ADD-PATH path-children (`IngressType::BgpPath`, of both BMP-monitored
+    ///   and direct BGP sessions): they hold RIB records under their own mui,
+    ///   so they take the same record-reclaiming path as `BgpViaBmp` peers.
+    ///   This also reaps children whose path id simply stopped being announced
+    ///   across a session flap (the rebind claim leaves them Disconnected).
+    ///
+    /// * BMP routers (`IngressType::Bmp`, the parent entries) that have **no
+    ///   children left in the register**. These hold no RIB records of their
+    ///   own (routes live under their `BgpViaBmp` children), so only the
+    ///   register entry is removed. A router parent is kept while any child
+    ///   (`parent_ingress == this id`) still exists so a reconnecting peer can
+    ///   rebind to it; once the last child is gone the parent has no reuse
+    ///   value left. Without this path, every torn-down router leaks a
+    ///   permanent `Disconnected` entry — including every TCP connection that
+    ///   drops before sending Initiation (port scan, TLS probe, half-open RST,
+    ///   each minting a childless provisional entry) and every
+    ///   NAT/IP-renumber/sysName change — because the sweep otherwise only
+    ///   reaped `BgpViaBmp`.
+    ///
+    /// Uses a two-sweep set rather than per-entry timestamps: `prev` is the
+    /// set seen Disconnected on the previous sweep; any still Disconnected now
+    /// have been idle for >= one interval and are reclaimed. Returns the set
+    /// to pass to the next sweep.
     pub fn gc_disconnected_bmp_peers(
         &self,
         prev: HashSet<IngressId>,
@@ -1860,7 +1860,10 @@ impl Rib {
                 continue;
             }
             match i.ingress_type {
-                Some(ingress::IngressType::BgpViaBmp) => {
+                Some(
+                    ingress::IngressType::BgpViaBmp
+                    | ingress::IngressType::Bgp,
+                ) => {
                     disconnected.insert(*id);
                     // Defer while ADD-PATH path-children still reference
                     // this session as parent: they are reclaimed this
@@ -4118,6 +4121,7 @@ mod tests {
     /// no destination-prefix component is keyed at the family default route
     /// (0.0.0.0/0), shows up in walks/queries there, and is reclaimed by
     /// whole-mui removal like any other record.
+
     #[test]
     fn flowspec_no_dst_rule_keyed_at_default_route() {
         let rib = test_rib();

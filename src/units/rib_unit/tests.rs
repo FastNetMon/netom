@@ -3221,3 +3221,57 @@ async fn best_path_honours_the_path_attribute_field_filter() {
     assert!(attrs.contains("origin"), "{attrs}");
     assert!(!attrs.contains("asPath"), "{attrs}");
 }
+
+
+#[tokio::test]
+async fn gc_reclaims_native_bgp_records_and_spares_reconnect() {
+    use crate::ingress::{register::IngressState, IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+    use std::collections::HashSet;
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+    let prefix: Prefix = "198.51.100.0/24".parse().unwrap();
+    let route = RotondaRoute::Ipv4Unicast(
+        prefix.try_into().unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    for retain in [false, true] {
+        let id = reg.register();
+        reg.update_info(
+            id,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::Bgp)
+                .with_state(IngressState::Disconnected),
+        );
+        rib.insert(&route, RouteStatus::Active, 0, id, retain, false)
+            .unwrap();
+        rib.withdraw_for_ingress(id, None, retain);
+        let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+        assert!(reg.get(id).is_some());
+        rib.gc_disconnected_bmp_peers(prev);
+        assert!(reg.get(id).is_none());
+        assert!(rib
+            .store()
+            .unwrap()
+            .get_records_for_prefix(&prefix, Some(id), true)
+            .unwrap()
+            .is_none_or(|r| r.is_empty()));
+    }
+    let id = reg.register();
+    let identity = IngressInfo::new()
+        .with_ingress_type(IngressType::Bgp)
+        .with_remote_addr("192.0.2.1".parse::<IpAddr>().unwrap())
+        .with_remote_asn(Asn::from_u32(64512));
+    reg.update_info(
+        id,
+        identity.clone().with_state(IngressState::Disconnected),
+    );
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    assert_eq!(reg.find_existing_bgp_session_and_claim(&identity).unwrap().0, id);
+    rib.insert(&route, RouteStatus::Active, 0, id, false, false)
+        .unwrap();
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(reg.get(id).is_some());
+    assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 1);
+}

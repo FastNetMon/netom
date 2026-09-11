@@ -12,13 +12,13 @@ use chrono::{DateTime, Utc};
 use inetnum::asn::Asn;
 use log::{debug, error, warn};
 use rotonda_store::prefix_record::RouteStatus;
+use routecore::bgp::message::update::UpdateTreatment;
 use routecore::bgp::message::{
     Message as BgpMsg, SessionConfig, UpdateMessage,
 };
-use routecore::bgp::message::update::UpdateTreatment;
 use smallvec::{smallvec, SmallVec};
-use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
@@ -563,7 +563,7 @@ impl Processor {
                                 .with_ingress_type(ingress::IngressType::Bgp);
 
                             if let Some((existing_id, _existing_info)) =
-                                self.ingresses.find_existing_bgp_session(&query)
+                                self.ingresses.find_existing_bgp_session_and_claim(&query)
                             {
                                 debug!(
                                     "Reusing existing ingress {} for {:?}",
@@ -589,11 +589,7 @@ impl Processor {
                                         [(ingress::IngressId, Option<ingress::IngressInfo>); 8],
                                     > = smallvec![(existing_id, None)];
                                     for child in stale_children {
-                                        self.ingresses.update_info(
-                                            child,
-                                            ingress::IngressInfo::new()
-                                                .with_state(IngressState::Disconnected),
-                                        );
+                                        self.ingresses.mark_disconnected(child);
                                         entries.push((child, None));
                                     }
                                     self.gate
@@ -641,9 +637,9 @@ impl Processor {
                                     self.gate
                                         .update_data(Update::WithdrawBulk(Box::new(entries)))
                                         .await;
-                                    self.ingresses.remove(old_ingress_id);
-                                    for child in old_children {
-                                        self.ingresses.remove(child);
+                                    for id in std::iter::once(old_ingress_id).chain(old_children) {
+                                        self.ingresses.mark_disconnected(id);
+                                        self.peer_stats.remove(id);
                                     }
                                 }
                             }
@@ -770,19 +766,11 @@ impl Processor {
                     negotiated.remote_addr(),
                     ls.len()
                 );
-                self.ingresses.update_info(
-                    session_ingress_id,
-                    ingress::IngressInfo::new()
-                        .with_state(IngressState::Disconnected),
-                );
+                self.ingresses.mark_disconnected(session_ingress_id);
                 // The session's ADD-PATH path-children disconnect and
                 // withdraw together with it.
                 for child in self.path_children.values() {
-                    self.ingresses.update_info(
-                        *child,
-                        ingress::IngressInfo::new()
-                            .with_state(IngressState::Disconnected),
-                    );
+                    self.ingresses.mark_disconnected(*child);
                 }
                 true
             } else {
@@ -824,13 +812,11 @@ impl Processor {
                 .values()
                 .any(|(_, _, _, _, id)| *id == session_ingress_id);
             if !reclaimed_by_new_session {
-                // Clean up the ingress register entry so it doesn't leak.
-                self.ingresses.remove(session_ingress_id);
-                // Its ADD-PATH path-children reference the removed session
-                // as parent and can never be claimed again; drop them too,
-                // along with the stats aliases pointing at the session.
+                // Keep disconnected registrations until RIB GC has removed
+                // their records. Dropping them here orphaned one retained
+                // table per reconnect, since GC enumerates the register.
+                // A reconnect can atomically claim these IDs in the meantime.
                 for child in self.path_children.values() {
-                    self.ingresses.remove(*child);
                     self.peer_stats.remove(*child);
                 }
                 // And the per-peer stats — the periodic emitter would
@@ -1130,11 +1116,7 @@ pub async fn handle_connection(
     tokio::spawn(async move {
         while let Some(pdu) = pdu_out_rx.recv().await {
             if let Err(e) = tcp_out.write_all(pdu.as_ref()).await {
-                warn!(
-                    "error sending pdu ({:?}): {}",
-                    tcp_out.peer_addr(),
-                    e
-                );
+                warn!("error sending pdu ({:?}): {}", tcp_out.peer_addr(), e);
                 break;
             }
         }
