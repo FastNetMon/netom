@@ -46,6 +46,15 @@ impl Spool {
             }
             bytes[..16].try_into().unwrap()
         } else {
+            for e in fs::read_dir(dir)? {
+                if e?
+                    .path()
+                    .extension()
+                    .is_some_and(|v| v == "open" || v == "ready")
+                {
+                    return Err(invalid("segments exist without their destination manifest; restore the manifest before replay"));
+                }
+            }
             // A crash before manifest rename may leave this uncommitted file.
             let mut file = File::create(dir.join("manifest.tmp"))?;
             let stream = *uuid::Uuid::new_v4().as_bytes();
@@ -338,6 +347,7 @@ mod tests {
     #[test]
     fn corruption_of_attemptable_segment_is_never_repaired() {
         let dir = dir();
+        let spool = Spool::open(&dir, "test").unwrap();
         let mut s = Segment::create(&dir).unwrap();
         s.append(b"binary\0\xff", 1).unwrap();
         let p = s.seal().unwrap();
@@ -345,8 +355,23 @@ mod tests {
         bytes[36] ^= 1;
         fs::write(&p, &bytes).unwrap();
         assert!(validate(&p).is_err());
+        drop(spool);
         let _spool = Spool::open(&dir, "test").unwrap();
         assert_eq!(fs::read(p).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_manifest_cannot_redirect_existing_segments() {
+        let dir = dir();
+        let spool = Spool::open(&dir, "test").unwrap();
+        let mut s = Segment::create(&dir).unwrap();
+        s.append(b"row", 1).unwrap();
+        let path = s.seal().unwrap();
+        drop(spool);
+        fs::remove_file(dir.join("manifest")).unwrap();
+        assert!(Spool::open(&dir, "other destination").is_err());
+        assert_eq!(validate(&path).unwrap().1, 1);
         fs::remove_dir_all(dir).unwrap();
     }
 }

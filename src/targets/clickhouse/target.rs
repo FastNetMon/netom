@@ -511,6 +511,14 @@ fn writer(
             frame_rows = 0;
             last_space_check = Instant::now() - Duration::from_secs(1);
         }
+        // A frame may have flushed on size before the sync interval. Keep
+        // syncing its file on time even when no new events arrive afterward.
+        if synced.elapsed() >= Duration::from_millis(500) {
+            if let Some(s) = segment.as_ref() {
+                s.sync()?;
+            }
+            synced = Instant::now();
+        }
         if seal {
             if let Some(s) = segment.take() {
                 s.seal()?;
