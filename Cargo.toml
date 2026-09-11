@@ -90,6 +90,9 @@ tokio-metrics      = { version = "0.4", default-features = false }
 uuid               = { version = "1.20", features = ["v4", "fast-rng"] }
 sha2               = "0.10"
 csv                = "1.4"
+lz4_flex           = "0.13"
+fs2                = "0.4"
+reqwest            = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 bzip2              = "0.6"
 tokio-stream       = "0.1.18"
 rpki               = { git = "https://github.com/FastNetMon/rpki.git", tag = "v0.19.2-fnm1", features = ["crypto", "rtr"] }
@@ -124,7 +127,6 @@ hex                = "0.4"
 env_logger         = "0.11"
 mrtgen             = { git = "https://github.com/FastNetMon/mrtgen.git", rev = "02fdb5a59ca7a9d344d229e0bde58fa423ccfd62" }
 prometheus-parse   = "0.2"
-reqwest            = { version = "0.12", default-features = false, features = ["json"] }
 rumqttd            = { version = "0.20.0", default-features = false }
 
 [profile.release]
