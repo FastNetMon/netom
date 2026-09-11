@@ -14,6 +14,7 @@ Netom is focused on production deployments that collect, process, and
 redistribute large volumes of BGP and BMP routing data. Compared with the
 Rotonda version from which it was forked, Netom adds:
 
+- [active TCP/TLS BMP input](docs/bmp-tcp-in.md) for pulling exporter feeds;
 - BMP restreaming with an initial RIB dump followed by live updates;
 - bounded buffers, streaming full-RIB exports, and slow-consumer protection;
 - stronger BMP peer lifecycle, reconnect, withdrawal, and memory handling;

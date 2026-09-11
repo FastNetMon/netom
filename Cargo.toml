@@ -26,7 +26,7 @@ name = "netom-cli"
 path = "src/bin/netom-cli/main.rs"
 
 [workspace.package]
-version = "0.6.0-fnm14"
+version = "0.6.0-fnm15"
 edition = "2021"
 rust-version = "1.88"
 authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fastnetmon.com>"]
@@ -167,6 +167,7 @@ assets = [
     ["target/release/netom-cli", "usr/bin/", "755"],
     ["README.md", "usr/share/doc/netom/", "644"],
     ["NOTICE.md", "usr/share/doc/netom/", "644"],
+    ["docs/bmp-tcp-in.md", "usr/share/doc/netom/", "644"],
     ["docs/clickhouse.md", "usr/share/doc/netom/", "644"],
     ["docs/clickhouse/schema.sql", "usr/share/doc/netom/clickhouse/schema.sql", "644"],
     ["docs/clickhouse/example.conf", "usr/share/doc/netom/clickhouse/example.conf", "644"],
