@@ -62,7 +62,8 @@ impl Event {
     pub fn encode(&self, out: &mut Vec<u8>) {
         let raw = self.attrs.get(2..).unwrap_or_default();
         let width = if self.attrs.get(1) == Some(&0) { 2 } else { 4 };
-        let derived = Derived::parse(raw, width).unwrap_or_default();
+        let derived = Derived::parse(raw, width, self.afi, self.safi)
+            .unwrap_or_default();
         out.extend_from_slice(&1u16.to_le_bytes());
         out.extend_from_slice(&self.stream);
         out.extend_from_slice(&self.epoch);
@@ -120,7 +121,12 @@ struct Derived {
     ok: bool,
 }
 impl Derived {
-    fn parse(mut raw: &[u8], width: usize) -> Option<Self> {
+    fn parse(
+        mut raw: &[u8],
+        width: usize,
+        afi: u16,
+        safi: u8,
+    ) -> Option<Self> {
         let mut d = Self::default();
         while !raw.is_empty() {
             let flags = *raw.first()?;
@@ -140,6 +146,9 @@ impl Derived {
                 2 => d.path = Self::path(value, width)?,
                 17 => d.as4_path = Self::path(value, 4)?,
                 3 if len == 4 => {
+                    if afi != 1 || safi != 1 {
+                        continue;
+                    }
                     d.next_hop = Some(ip_bytes(IpAddr::V4(
                         <[u8; 4]>::try_from(value).ok()?.into(),
                     )))
@@ -168,13 +177,19 @@ impl Derived {
                         .collect()
                 }
                 14 => {
+                    if u16::from_be_bytes(value.get(..2)?.try_into().ok()?)
+                        != afi
+                        || *value.get(2)? != safi
+                    {
+                        continue;
+                    }
                     let nhlen = *value.get(3)? as usize;
                     let nh = value.get(4..4 + nhlen)?;
                     d.next_hop = match (value.get(..3)?, nhlen) {
                         ([0, 1, 1], 4) => Some(ip_bytes(IpAddr::V4(
                             <[u8; 4]>::try_from(nh).ok()?.into(),
                         ))),
-                        ([0, 2, 1], 16 | 32) => {
+                        ([0, 1 | 2, 1], 16 | 32) => {
                             Some(nh[..16].try_into().ok()?)
                         }
                         _ => d.next_hop,
@@ -212,6 +227,18 @@ impl Derived {
 mod tests {
     use super::*;
     #[test]
+    fn mixed_family_update_selects_the_routes_own_next_hop() {
+        let mut raw = vec![64, 3, 4, 192, 0, 2, 1, 128, 14, 21, 0, 2, 1, 16];
+        let v6 = ip_bytes("2001:db8::1".parse().unwrap());
+        raw.extend_from_slice(&v6);
+        raw.push(0);
+        assert_eq!(
+            Derived::parse(&raw, 4, 1, 1).unwrap().next_hop,
+            Some(ip_bytes("192.0.2.1".parse().unwrap()))
+        );
+        assert_eq!(Derived::parse(&raw, 4, 2, 1).unwrap().next_hop, Some(v6));
+    }
+    #[test]
     fn legacy_as_path_and_unknown_attribute_are_preserved() {
         let raw = [
             0, 0, 64, 2, 6, 2, 2, 0xfd, 0xe8, 0xfd, 0xe9, 128, 99, 3, 0, 255,
@@ -221,7 +248,7 @@ mod tests {
             attrs: Arc::from(raw),
             ..Default::default()
         };
-        let d = Derived::parse(&raw[2..], 2).unwrap();
+        let d = Derived::parse(&raw[2..], 2, 1, 1).unwrap();
         assert_eq!(d.path, [65000, 65001]);
         let mut bytes = Vec::new();
         e.encode(&mut bytes);
@@ -230,9 +257,9 @@ mod tests {
     #[test]
     fn malformed_attributes_never_panic_or_publish_partial_derivations() {
         let raw = [64, 5, 4, 0, 0, 0, 100, 128, 99, 255];
-        assert!(Derived::parse(&raw, 4).is_none());
+        assert!(Derived::parse(&raw, 4, 1, 1).is_none());
         for i in 0..raw.len() {
-            let _ = Derived::parse(&raw[..i], 4);
+            let _ = Derived::parse(&raw[..i], 4, 1, 1);
         }
     }
     #[test]
