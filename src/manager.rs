@@ -1217,6 +1217,42 @@ impl Manager {
         }
     }
 
+    /// Quiesce producers, then let durable targets drain before dropping the
+    /// runtime. Bound the producer wait: a source can be blocked on a full
+    /// target queue, which only target shutdown can release.
+    pub async fn shutdown(&mut self) {
+        let units: Vec<_> = self
+            .running_units
+            .drain()
+            .map(|(name, (_, agent))| {
+                let agent = Arc::new(agent);
+                Self::terminate_unit(&name, agent.clone());
+                agent
+            })
+            .collect();
+        let until = Instant::now() + Duration::from_secs(5);
+        while units.iter().any(|a| !a.is_terminated())
+            && Instant::now() < until
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if units.iter().any(|a| !a.is_terminated()) {
+            log::warn!("Some sources are still stopping; closing target admission to release backpressure");
+        }
+        let targets: Vec<_> = self
+            .running_targets
+            .drain()
+            .map(|(name, (_, sender))| {
+                let sender = Arc::new(sender);
+                Self::terminate_target(&name, sender.clone());
+                sender
+            })
+            .collect();
+        while targets.iter().any(|s| !s.is_closed()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     fn spawn_unit(
         component: Component,
         new_unit: Unit,
@@ -1628,6 +1664,36 @@ pub fn load_filter_name(filter_name: FilterName) -> FilterName {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_waits_for_targets_without_blocking_the_executor() {
+        let mut manager = super::Manager::new();
+        let target: crate::targets::Target =
+            toml::from_str("type = 'null-out'\nsources = []").unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        manager.running_targets.insert(
+            "draining-target".into(),
+            (std::mem::discriminant(&target), tx),
+        );
+        let drained =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = drained.clone();
+        tokio::spawn(async move {
+            assert!(matches!(
+                rx.recv().await,
+                Some(super::TargetCommand::Terminate)
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(rx);
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.shutdown(),
+        )
+        .await
+        .unwrap();
+        assert!(drained.load(std::sync::atomic::Ordering::SeqCst));
+    }
     use std::{
         fmt::Display,
         ops::{Deref, DerefMut},

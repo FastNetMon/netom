@@ -79,9 +79,18 @@ async fn handle_signals(
         error!("Fatal: cannot listen for HUP signals ({}). Aborting.", err);
         ExitError
     })?;
+    let mut term_signals = signal(SignalKind::terminate()).map_err(|err| {
+        error!("Fatal: cannot listen for SIGTERM ({err}). Aborting.");
+        ExitError
+    })?;
 
     loop {
-        let ctrl_c = signal::ctrl_c();
+        let ctrl_c = async {
+            tokio::select! {
+                result = signal::ctrl_c() => result,
+                _ = term_signals.recv() => Ok(()),
+            }
+        };
         pin_mut!(ctrl_c);
 
         let hup = hup_signals.recv();
@@ -92,7 +101,7 @@ async fn handle_signals(
                 error!(
                     "Fatal: listening for SIGHUP signals failed. Aborting."
                 );
-                manager.terminate();
+                manager.shutdown().await;
                 return Err(ExitError);
             }
             Either::Left((Some(_), _)) => {
@@ -168,13 +177,13 @@ async fn handle_signals(
                     ({}). Aborting.",
                     err
                 );
-                manager.terminate();
+                manager.shutdown().await;
                 return Err(ExitError);
             }
             Either::Right((Ok(_), _)) => {
                 // CTRL-C received
-                warn!("CTRL-C (SIGINT) received, shutting down.");
-                manager.terminate();
+                warn!("SIGINT/SIGTERM received, shutting down.");
+                manager.shutdown().await;
                 return Ok(());
             }
         }
