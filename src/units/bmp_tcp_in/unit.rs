@@ -468,71 +468,13 @@ impl BmpTcpInRunner {
             'inner: loop {
                 match self.process_until(listener.accept()).await {
                     ControlFlow::Continue(Ok((tcp_stream, client_addr))) => {
-                        let query_ingress = IngressInfo::new()
-                            .with_parent_ingress(unit_ingress_id)
-                            .with_remote_addr(client_addr.ip())
-                            .with_ingress_type(ingress::IngressType::Bmp);
-                        // Register a provisional ingress id for this TCP
-                        // connection. The router's real identity (incl.
-                        // sysName) and any rebind to an existing id on
-                        // reconnect is resolved once the Initiation message
-                        // arrives (see initiating.rs and
-                        // RouterHandler::read_from_router) — the sysName isn't
-                        // known until then, and resolving here on remote_addr
-                        // alone would conflate distinct exporters behind a NAT.
-                        let router_ingress_id =
-                            self.ingress_register.register();
-                        self.ingress_register
-                            .update_info(router_ingress_id, query_ingress);
-
-                        let state_machine = Arc::new(Mutex::new(Some(
-                            self.router_connected(router_ingress_id),
-                        )));
-
-                        let last_msg_at = Some(Arc::new(
-                            std::sync::RwLock::new(Utc::now()),
-                        ));
-
-                        self.router_states
-                            .insert(router_ingress_id, state_machine.clone());
-
-                        status_reporter
-                            .listener_connection_accepted(client_addr);
-
-                        // Spawn a task to handle the newly connected routers BMP
-                        // message stream.
-
-                        // Choose a name to be reported in application logs.
-                        let child_name = format!(
-                            "router[{}:{}]",
-                            client_addr.ip(),
-                            client_addr.port()
-                        );
-
-                        // Create a status reporter whose name in output will be
-                        // a combination of ours as parent and the newly chosen
-                        // child name, enabling logged messages relating to this
-                        // newly connected router to be distinguished from logged
-                        // messages relating to other connected routers.
-                        let child_status_reporter = Arc::new(
-                            self.status_reporter.add_child(&child_name),
-                        );
-
-                        let router_handler = RouterHandler::new(
-                            self.gate.clone(),
-                            roto_function.clone(),
-                            roto_context.clone(),
-                            self.router_id_template.clone(),
-                            child_status_reporter,
-                            state_machine,
-                            self.tracer.clone(),
-                            self.tracing_mode.clone(),
-                            last_msg_at,
-                            self.bmp_metrics.clone(),
-                            self.ingress_register.clone(),
-                            self.ignore_post_policy_routes,
-                            self.forward_raw_updates,
-                        );
+                        let (child_name, router_handler, router_ingress_id) =
+                            self.prepare_connection(
+                                client_addr,
+                                unit_ingress_id,
+                                roto_function.clone(),
+                                roto_context.clone(),
+                            );
 
                         F::accept_config(
                             child_name,
@@ -550,6 +492,75 @@ impl BmpTcpInRunner {
                 }
             }
         }
+    }
+
+    fn prepare_connection(
+        &self,
+        client_addr: SocketAddr,
+        unit_ingress_id: IngressId,
+        roto_function: Option<RotoFunc>,
+        roto_context: Arc<std::sync::Mutex<Ctx>>,
+    ) -> (String, RouterHandler, IngressId) {
+        let query_ingress = IngressInfo::new()
+            .with_parent_ingress(unit_ingress_id)
+            .with_remote_addr(client_addr.ip())
+            .with_ingress_type(ingress::IngressType::Bmp);
+        // Register a provisional ingress id for this TCP
+        // connection. The router's real identity (incl.
+        // sysName) and any rebind to an existing id on
+        // reconnect is resolved once the Initiation message
+        // arrives (see initiating.rs and
+        // RouterHandler::read_from_router) — the sysName isn't
+        // known until then, and resolving here on remote_addr
+        // alone would conflate distinct exporters behind a NAT.
+        let router_ingress_id = self.ingress_register.register();
+        self.ingress_register
+            .update_info(router_ingress_id, query_ingress);
+
+        let state_machine = Arc::new(Mutex::new(Some(
+            self.router_connected(router_ingress_id),
+        )));
+
+        let last_msg_at = Some(Arc::new(std::sync::RwLock::new(Utc::now())));
+
+        self.router_states
+            .insert(router_ingress_id, state_machine.clone());
+
+        self.status_reporter
+            .listener_connection_accepted(client_addr);
+
+        // Spawn a task to handle the newly connected routers BMP
+        // message stream.
+
+        // Choose a name to be reported in application logs.
+        let child_name =
+            format!("router[{}:{}]", client_addr.ip(), client_addr.port());
+
+        // Create a status reporter whose name in output will be
+        // a combination of ours as parent and the newly chosen
+        // child name, enabling logged messages relating to this
+        // newly connected router to be distinguished from logged
+        // messages relating to other connected routers.
+        let child_status_reporter =
+            Arc::new(self.status_reporter.add_child(&child_name));
+
+        let router_handler = RouterHandler::new(
+            self.gate.clone(),
+            roto_function,
+            roto_context,
+            self.router_id_template.clone(),
+            child_status_reporter,
+            state_machine,
+            self.tracer.clone(),
+            self.tracing_mode.clone(),
+            last_msg_at,
+            self.bmp_metrics.clone(),
+            self.ingress_register.clone(),
+            self.ignore_post_policy_routes,
+            self.forward_raw_updates,
+        );
+
+        (child_name, router_handler, router_ingress_id)
     }
 
     async fn process_until<T, U>(

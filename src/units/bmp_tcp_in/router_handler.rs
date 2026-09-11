@@ -14,8 +14,8 @@ use log::{debug, error, info};
 use routecore::bmp::message::{Message, PeerType};
 
 use smallvec::smallvec;
+use tokio::io::AsyncRead;
 use tokio::sync::Mutex;
-use tokio::{io::AsyncRead, net::TcpStream};
 
 use crate::ingress::register::IngressState;
 use crate::roto_runtime::types::{
@@ -159,9 +159,9 @@ impl RouterHandler {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn run(
+    pub async fn run<T: AsyncRead + Unpin>(
         &self,
-        mut tcp_stream: TcpStream,
+        stream: T,
         router_addr: SocketAddr,
         ingress_id: IngressId,
         ingress_register: Arc<ingress::Register>,
@@ -175,13 +175,10 @@ impl RouterHandler {
         // we need access to the ingress Register to register new IDs, for
         // every peer / session in the BMP connection
     ) -> IngressId {
-        // Discard the write half of the TCP stream as we are a "monitoring
-        // station" and per the BMP RFC 7584 specification _"No BMP message is
-        // ever sent from the monitoring station to the monitored router"_.
-        // See: https://datatracker.ietf.org/doc/html/rfc7854#section-3.2
-        let (rx, _tx) = tcp_stream.split();
+        // BMP collectors only read. Keep the entire transport alive here so
+        // plain TCP and TLS share the parser and the same teardown path.
         self.read_from_router(
-            rx,
+            stream,
             router_addr,
             ingress_id,
             ingress_register,
