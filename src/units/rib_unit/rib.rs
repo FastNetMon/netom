@@ -1054,9 +1054,11 @@ impl Rib {
             // reconnecting peer would look like a re-advertisement and the
             // gauge would never climb back up. This is a roaring-bitmap
             // lookup, cheaper than the tree descents below.
-            if store.mui_is_withdrawn_v4(mui)
-                || store.mui_is_withdrawn_v6(mui)
-            {
+            if if prefix.is_v4() {
+                store.mui_is_withdrawn_v4(mui)
+            } else {
+                store.mui_is_withdrawn_v6(mui)
+            } {
                 return false;
             }
             // `contains` is a bitmap check with no record-map read: false
@@ -1120,12 +1122,16 @@ impl Rib {
         // A reused MUI may still own retained records from its previous
         // session.  Merely clearing the global withdrawn bit would resurrect
         // all of them, including prefixes not announced in the new session.
-        // Remove the old session on the first active announcement instead.
+        // Reset only this family: another family may already have received
+        // fresh routes after reconnecting.
         if route_status == RouteStatus::Active
-            && (store.mui_is_withdrawn_v4(mui)
-                || store.mui_is_withdrawn_v6(mui))
+            && if prefix.is_v4() {
+                store.mui_is_withdrawn_v4(mui)
+            } else {
+                store.mui_is_withdrawn_v6(mui)
+            }
         {
-            self.remove_for_ingresses(&[mui]);
+            self.reset_prefix_family(store, mui, prefix.is_v4(), multicast)?;
             self.ingress_register.update_info(
                 mui,
                 ingress::IngressInfo::new()
@@ -1165,6 +1171,63 @@ impl Rib {
         }
 
         report
+    }
+
+    /// Empty retained records before clearing just this family's withdrawn
+    /// bitmap. The store only exposes whole-MUI physical removal, which would
+    /// erase already reannounced routes in other families.
+    fn reset_prefix_family(
+        &self,
+        store: &Store,
+        mui: IngressId,
+        is_v4: bool,
+        multicast: Multicast,
+    ) -> Result<(), PrefixStoreError> {
+        let _guard =
+            self.withdraw_lock.lock().unwrap_or_else(|p| p.into_inner());
+        // Another first announcement may have completed the reset while
+        // this caller waited for the lock.
+        if !(if is_v4 {
+            store.mui_is_withdrawn_v4(mui)
+        } else {
+            store.mui_is_withdrawn_v6(mui)
+        }) {
+            return Ok(());
+        }
+        let keys: Vec<Prefix> = if is_v4 {
+            store.prefixes_keys_iter_v4().collect()
+        } else {
+            store.prefixes_keys_iter_v6().collect()
+        };
+        for prefix in keys {
+            if store.contains(&prefix, Some(mui)) {
+                store.insert(
+                    &prefix,
+                    Record::new(
+                        mui,
+                        0,
+                        RouteStatus::Withdrawn,
+                        RotondaPaMap::empty_path_attributes(),
+                    ),
+                    None,
+                )?;
+            }
+        }
+        if is_v4 {
+            store.mark_mui_as_active_v4(mui)?;
+        } else {
+            store.mark_mui_as_active_v6(mui)?;
+        }
+        reset_peer_gauge(
+            mui,
+            Some(match (is_v4, multicast.0) {
+                (true, false) => AfiSafiType::Ipv4Unicast,
+                (false, false) => AfiSafiType::Ipv6Unicast,
+                (true, true) => AfiSafiType::Ipv4Multicast,
+                (false, true) => AfiSafiType::Ipv6Multicast,
+            }),
+        );
+        Ok(())
     }
 
     pub fn withdraw_for_ingress(
@@ -3036,8 +3099,12 @@ impl Rib {
             rotonda_store::match_options::MatchType::ExactMatch
         };
 
-        let search =
-            self.search_routes_with(match_type, afisafi, nlri, filter.clone())?;
+        let search = self.search_routes_with(
+            match_type,
+            afisafi,
+            nlri,
+            filter.clone(),
+        )?;
 
         let total = search.query_result.records.len();
         let (best, alternatives, excluded) = super::best_path::select(
@@ -4208,6 +4275,97 @@ mod tests {
             let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
             rib.gc_disconnected_bmp_peers(prev);
             assert!(reg.get(id).is_none());
+        }
+    }
+
+    #[test]
+    fn reconnect_unicast_preserves_reannounced_flowspec() {
+        let rib = test_rib();
+        let mui = 123;
+        let flow = mk_flowspec_v4(FS_DST_PROTO);
+        let unicast = RotondaRoute::Ipv4Unicast(
+            "198.51.100.0/24"
+                .parse::<Prefix>()
+                .unwrap()
+                .try_into()
+                .unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        );
+        for retain in [false, true] {
+            for r in [&flow, &unicast] {
+                rib.insert(r, RouteStatus::Active, 0, mui, retain, false)
+                    .unwrap();
+            }
+            rib.withdraw_for_ingress(mui, None, retain);
+            rib.insert(&flow, RouteStatus::Active, 0, mui, retain, false)
+                .unwrap();
+            rib.insert(&unicast, RouteStatus::Active, 0, mui, retain, false)
+                .unwrap();
+            assert_eq!(flowspec_rows(&rib).len(), 1);
+            assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn prefix_family_reset_preserves_other_families_and_drops_stale_routes() {
+        let rib = test_rib();
+        let mui = 456;
+        let v4: Prefix = "198.51.100.0/24".parse().unwrap();
+        let stale: Prefix = "203.0.113.0/24".parse().unwrap();
+        let v6: Prefix = "2001:db8::/32".parse().unwrap();
+        let pa = RotondaPaMap::empty_path_attributes;
+        let routes = [
+            RotondaRoute::Ipv4Unicast(v4.try_into().unwrap(), pa()),
+            RotondaRoute::Ipv4Unicast(stale.try_into().unwrap(), pa()),
+            RotondaRoute::Ipv6Unicast(v6.try_into().unwrap(), pa()),
+            RotondaRoute::Ipv4Multicast(v4.try_into().unwrap(), pa()),
+            RotondaRoute::Ipv6Multicast(v6.try_into().unwrap(), pa()),
+        ];
+        for r in &routes {
+            rib.insert(r, RouteStatus::Active, 0, mui, true, false)
+                .unwrap();
+        }
+        rib.withdraw_for_ingress(mui, Some(AfiSafiType::Ipv4Unicast), true);
+        // Even an IPv6 update while v4 is withdrawn must not clear v4's flag.
+        rib.insert(&routes[2], RouteStatus::Active, 0, mui, true, false)
+            .unwrap();
+        assert!(rib.store().unwrap().mui_is_withdrawn_v4(mui));
+        rib.insert(&routes[0], RouteStatus::Active, 0, mui, true, false)
+            .unwrap();
+        assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 2);
+        assert!(rib
+            .store()
+            .unwrap()
+            .get_records_for_prefix(&stale, Some(mui), false)
+            .unwrap()
+            .is_none_or(|r| r.is_empty()));
+        for (index, family) in [
+            (2, AfiSafiType::Ipv6Unicast),
+            (3, AfiSafiType::Ipv4Multicast),
+            (4, AfiSafiType::Ipv6Multicast),
+        ] {
+            rib.withdraw_for_ingress(mui, Some(family), true);
+            rib.insert(
+                &routes[index],
+                RouteStatus::Active,
+                0,
+                mui,
+                true,
+                false,
+            )
+            .unwrap();
+            assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 2);
+            let store = rib.multicast.as_ref().as_ref().unwrap();
+            for prefix in [&v4, &v6] {
+                assert_eq!(
+                    store
+                        .get_records_for_prefix(prefix, Some(mui), false)
+                        .unwrap()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
         }
     }
 
