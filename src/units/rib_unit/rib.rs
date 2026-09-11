@@ -1773,6 +1773,31 @@ impl Rib {
             }
         }
 
+        // FlowSpec children can have no unicast/multicast record at all.
+        // Keep them while either family's rule-set is active.
+        if let Some(store) = self.flowspec.as_ref() {
+            let keys: Vec<Prefix> = store
+                .prefixes_keys_iter_v4()
+                .chain(store.prefixes_keys_iter_v6())
+                .collect();
+            for prefix in keys {
+                match store.get_records_for_prefix(&prefix, None, false) {
+                    Ok(Some(records)) => {
+                        for r in records {
+                            if !r.meta.is_empty() {
+                                active_muis.insert(r.multi_uniq_id);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!("abandoning idle path scan: {err}");
+                        return HashMap::new();
+                    }
+                }
+            }
+        }
+
         let idle: HashMap<IngressId, u64> = children
             .iter()
             .filter(|(id, _)| !active_muis.contains(id))
@@ -4125,6 +4150,66 @@ mod tests {
     /// no destination-prefix component is keyed at the family default route
     /// (0.0.0.0/0), shows up in walks/queries there, and is reclaimed by
     /// whole-mui removal like any other record.
+
+    #[test]
+    fn reap_keeps_both_flowspec_families_until_withdrawn() {
+        use crate::ingress::register::IngressState;
+        let rib = test_rib();
+        let reg = &rib.ingress_register;
+        for is_v4 in [true, false] {
+            let id = reg.register();
+            reg.update_info(
+                id,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpPath)
+                    .with_parent_ingress(999u32)
+                    .with_path_id(id)
+                    .with_state(IngressState::Connected),
+            );
+            let bytes = bytes::Bytes::from_static(&[3, 3, 0x81, 17]);
+            let mut parser = octseq::Parser::from_ref(&bytes);
+            let nlri = routecore::bgp::nlri::flowspec::FlowSpecNlri::parse(
+                &mut parser,
+                if is_v4 {
+                    routecore::bgp::types::Afi::Ipv4
+                } else {
+                    routecore::bgp::types::Afi::Ipv6
+                },
+            )
+            .unwrap();
+            let route = if is_v4 {
+                RotondaRoute::Ipv4FlowSpec(
+                    nlri.into(),
+                    RotondaPaMap::empty_path_attributes(),
+                )
+            } else {
+                RotondaRoute::Ipv6FlowSpec(
+                    nlri.into(),
+                    RotondaPaMap::empty_path_attributes(),
+                )
+            };
+            rib.insert(&route, RouteStatus::Active, 0, id, false, false)
+                .unwrap();
+            let idle = rib.reap_idle_path_children(Default::default());
+            assert!(!idle.contains_key(&id));
+            rib.reap_idle_path_children(idle);
+            let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+            rib.gc_disconnected_bmp_peers(prev);
+            assert_eq!(
+                rib.query_flowspec(is_v4, None, false, false, None, None)
+                    .unwrap()
+                    .len(),
+                1
+            );
+            rib.insert(&route, RouteStatus::Withdrawn, 0, id, false, false)
+                .unwrap();
+            let idle = rib.reap_idle_path_children(Default::default());
+            rib.reap_idle_path_children(idle);
+            let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+            rib.gc_disconnected_bmp_peers(prev);
+            assert!(reg.get(id).is_none());
+        }
+    }
 
     #[test]
     fn flowspec_no_dst_rule_keyed_at_default_route() {
