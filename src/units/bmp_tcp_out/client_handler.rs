@@ -85,26 +85,31 @@ fn build_peer_info_for_emit(
 /// path-child (`IngressType::BgpPath`) maps to its parent session for the
 /// downstream per-peer header, carrying its RFC 7911 path id along for NLRI
 /// encoding; anything else emits as itself with no path id. Memoized per
-/// client (the relation is immutable per ingress id); an id not (yet) in
-/// the register resolves to itself and is NOT memoized, so it re-resolves
-/// once registered.
+/// client with bounded memory. If both the cache and the registration are
+/// gone (for example after GC during a long buffered replay), reconnect for
+/// a fresh dump rather than encode a path under a made-up session header.
 async fn resolve_emit_target(
     client: &Arc<ClientState>,
     ingress_register: &register::Register,
     ingress_id: IngressId,
-) -> (IngressId, Option<u32>) {
+) -> Option<(IngressId, Option<u32>)> {
     if let Some(target) = client.cached_emit_target(ingress_id).await {
-        return target;
+        return Some(target);
     }
     let target = match ingress_register.get(ingress_id) {
         Some(info) if info.ingress_type == Some(IngressType::BgpPath) => {
             (info.parent_ingress.unwrap_or(ingress_id), info.path_id)
         }
         Some(_) => (ingress_id, None),
-        None => return (ingress_id, None),
+        None => {
+            if client.request_disconnect() {
+                warn!("bmp-out: ingress {ingress_id} expired during replay; reconnecting {} for a fresh dump", client.remote_addr);
+            }
+            return None;
+        }
     };
     client.cache_emit_target(ingress_id, target).await;
-    target
+    Some(target)
 }
 
 /// Perform the initial table dump for a newly connected BMP client.
@@ -1011,9 +1016,12 @@ async fn send_payload_to_client(
     // header, with their path id re-attached to the NLRI. Everything below
     // (known_peers, PeerInfo cache, lazy Peer Up) keys on the emit id, so
     // sibling paths share one downstream peer.
-    let (ingress_id, path_id) =
+    let Some((ingress_id, path_id)) =
         resolve_emit_target(client, ingress_register, payload.ingress_id)
-            .await;
+            .await
+    else {
+        return false;
+    };
 
     // Fast path: PeerInfo is constant per peer for the session, so once it is
     // cached (Peer Up already sent, header already built) every subsequent
@@ -1061,17 +1069,8 @@ async fn send_payload_to_client(
             fan_in_peer_distinguisher,
         ),
         None => {
-            // Fall back to a default peer info. No parent_ingress is
-            // available, so the fan-in branch in
-            // build_peer_info_for_emit is a no-op and pd stays at zero —
-            // matching the legacy behaviour for this unknown-peer edge
-            // case.
-            build_peer_info_for_emit(
-                &IngressInfo::default(),
-                ingress_register,
-                forward_router_info,
-                fan_in_peer_distinguisher,
-            )
+            client.request_disconnect();
+            return false;
         }
     });
 
@@ -1162,8 +1161,11 @@ async fn send_peer_reappeared(
     // child's mui) reappears as its parent session downstream: children
     // are never peers of their own, and a Peer Up synthesized from the
     // child's thin register entry would carry a bogus header.
-    let (ingress_id, _path_id) =
-        resolve_emit_target(client, ingress_register, ingress_id).await;
+    let Some((ingress_id, _path_id)) =
+        resolve_emit_target(client, ingress_register, ingress_id).await
+    else {
+        return false;
+    };
     if let Some(info) = ingress_register.get(ingress_id) {
         let peer_info = build_peer_info_for_emit(
             &info,
@@ -1264,6 +1266,47 @@ mod tests {
             }
             other => panic!("unexpected BMP message type {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn evicted_emit_target_reresolves_or_requests_fresh_dump() {
+        let register = Arc::new(register::Register::default());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(16);
+        let client = Arc::new(ClientState::new(
+            "127.0.0.1:12345".parse().unwrap(),
+            tx,
+            100,
+            10000,
+        ));
+        register.update_info(
+            1,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(99u32)
+                .with_path_id(77u32),
+        );
+        assert_eq!(
+            resolve_emit_target(&client, &register, 1).await,
+            Some((99, Some(77)))
+        );
+        for id in
+            2..=super::super::client_state::INGRESS_CACHE_CAPACITY as u32 + 1
+        {
+            client.cache_emit_target(id, (99, Some(id))).await;
+        }
+        assert_eq!(client.cached_emit_target(1).await, None);
+        assert_eq!(
+            resolve_emit_target(&client, &register, 1).await,
+            Some((99, Some(77)))
+        );
+        register.remove(1);
+        client.remove_known_peer(99).await;
+        assert_eq!(resolve_emit_target(&client, &register, 1).await, None);
+        assert!(client.disconnect_pending.load(Ordering::Relaxed));
+        assert!(
+            rx.try_recv().is_err(),
+            "never emit a fabricated peer header"
+        );
     }
 
     /// Full dump sequence with a unicast+flowspec peer and a flowspec-only

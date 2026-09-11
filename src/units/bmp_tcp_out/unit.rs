@@ -589,6 +589,13 @@ impl BmpTcpOutRunner {
             Some(_) => ingress_id,
             None => return ingress_id,
         };
+        // Retired children need not generate a session-down update, so
+        // teardown-only eviction cannot bound a long-lived fastpath unit.
+        if self.raw_session_of.len()
+            >= super::client_state::INGRESS_CACHE_CAPACITY
+        {
+            self.raw_session_of.clear();
+        }
         self.raw_session_of.insert(ingress_id, session);
         session
     }

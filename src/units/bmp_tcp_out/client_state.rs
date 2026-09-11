@@ -17,6 +17,11 @@ use crate::ingress::IngressId;
 use crate::mem_stats;
 use crate::payload::Update;
 
+/// These are lookup accelerators, not an archive of every path ever seen.
+/// A full cache is recycled and subsequent misses resolve through the register.
+/// This caps retained metadata even on a consumer that stays connected for months.
+pub(super) const INGRESS_CACHE_CAPACITY: usize = 65_536;
+
 /// Phase of a connected BMP client.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClientPhase {
@@ -66,8 +71,8 @@ pub struct ClientState {
     /// to encode, i.e. an ADD-PATH path-child (`IngressType::BgpPath`) maps
     /// to `(parent session id, Some(path_id))`, anything else to
     /// `(itself, None)`. Both the child→parent relation and an entry's type
-    /// are immutable for the life of an ingress id, so entries never need
-    /// invalidation.
+    /// are immutable for the life of an ingress id. Entries are bounded
+    /// and removed with their session on Peer Down.
     emit_target_cache: RwLock<HashMap<IngressId, (IngressId, Option<u32>)>>,
 
     /// When this client connected.
@@ -297,6 +302,12 @@ impl ClientState {
     /// current register state.
     pub async fn remove_known_peer(&self, ingress_id: IngressId) -> bool {
         self.peer_info_cache.write().await.remove(&ingress_id);
+        self.emit_target_cache
+            .write()
+            .await
+            .retain(|id, (parent, _)| {
+                *id != ingress_id && *parent != ingress_id
+            });
         self.known_peers.write().await.remove(&ingress_id)
     }
 
@@ -343,10 +354,13 @@ impl ClientState {
         ingress_id: IngressId,
         target: (IngressId, Option<u32>),
     ) {
-        self.emit_target_cache
-            .write()
-            .await
-            .insert(ingress_id, target);
+        let mut cache = self.emit_target_cache.write().await;
+        if cache.len() >= INGRESS_CACHE_CAPACITY
+            && !cache.contains_key(&ingress_id)
+        {
+            cache.clear();
+        }
+        cache.insert(ingress_id, target);
     }
 }
 
@@ -382,5 +396,44 @@ impl std::fmt::Debug for ClientState {
                 &self.messages_sent.load(Ordering::Relaxed),
             )
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod ingress_cache_tests {
+    use super::*;
+    #[tokio::test]
+    async fn emit_cache_is_bounded_during_path_churn_and_cleared_on_peer_down(
+    ) {
+        let (tx, _rx) = mpsc::channel(16);
+        let client = ClientState::new(
+            "127.0.0.1:12345".parse().unwrap(),
+            tx,
+            100,
+            10000,
+        );
+        client.add_known_peer(7).await;
+        for id in 0..(INGRESS_CACHE_CAPACITY as u32 * 2 + 10) {
+            client.cache_emit_target(id, (7, Some(id))).await;
+            assert!(
+                client.emit_target_cache.read().await.len()
+                    <= INGRESS_CACHE_CAPACITY
+            );
+        }
+        assert_eq!(
+            client
+                .cached_emit_target(INGRESS_CACHE_CAPACITY as u32 * 2 + 9)
+                .await,
+            Some((7, Some(INGRESS_CACHE_CAPACITY as u32 * 2 + 9)))
+        );
+        client.cache_emit_target(u32::MAX, (8, None)).await;
+        client.remove_known_peer(7).await;
+        assert_eq!(client.emit_target_cache.read().await.len(), 1);
+        assert_eq!(
+            client.cached_emit_target(u32::MAX).await,
+            Some((8, None))
+        );
+        client.remove_known_peer(8).await;
+        assert!(client.emit_target_cache.read().await.is_empty());
     }
 }
