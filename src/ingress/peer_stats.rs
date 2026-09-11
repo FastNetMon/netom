@@ -259,6 +259,15 @@ impl BgpPeerStatsRegistry {
             .map(|e| e.stats().clone())
     }
 
+    /// Only a session owns the aggregate gauge. Resetting a path-child's
+    /// alias would also erase counts contributed by its live siblings.
+    pub fn get_session(&self, id: IngressId) -> Option<Arc<BgpPeerStats>> {
+        match self.inner.read().unwrap().get(&id) {
+            Some(Entry::Session(stats)) => Some(stats.clone()),
+            _ => None,
+        }
+    }
+
     /// True when no native BGP session has stats. Lets hot paths bail out
     /// before touching the lock.
     pub fn is_empty(&self) -> bool {

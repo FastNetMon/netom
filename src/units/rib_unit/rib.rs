@@ -228,7 +228,7 @@ fn prefix_afi_safi(prefix: &Prefix, multicast: Multicast) -> AfiSafiKey {
 /// walking prefixes — so the gauge has to be reset explicitly here or it
 /// would keep reporting a table for a peer that has none.
 fn reset_peer_gauge(mui: IngressId, family: Option<AfiSafiType>) {
-    let Some(gauge) = peer_gauge(mui) else {
+    let Some(gauge) = peer_stats::registry().get_session(mui) else {
         return;
     };
     match family {
@@ -2005,6 +2005,10 @@ impl Rib {
                 .collect();
             if !reclaimed.is_empty() {
                 self.remove_for_ingresses(&reclaimed);
+                let stats = peer_stats::registry();
+                for id in &reclaimed {
+                    stats.remove(*id);
+                }
                 info!(
                     "rib GC: reclaimed {} peer/path ingress(es) idle \
                      (Disconnected) for >= one GC interval",

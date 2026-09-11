@@ -3320,3 +3320,62 @@ async fn reap_spares_path_activity_between_sweeps_and_gc() {
     assert!(reg.get(child).is_some());
     assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn gc_removes_path_stats_alias_without_resetting_live_sibling() {
+    use crate::ingress::{
+        peer_stats, register::IngressState, IngressInfo, IngressType,
+    };
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+    use std::collections::HashSet;
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+    let stats = peer_stats::registry();
+    let (session, live, idle) = (990101, 990102, 990103);
+    let gauge = stats.get_or_create(session);
+    reg.update_info(
+        session,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::Bgp)
+            .with_state(IngressState::Connected),
+    );
+    for id in [live, idle] {
+        reg.update_info(
+            id,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpPath)
+                .with_parent_ingress(session)
+                .with_path_id(id)
+                .with_state(IngressState::Connected),
+        );
+        assert!(stats.alias(id, session));
+    }
+    let route = RotondaRoute::Ipv4Unicast(
+        "198.51.100.0/24"
+            .parse::<Prefix>()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    for id in [live, idle] {
+        rib.insert(&route, RouteStatus::Active, 0, id, false, false)
+            .unwrap();
+    }
+    assert_eq!(gauge.snapshot().adj_rib_in_routes, 2);
+    rib.insert(&route, RouteStatus::Withdrawn, 0, idle, false, false)
+        .unwrap();
+    let candidates = rib.reap_idle_path_children(Default::default());
+    rib.reap_idle_path_children(candidates);
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(reg.get(idle).is_none());
+    assert!(stats.get(idle).is_none());
+    assert!(stats.get(live).is_some());
+    assert_eq!(gauge.snapshot().adj_rib_in_routes, 1);
+    assert_eq!(gauge.snapshot().adj_rib_in_per_afi_safi, vec![((1, 1), 1)]);
+    for id in [live, idle, session] {
+        stats.remove(id);
+    }
+}
