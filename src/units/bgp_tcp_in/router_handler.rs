@@ -966,8 +966,14 @@ impl Processor {
         session_id: ingress::IngressId,
         path_id: PathId,
     ) -> ingress::IngressId {
-        if let Some(child_id) = self.path_children.get(&path_id) {
-            return *child_id;
+        if let Some(&child_id) = self.path_children.get(&path_id) {
+            if self
+                .ingresses
+                .refresh_path_child(child_id, session_id, path_id.0)
+            {
+                return child_id;
+            }
+            self.path_children.remove(&path_id);
         }
 
         let child_id = match self
@@ -1005,8 +1011,8 @@ impl Processor {
         self.path_children.insert(path_id, child_id);
 
         // See the BMP state machine's copy of this: entries for children the
-        // reap has retired are never looked up again (path ids do not
-        // repeat), so prune them periodically rather than let the cache grow
+        // reap has retired may never be looked up again, so prune them
+        // periodically rather than let the cache grow
         // for the life of the session.
         const PRUNE_EVERY: usize = 4096;
         self.path_children_minted += 1;
@@ -1293,5 +1299,36 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod path_child_lifecycle_tests {
+    use super::*;
+    #[tokio::test]
+    async fn cached_path_child_reactivates_or_replaces_retired_registration()
+    {
+        let (mut processor, _gate) =
+            Processor::mock(BgpTcpIn::mock("dummy", Asn::from_u32(12345)));
+        let session = processor.ingresses.register();
+        let old = processor.get_or_create_path_child(session, PathId(77));
+        let generation = processor.ingresses.get(old).unwrap().path_activity;
+        assert!(processor.ingresses.retire_path_child(old, generation));
+        assert_eq!(
+            processor.get_or_create_path_child(session, PathId(77)),
+            old
+        );
+        assert_eq!(
+            processor.ingresses.get(old).unwrap().state,
+            Some(IngressState::Connected)
+        );
+        // An idle scan based on the pre-reactivation snapshot must fail.
+        assert!(!processor.ingresses.retire_path_child(old, generation));
+        let generation = processor.ingresses.get(old).unwrap().path_activity;
+        assert!(processor.ingresses.retire_path_child(old, generation));
+        processor.ingresses.remove_if_disconnected(old).unwrap();
+        let next = processor.get_or_create_path_child(session, PathId(77));
+        assert_ne!(old, next);
+        assert_eq!(processor.ingresses.get(next).unwrap().path_id, Some(77));
     }
 }

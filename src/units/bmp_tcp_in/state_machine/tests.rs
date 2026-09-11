@@ -450,6 +450,63 @@ fn addpath_routes_store_under_path_children_and_tear_down_with_peer() {
 }
 
 #[test]
+fn addpath_cached_child_reactivation_and_teardown_after_gc() {
+    use crate::ingress::register::IngressState;
+    let register: Arc<crate::ingress::Register> = Arc::default();
+    let pph = mk_per_peer_header("127.0.0.1", 12345);
+    let processor = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_peer_up_notification_msg(&pph),
+            None,
+        )
+        .next_state;
+    let announce = || mk_addpath_v4_route_monitoring_msg(&pph, &[77]);
+    let child_id = |res: &super::processing::ProcessingResult| {
+        let MessageType::RoutingUpdate {
+            update: Update::Bulk(payloads),
+            ..
+        } = &res.message_type
+        else {
+            panic!("expected routes");
+        };
+        payloads[0].ingress_id
+    };
+    let res = processor.process_msg(Instant::now(), announce(), None);
+    let old = child_id(&res);
+    let generation = register.get(old).unwrap().path_activity;
+    assert!(register.retire_path_child(old, generation));
+    let res = res.next_state.process_msg(Instant::now(), announce(), None);
+    assert_eq!(child_id(&res), old);
+    assert_eq!(
+        register.get(old).unwrap().state,
+        Some(IngressState::Connected)
+    );
+    assert!(!register.retire_path_child(old, generation));
+    register.mark_disconnected(old);
+    register.remove_if_disconnected(old).unwrap();
+    let res = res.next_state.process_msg(Instant::now(), announce(), None);
+    let fresh = child_id(&res);
+    assert_ne!(fresh, old);
+    assert_eq!(register.get(fresh).unwrap().path_id, Some(77));
+    // Teardown must not recreate a child removed by GC but still cached.
+    register.mark_disconnected(fresh);
+    register.remove_if_disconnected(fresh).unwrap();
+    let _res = res.next_state.process_msg(
+        Instant::now(),
+        mk_peer_down_notification_msg(&pph),
+        None,
+    );
+    assert!(register.get(fresh).is_none());
+}
+
+#[test]
 fn asymmetric_addpath_send_parses_adj_rib_out_path_ids() {
     use crate::ingress;
     use crate::ingress::register::IngressType;

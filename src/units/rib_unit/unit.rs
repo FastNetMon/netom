@@ -601,8 +601,8 @@ impl RibUnitRunner {
                     HashSet::new();
                 // Path-children that owned no active route last reap; a
                 // child is retired only after two consecutive sweeps agree.
-                let mut idle_children: HashSet<ingress::IngressId> =
-                    HashSet::new();
+                let mut idle_children: HashMap<ingress::IngressId, u64> =
+                    HashMap::new();
                 // The reap walks the whole table, so it runs on a multiple of
                 // the GC interval: children accrue at hundreds per hour, not
                 // per second, and a 30-minute lag costs nothing.
@@ -644,7 +644,7 @@ impl RibUnitRunner {
                             Ok(next) => next,
                             Err(e) => {
                                 error!("rib GC sweep task failed: {e}");
-                                (HashSet::new(), HashSet::new())
+                                (HashSet::new(), HashMap::new())
                             }
                         };
                     candidates = next_candidates;

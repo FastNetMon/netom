@@ -180,7 +180,9 @@ macro_rules! info_for_field{
                 pub $field: Option<$type>,
             )*
 
-            // pub last_active: Instant ? to enable 'reconnecting' remotes?
+            // Internal generation for path-child activity; not exposed in APIs.
+            #[serde(skip)]
+            pub(crate) path_activity: u64,
         }
 
         impl $name {
@@ -287,7 +289,7 @@ impl Register {
     /// The BMP state machine and the BGP router handler each cache
     /// `path_id -> child ingress` per peer. Once the reap retires a child
     /// (see `Rib::reap_idle_path_children`) that cache entry is stale, and
-    /// since path ids are not reused it would never be looked up again --
+    /// if its path id is never reused it would never be looked up again --
     /// it would simply sit there, growing the map for the life of the
     /// session. Callers prune periodically rather than per update.
     pub fn prune_missing<K>(&self, map: &mut HashMap<K, IngressId>) {
@@ -599,6 +601,50 @@ impl Register {
         true
     }
 
+    /// Validate a cached path-child and reactivate it atomically with GC.
+    /// Recording activity also invalidates any in-progress idle scan.
+    pub fn refresh_path_child(
+        &self,
+        id: IngressId,
+        parent: IngressId,
+        path_id: u32,
+    ) -> bool {
+        let mut lock = self.info.write().unwrap();
+        let Some(info) = lock.get_mut(&id) else {
+            return false;
+        };
+        if info.ingress_type != Some(IngressType::BgpPath)
+            || info.parent_ingress != Some(parent)
+            || info.path_id != Some(path_id)
+        {
+            return false;
+        }
+        info.path_activity = info.path_activity.saturating_add(1);
+        info.state = Some(IngressState::Connected);
+        true
+    }
+
+    /// Retire only the exact idle generation observed by both sweeps.
+    pub(crate) fn retire_path_child(
+        &self,
+        id: IngressId,
+        activity: u64,
+    ) -> bool {
+        let mut lock = self.info.write().unwrap();
+        let Some(info) = lock.get_mut(&id) else {
+            return false;
+        };
+        if info.ingress_type != Some(IngressType::BgpPath)
+            || info.state != Some(IngressState::Connected)
+            || info.path_activity != activity
+            || activity == u64::MAX
+        {
+            return false;
+        }
+        info.state = Some(IngressState::Disconnected);
+        true
+    }
+
     /// Find all [`IngressId`]s that are children of the given `parent`
     ///
     /// This is used in cases where for example a BMP session (the parent) is
@@ -725,6 +771,7 @@ impl Register {
                 && info.path_id == Some(path_id)
             {
                 info.state = Some(IngressState::Connected);
+                info.path_activity = info.path_activity.saturating_add(1);
                 return Some(*id);
             }
         }

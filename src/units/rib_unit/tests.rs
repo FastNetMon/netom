@@ -1091,7 +1091,7 @@ async fn reap_retires_only_path_children_that_stopped_routing() {
     let state = |id| register.get(id).and_then(|info| info.state);
 
     // Both are routing, so neither is even a candidate.
-    let candidates = rib.reap_idle_path_children(HashSet::new());
+    let candidates = rib.reap_idle_path_children(Default::default());
     assert!(candidates.is_empty());
     let candidates = rib.reap_idle_path_children(candidates);
     assert!(candidates.is_empty());
@@ -1102,9 +1102,9 @@ async fn reap_retires_only_path_children_that_stopped_routing() {
     // as routing, so it becomes a candidate -- but one sweep is not enough.
     rib.insert(&route, RouteStatus::Withdrawn, 2, retired, false, false)
         .unwrap();
-    let candidates = rib.reap_idle_path_children(HashSet::new());
+    let candidates = rib.reap_idle_path_children(Default::default());
     assert_eq!(
-        candidates.iter().copied().collect::<Vec<_>>(),
+        candidates.keys().copied().collect::<Vec<_>>(),
         vec![retired],
         "the withdrawn path's child is a candidate"
     );
@@ -3273,5 +3273,50 @@ async fn gc_reclaims_native_bgp_records_and_spares_reconnect() {
         .unwrap();
     rib.gc_disconnected_bmp_peers(prev);
     assert!(reg.get(id).is_some());
+    assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn reap_spares_path_activity_between_sweeps_and_gc() {
+    use crate::ingress::{register::IngressState, IngressInfo, IngressType};
+    use crate::payload::{RotondaPaMap, RotondaRoute};
+    use std::collections::HashSet;
+    let (runner, _) = RibUnitRunner::mock("").unwrap();
+    let rib = runner.rib();
+    let reg = &rib.ingress_register;
+    let session = reg.register();
+    let child = reg.register();
+    reg.update_info(
+        child,
+        IngressInfo::new()
+            .with_ingress_type(IngressType::BgpPath)
+            .with_parent_ingress(session)
+            .with_path_id(77u32)
+            .with_state(IngressState::Connected),
+    );
+    let idle = rib.reap_idle_path_children(Default::default());
+    assert!(reg.refresh_path_child(child, session, 77));
+    // A payload resolved since the first sweep may still be in flight.
+    let idle = rib.reap_idle_path_children(idle);
+    assert_eq!(reg.get(child).unwrap().state, Some(IngressState::Connected));
+    rib.reap_idle_path_children(idle);
+    assert_eq!(
+        reg.get(child).unwrap().state,
+        Some(IngressState::Disconnected)
+    );
+    let prev = rib.gc_disconnected_bmp_peers(HashSet::new());
+    assert!(reg.refresh_path_child(child, session, 77));
+    let route = RotondaRoute::Ipv4Unicast(
+        "198.51.100.0/24"
+            .parse::<Prefix>()
+            .unwrap()
+            .try_into()
+            .unwrap(),
+        RotondaPaMap::empty_path_attributes(),
+    );
+    rib.insert(&route, RouteStatus::Active, 0, child, false, false)
+        .unwrap();
+    rib.gc_disconnected_bmp_peers(prev);
+    assert!(reg.get(child).is_some());
     assert_eq!(rib.iter_all_prefix_records().unwrap().len(), 1);
 }

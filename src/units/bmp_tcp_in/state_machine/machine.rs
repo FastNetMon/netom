@@ -775,14 +775,10 @@ where
                     std::iter::once(peer.ingress_id)
                         .chain(peer.path_children.values().copied())
                 })
-                .map(|ingress_id| {
-                    self.ingress_register.update_info(
-                        ingress_id,
-                        ingress::IngressInfo::new().with_state(
-                            ingress::register::IngressState::Disconnected,
-                        ),
-                    );
-                    (ingress_id, None)
+                .filter_map(|ingress_id| {
+                    self.ingress_register
+                        .mark_disconnected(ingress_id)
+                        .then_some((ingress_id, None))
                 })
                 .collect();
 
@@ -1822,14 +1818,10 @@ impl PeerStates {
                 std::iter::once(peer.ingress_id)
                     .chain(peer.path_children.values().copied())
             })
-            .map(|ingress_id| {
-                register.update_info(
-                    ingress_id,
-                    ingress::IngressInfo::new().with_state(
-                        ingress::register::IngressState::Disconnected,
-                    ),
-                );
-                (ingress_id, None)
+            .filter_map(|ingress_id| {
+                register
+                    .mark_disconnected(ingress_id)
+                    .then_some((ingress_id, None))
             })
             .collect()
     }
@@ -2085,8 +2077,15 @@ impl PeerAware for PeerStates {
         register: &Arc<ingress::Register>,
     ) -> Option<(ingress::IngressId, bool)> {
         let peer_state = self.0.get_mut(pph)?;
-        if let Some(id) = peer_state.path_children.get(&path_id) {
-            return Some((*id, false));
+        if let Some(&id) = peer_state.path_children.get(&path_id) {
+            if register.refresh_path_child(
+                id,
+                peer_state.ingress_id,
+                path_id.0,
+            ) {
+                return Some((id, false));
+            }
+            peer_state.path_children.remove(&path_id);
         }
 
         let session_id = peer_state.ingress_id;
@@ -2116,7 +2115,7 @@ impl PeerAware for PeerStates {
         peer_state.path_children.insert(path_id, child_id);
 
         // Drop cache entries for children the reap has retired. Path ids are
-        // not reused, so a stale entry is never looked up again -- it would
+        // not necessarily reused, so a stale entry may never be looked up -- it would
         // just grow the map for the life of the session, which on a peer
         // that mints six figures of path ids is the same leak in miniature.
         // Amortised: one pass per PRUNE_EVERY mints, one register read lock.

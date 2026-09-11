@@ -1716,16 +1716,16 @@ impl Rib {
     /// which already knows how to drop a path-child's register entry and its
     /// leftover records together.
     ///
-    /// Two-pass, like the GC: a child is retired only if it owned nothing in
-    /// this sweep *and* the previous one, so a child minted mid-walk whose
-    /// first announcement is still in flight is not retired from under the
-    /// session. Returns this sweep's candidate set, to be passed back next
-    /// time.
+    /// A child is retired only if it owned nothing in two consecutive
+    /// sweeps and its activity generation is unchanged across both scans.
+    /// The final generation check and retirement share the register lock,
+    /// so an announcement resolved during a scan invalidates its snapshot.
+    /// Returns idle children and their generations for the next sweep.
     pub fn reap_idle_path_children(
         &self,
-        prev: HashSet<IngressId>,
-    ) -> HashSet<IngressId> {
-        let children: HashMap<IngressId, ()> = self
+        prev: HashMap<IngressId, u64>,
+    ) -> HashMap<IngressId, u64> {
+        let children: HashMap<IngressId, u64> = self
             .ingress_register
             .cloned_info()
             .into_iter()
@@ -1734,10 +1734,10 @@ impl Rib {
                     && info.state
                         == Some(ingress::register::IngressState::Connected)
             })
-            .map(|(id, _)| (id, ()))
+            .map(|(id, info)| (id, info.path_activity))
             .collect();
         if children.is_empty() {
-            return HashSet::new();
+            return HashMap::new();
         }
 
         // Which muis still own an active record. Walked prefix-major and in
@@ -1757,38 +1757,42 @@ impl Rib {
                 for &prefix in chunk {
                     // include_withdrawn = false: a child holding only
                     // tombstones owns nothing worth keeping it for.
-                    if let Ok(Some(records)) =
-                        store.get_records_for_prefix(&prefix, None, false)
-                    {
-                        for r in records {
-                            active_muis.insert(r.multi_uniq_id);
+                    match store.get_records_for_prefix(&prefix, None, false) {
+                        Ok(Some(records)) => {
+                            for r in records {
+                                active_muis.insert(r.multi_uniq_id);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!("abandoning idle path scan: {err}");
+                            return HashMap::new();
                         }
                     }
                 }
             }
         }
 
-        let idle: HashSet<IngressId> = children
-            .keys()
-            .copied()
-            .filter(|id| !active_muis.contains(id))
+        let idle: HashMap<IngressId, u64> = children
+            .iter()
+            .filter(|(id, _)| !active_muis.contains(id))
+            .map(|(&id, &activity)| (id, activity))
             .collect();
 
-        let retire: Vec<IngressId> =
-            idle.intersection(&prev).copied().collect();
-        if !retire.is_empty() {
-            for id in &retire {
-                self.ingress_register.update_info(
-                    *id,
-                    ingress::IngressInfo::new().with_state(
-                        ingress::register::IngressState::Disconnected,
-                    ),
-                );
-            }
+        let retired = idle
+            .iter()
+            .filter(|(id, activity)| {
+                prev.get(id) == Some(activity)
+                    && self
+                        .ingress_register
+                        .retire_path_child(**id, **activity)
+            })
+            .count();
+        if retired > 0 {
             info!(
                 "rib reap: retired {} ADD-PATH path-child ingress(es) \
                  with no active routes ({} children, {} still routing)",
-                retire.len(),
+                retired,
                 children.len(),
                 active_muis.len(),
             );
