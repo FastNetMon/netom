@@ -15,7 +15,7 @@ use futures::{future::select, pin_mut, Future};
 use log::{debug, warn};
 use routecore::bmp::message::Message as BmpMessage;
 use serde::Deserialize;
-use serde_with::{serde_as, DisplayFromStr};
+
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     sync::{Mutex, RwLock},
@@ -67,10 +67,10 @@ use super::{
 /// second full copy of the table). Keepalive lets the kernel reset the dead
 /// socket, surfacing as EOF in the read loop so the existing teardown
 /// (`disconnect_into_register`) runs and the records become reclaimable.
-const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+pub(super) const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 
 /// Interval between TCP keepalive probes once they start.
-const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+pub(super) const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 //-------- BmpIn -------------------------------------------------------------
 
@@ -125,16 +125,11 @@ pub(crate) type RotoFunc = roto::TypedFunc<
 
 pub const ROTO_FUNC_FILTER_NAME: &str = "bmp_in";
 
-#[serde_as]
 #[derive(Clone, Debug, Deserialize)]
 pub struct BmpTcpIn {
-    /// A colon separated IP address and port number to listen on for incoming
-    /// BMP over TCP connections from routers.
-    ///
-    /// On change: existing connections to routers will be unaffected, new
-    ///            connections will only be accepted at the changed URI.
-    #[serde_as(as = "Arc<DisplayFromStr>")]
-    pub listen: Arc<SocketAddr>,
+    /// Exactly one of `listen = "IP:port"` or `connect = "host:port"`.
+    #[serde(flatten)]
+    pub connection: super::transport::Connection,
 
     #[serde(default = "BmpTcpIn::default_router_id_template")]
     pub router_id_template: String,
@@ -231,7 +226,7 @@ impl BmpTcpIn {
 
         BmpTcpInRunner::new(
             component,
-            self.listen,
+            self.connection,
             gate,
             router_states,
             router_info,
@@ -292,7 +287,7 @@ trait ConfigAcceptor {
 struct BmpTcpInRunner {
     #[allow(dead_code)]
     component: Arc<RwLock<Component>>,
-    listen: Arc<SocketAddr>,
+    connection: super::transport::Connection,
     gate: Gate,
     router_states: Arc<
         FrimMap<
@@ -320,7 +315,7 @@ impl BmpTcpInRunner {
     #[allow(clippy::too_many_arguments)]
     fn new(
         component: Arc<RwLock<Component>>,
-        listen: Arc<SocketAddr>,
+        connection: super::transport::Connection,
         gate: Gate,
         router_states: Arc<
             FrimMap<
@@ -345,7 +340,7 @@ impl BmpTcpInRunner {
     ) -> Self {
         Self {
             component,
-            listen,
+            connection,
             gate,
             router_states,
             router_info,
@@ -371,7 +366,9 @@ impl BmpTcpInRunner {
 
         let runner = Self {
             component: Default::default(),
-            listen: Arc::new("127.0.0.1:12345".parse().unwrap()),
+            connection: super::transport::Connection::Listen(
+                "127.0.0.1:12345".parse().unwrap(),
+            ),
             gate,
             router_states: Default::default(),
             router_info: Default::default(),
@@ -434,8 +431,113 @@ impl BmpTcpInRunner {
         let roto_context = Arc::new(std::sync::Mutex::new(roto_context));
 
         let unit_ingress_id = self.ingress_register.register();
+        let mut backoff = super::transport::Backoff::default();
+        let mut retry_delay = Duration::ZERO;
         loop {
-            let listen_addr = self.listen.clone();
+            if let super::transport::Connection::Connect(config) =
+                self.connection.clone()
+            {
+                if !retry_delay.is_zero() {
+                    match self
+                        .process_until(async {
+                            sleep(retry_delay).await;
+                            Ok(())
+                        })
+                        .await
+                    {
+                        ControlFlow::Continue(Ok(())) => {}
+                        ControlFlow::Continue(Err(_)) => {
+                            backoff.reset();
+                            retry_delay = Duration::ZERO;
+                            continue;
+                        }
+                        ControlFlow::Break(Terminated) => {
+                            return Err(Terminated)
+                        }
+                    }
+                }
+                log::info!("bmp-in: connecting to {}", config.endpoint);
+                let (stream, addr) = match self
+                    .process_until(super::transport::connect(&config))
+                    .await
+                {
+                    ControlFlow::Continue(Ok(connection)) => connection,
+                    ControlFlow::Continue(Err(err)) => {
+                        if self.connection
+                            != super::transport::Connection::Connect(
+                                config.clone(),
+                            )
+                        {
+                            backoff.reset();
+                            retry_delay = Duration::ZERO;
+                        } else {
+                            retry_delay = backoff.next_delay();
+                            warn!(
+                                "bmp-in: {}: {err}; retry in {}s",
+                                config.endpoint,
+                                retry_delay.as_secs()
+                            );
+                        }
+                        continue;
+                    }
+                    ControlFlow::Break(Terminated) => return Err(Terminated),
+                };
+                let started = tokio::time::Instant::now();
+                let (_, handler, ingress_id) = self.prepare_connection(
+                    addr,
+                    unit_ingress_id,
+                    roto_function.clone(),
+                    roto_context.clone(),
+                );
+                let states = self.router_states.clone();
+                let info = self.router_info.clone();
+                let register = self.ingress_register.clone();
+                let (stop, stopped) = tokio::sync::oneshot::channel();
+                let mut session = Box::pin(async move {
+                    let final_id = handler
+                        .run(
+                            super::transport::CancellableReader::new(
+                                stream, stopped,
+                            ),
+                            addr,
+                            ingress_id,
+                            register,
+                            states.clone(),
+                            info.clone(),
+                        )
+                        .await;
+                    states.remove(&final_id);
+                    info.remove(&final_id);
+                    Ok(())
+                });
+                match self.process_until(session.as_mut()).await {
+                    ControlFlow::Continue(Ok(())) => {
+                        if started.elapsed() >= Duration::from_secs(300) {
+                            backoff.reset();
+                        }
+                        retry_delay = backoff.next_delay();
+                    }
+                    outcome => {
+                        let _ = stop.send(());
+                        // Keep the handler alive through teardown. Reconnecting
+                        // before this completes can overlap peer generations.
+                        let _ = session.await;
+                        if matches!(outcome, ControlFlow::Break(_)) {
+                            return Err(Terminated);
+                        }
+                        backoff.reset();
+                        retry_delay = Duration::ZERO;
+                    }
+                }
+                continue;
+            }
+            backoff.reset();
+            retry_delay = Duration::ZERO;
+            let super::transport::Connection::Listen(listen_addr) =
+                self.connection
+            else {
+                unreachable!()
+            };
 
             let bind_with_backoff = || async {
                 let mut wait = 1;
@@ -449,7 +551,7 @@ impl BmpTcpInRunner {
                             status_reporter
                                 .bind_error(&listen_addr.to_string(), &err);
                             sleep(Duration::from_secs(wait)).await;
-                            wait *= 2;
+                            wait = (wait * 2).min(300);
                         }
                         res => break res,
                     }
@@ -584,7 +686,7 @@ impl BmpTcpInRunner {
                         GateStatus::Reconfiguring {
                             new_config:
                                 Unit::BmpTcpIn(BmpTcpIn {
-                                    listen: new_listen,
+                                    connection: new_connection,
                                     router_id_template: new_router_id_template,
                                     filter_name: new_filter_name,
                                     tracing_mode: new_tracing_mode,
@@ -601,9 +703,9 @@ impl BmpTcpInRunner {
                             // router_handler() tasks will receive their
                             // own copy of this Reconfiguring status
                             // update and can react to it accordingly.
-                            let rebind = self.listen != new_listen;
+                            let rebind = self.connection != new_connection;
 
-                            self.listen = new_listen;
+                            self.connection = new_connection;
                             self.filter_name.store(new_filter_name.into());
                             self.router_id_template
                                 .store(new_router_id_template.into());
@@ -795,7 +897,7 @@ mod tests {
     use super::{BmpTcpIn, ConfigAcceptor};
 
     #[test]
-    fn listen_is_required() {
+    fn listen_or_connect_is_required() {
         assert!(mk_config_from_toml("").is_err());
     }
 
@@ -809,6 +911,183 @@ mod tests {
     #[test]
     fn listen_is_the_only_required_field() {
         assert!(mk_config_from_toml("listen = '1.2.3.4:12345'").is_ok());
+    }
+
+    #[test]
+    fn active_configuration_is_unambiguous() {
+        for cfg in [
+            "connect = 'localhost:11019'",
+            "connect = '[::1]:443'\ntls = { insecure = true }",
+            "connect = 'example.org:443'\ntls = {}",
+        ] {
+            assert!(mk_config_from_toml(cfg).is_ok(), "{cfg}");
+        }
+        for cfg in ["listen = '127.0.0.1:123'\nconnect = 'host:123'", "listen = '127.0.0.1:123'\ntls = {}", "connect = 'host:123'\ntls = { insecure = true, ca_file = 'ca.pem' }", "connect = 'host:123'\ntls = { server_name = 'bad name' }"] {
+            assert!(mk_config_from_toml(cfg).is_err(), "{cfg}");
+        }
+    }
+
+    fn active_config(addr: SocketAddr) -> BmpTcpIn {
+        mk_config_from_toml(&format!("connect = '{addr}'")).unwrap()
+    }
+
+    fn start_active(
+        config: BmpTcpIn,
+    ) -> (
+        GateAgent,
+        tokio::task::JoinHandle<Result<(), Terminated>>,
+        Arc<FrimMap<IngressId, Arc<Mutex<Option<BmpState>>>>>,
+    ) {
+        let (mut runner, agent) = BmpTcpInRunner::_mock();
+        runner.connection = config.connection;
+        let states = runner.router_states.clone();
+        let task = tokio::spawn(runner.run::<_, _, crate::common::net::StandardTcpStream, BmpTcpInRunner>(Arc::new(crate::common::net::StandardTcpListenerFactory)));
+        (agent, task, states)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_reconnects_after_eof_and_cleans_up_on_shutdown() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (agent, task, states) =
+            start_active(active_config(listener.local_addr().unwrap()));
+        let (first, _) = timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        drop(first);
+        let (_second, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+        agent.terminate().await;
+        assert!(timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_reconfigure_closes_partial_frame_before_redial() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let first =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (agent, task, states) =
+            start_active(active_config(first.local_addr().unwrap()));
+        let (mut socket, _) = first.accept().await.unwrap();
+        socket.write_all(&[3, 0, 0]).await.unwrap();
+        let (gate, next_agent) = Gate::new(1);
+        agent
+            .reconfigure(
+                Unit::BmpTcpIn(active_config(second.local_addr().unwrap())),
+                gate,
+            )
+            .await
+            .unwrap();
+        let (_socket2, _) = timeout(Duration::from_secs(2), second.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let closed =
+            timeout(Duration::from_secs(2), socket.read(&mut [0; 1]))
+                .await
+                .unwrap();
+        assert!(
+            matches!(closed, Ok(0))
+                || matches!(closed, Err(ref e) if e.kind() == std::io::ErrorKind::ConnectionReset)
+        );
+        next_agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_active_config_preserves_idle_session() {
+        use tokio::io::AsyncReadExt;
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = active_config(listener.local_addr().unwrap());
+        let (agent, task, _) = start_active(config.clone());
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (gate, next_agent) = Gate::new(1);
+        agent
+            .reconfigure(Unit::BmpTcpIn(config), gate)
+            .await
+            .unwrap();
+        assert!(timeout(
+            Duration::from_millis(100),
+            socket.read(&mut [0; 1])
+        )
+        .await
+        .is_err());
+        next_agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_interrupts_tls_handshake() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = mk_config_from_toml(&format!(
+            "connect = '{}'\ntls = {{ insecure = true }}",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let (agent, task, states) = start_active(config);
+        let (_idle, _) = listener.accept().await.unwrap();
+        agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(states.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconfigure_interrupts_retry_backoff() {
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable = listener.local_addr().unwrap();
+        drop(listener);
+        let (agent, task, _) = start_active(active_config(unavailable));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (gate, next_agent) = Gate::new(1);
+        agent
+            .reconfigure(
+                Unit::BmpTcpIn(active_config(listener.local_addr().unwrap())),
+                gate,
+            )
+            .await
+            .unwrap();
+        let (_socket, _) =
+            timeout(Duration::from_millis(500), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        next_agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
     }
 
     // --- Test helpers ------------------------------------------------------
@@ -838,9 +1117,11 @@ mod tests {
         // When the unit is reconfigured to listen for incoming connections on
         // "127.0.0.1:11019":
         let (new_gate, new_agent) = Gate::new(1);
-        let listen = Arc::new("127.0.0.1:11019".parse().unwrap());
+        let connection = super::super::transport::Connection::Listen(
+            "127.0.0.1:11019".parse().unwrap(),
+        );
         let new_config = BmpTcpIn {
-            listen,
+            connection,
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
@@ -906,9 +1187,11 @@ mod tests {
         // When the unit is reconfigured to listen for incoming connections on
         // an unchanged listen address:
         let (new_gate, new_agent) = Gate::new(1);
-        let listen = Arc::new("127.0.0.1:11019".parse().unwrap());
+        let connection = super::super::transport::Connection::Listen(
+            "127.0.0.1:11019".parse().unwrap(),
+        );
         let new_config = BmpTcpIn {
-            listen,
+            connection,
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
@@ -978,9 +1261,11 @@ mod tests {
         // When the unit is reconfigured to listen for incoming connections on
         // an unchanged listen address:
         let (new_gate, new_agent) = Gate::new(1);
-        let listen = Arc::new("127.0.0.1:11019".parse().unwrap());
+        let connection = super::super::transport::Connection::Listen(
+            "127.0.0.1:11019".parse().unwrap(),
+        );
         let new_config = BmpTcpIn {
-            listen,
+            connection,
             router_id_template: Default::default(),
             filter_name: Default::default(),
             tracing_mode: Default::default(),
@@ -1129,7 +1414,9 @@ mod tests {
         let status_reporter = Arc::new(BmpTcpInStatusReporter::default());
         let runner = BmpTcpInRunner {
             component: Default::default(),
-            listen: Arc::new(listen.parse().unwrap()),
+            connection: super::super::transport::Connection::Listen(
+                listen.parse().unwrap(),
+            ),
             gate,
             router_states: Default::default(),
             router_info: Default::default(),

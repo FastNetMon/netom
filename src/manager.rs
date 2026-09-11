@@ -2645,7 +2645,7 @@ mod tests {
         if let UnitOrTargetConfig::UnitConfig(Unit::BmpTcpIn(config)) =
             &item.config
         {
-            assert_eq!(config.listen.to_string(), "5.6.7.8:1818");
+            assert_eq!(config.connection, crate::units::bmp_tcp_in::transport::Connection::Listen("5.6.7.8:1818".parse().unwrap()));
         } else {
             unreachable!();
         }

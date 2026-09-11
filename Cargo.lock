@@ -2131,6 +2131,7 @@ dependencies = [
  "async-trait",
  "atomic_enum",
  "axum 0.8.8",
+ "base64 0.22.1",
  "bytes",
  "bzip2",
  "chrono",
@@ -2185,6 +2186,7 @@ dependencies = [
  "smallvec",
  "socket2 0.6.3",
  "syslog",
+ "tempfile",
  "tikv-jemallocator",
  "tokio",
  "tokio-metrics",
@@ -2193,6 +2195,7 @@ dependencies = [
  "toml 0.9.12+spec-1.1.0",
  "tower-http 0.5.2",
  "uuid",
+ "webpki-roots",
 ]
 
 [[package]]
