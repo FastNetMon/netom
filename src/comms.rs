@@ -76,10 +76,9 @@ use crossbeam_utils::atomic::AtomicCell;
 use futures::future::{select, Either, Future};
 use futures::pin_mut;
 use inetnum::addr::Prefix;
-use log::{error, log_enabled, trace, warn, Level};
+use log::{log_enabled, trace, warn, Level};
 use rotonda_store::match_options::MatchOptions;
 use serde::Deserialize;
-use tokio::sync::mpsc::Sender;
 
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::{Arc, Mutex, Weak};
@@ -112,10 +111,8 @@ const COMMAND_QUEUE_LEN: usize = 16;
 
 #[derive(Debug)]
 pub struct NormalGateState {
-    /// Sender to our command receiver. Cloned when creating a clone of this
-    /// Gate so that the cloned Gate can notify us when it is dropped. Only
-    /// root Gates have this set, not their clones (if any).
-    command_sender: mpsc::Sender<GateCommand>,
+    /// Keep the root command receiver alive even with no external agents.
+    _command_sender: mpsc::Sender<GateCommand>,
 
     /// Senders for propagating received commands to clones of this Gate.
     clone_senders: Arc<FrimMap<Uuid, mpsc::Sender<GateCommand>>>,
@@ -126,8 +123,10 @@ pub struct CloneGateState {
     /// The id of this clone.
     clone_id: Uuid,
 
-    /// A sender for sending commands to the parent of a clone, e.g. detach.
-    parent_command_sender: mpsc::Sender<GateCommand>,
+    /// Register directly with the root, independently of command-channel
+    /// replacement during reconfigure. Weak ownership lets root drop close
+    /// all clone channels even when children remain alive.
+    parent_clones: Weak<FrimMap<Uuid, mpsc::Sender<GateCommand>>>,
 }
 
 #[derive(Debug)]
@@ -198,13 +197,7 @@ impl Drop for Gate {
             trace!("Gate[{} ({}{})]: Drop", self.name, clone_txt, self.id());
         }
         if self.is_clone() {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                tokio::task::block_in_place(move || {
-                    handle.block_on(self.detach());
-                });
-            } else {
-                self.blocking_detach();
-            }
+            self.blocking_detach();
         }
     }
 }
@@ -232,7 +225,7 @@ impl Gate {
             suspended: Default::default(),
             metrics: Default::default(),
             state: GateState::Normal(NormalGateState {
-                command_sender: tx.clone(),
+                _command_sender: tx.clone(),
                 clone_senders: Default::default(),
             }),
             tracer: None,
@@ -291,67 +284,15 @@ impl Gate {
     }
 
     pub async fn detach(&self) {
-        if let GateState::Clone(CloneGateState {
-            clone_id,
-            parent_command_sender,
-            ..
-        }) = &self.state
-        {
-            if log_enabled!(Level::Trace) {
-                let clone_txt = format!("{clone_id} clone of ");
-                trace!(
-                    "Gate[{} ({}{})]: Detach",
-                    self.name,
-                    clone_txt,
-                    self.id()
-                );
-            }
-            if let Err(_err) = parent_command_sender
-                .send(GateCommand::DetachClone {
-                    clone_id: *clone_id,
-                })
-                .await
-            {
-                // TODO
-            }
-        } else {
-            error!(
-                "Gate[{} ({})]: Root gates cannot be detached!",
-                self.name,
-                self.id()
-            );
-        }
+        self.blocking_detach();
     }
 
+    /// Synchronous map removal; never waits on the parent task or runtime.
     pub fn blocking_detach(&self) {
-        if let GateState::Clone(CloneGateState {
-            clone_id,
-            parent_command_sender,
-            ..
-        }) = &self.state
-        {
-            if log_enabled!(Level::Trace) {
-                let clone_txt = format!("{clone_id} clone of ");
-                trace!(
-                    "Gate[{} ({}{})]: Blocking detach",
-                    self.name,
-                    clone_txt,
-                    self.id()
-                );
+        if let GateState::Clone(state) = &self.state {
+            if let Some(clones) = state.parent_clones.upgrade() {
+                clones.remove(&state.clone_id);
             }
-            if let Err(_err) = parent_command_sender.blocking_send(
-                GateCommand::DetachClone {
-                    clone_id: *clone_id,
-                },
-            ) {
-                // TODO
-            }
-        } else {
-            error!(
-                "Gate[{} ({})]: Root gates cannot be blocking detached!",
-                self.name,
-                self.id()
-            );
         }
     }
 
@@ -416,22 +357,6 @@ impl Gate {
             }
 
             match command {
-                GateCommand::AttachClone { clone_id, tx } => {
-                    match &self.state {
-                        GateState::Normal(state) => {
-                            state.clone_senders.insert(clone_id, tx);
-                        }
-                        GateState::Clone(_) => unreachable!(),
-                    }
-                }
-
-                GateCommand::DetachClone { clone_id } => match &self.state {
-                    GateState::Normal(state) => {
-                        let _ = state.clone_senders.remove(&clone_id);
-                    }
-                    GateState::Clone(_) => self.detach().await,
-                },
-
                 GateCommand::Suspension { slot, suspend } => {
                     self.suspension(slot, suspend)
                 }
@@ -563,9 +488,7 @@ impl Gate {
                 // full clone channel would freeze the whole unit, and the
                 // previous `.expect()` on `send().await` crashed the gate task
                 // on a clone-drop race (TOCTOU: the clone closes its receiver
-                // at drop time but the `DetachClone` that prunes `clone_senders`
-                // is only enqueued, so a just-dropped sender is still present
-                // here). `try_send` avoids both failure modes.
+                // at drop time while iteration may still hold an older snapshot). `try_send` avoids both failure modes.
                 //
                 // A clone whose 16-slot command queue is full is one that does
                 // not drain its commands — e.g. the bgp-in peer-stats emitter,
@@ -894,9 +817,9 @@ impl Clone for Gate {
             );
         }
 
-        let parent_command_sender = match &self.state {
-            GateState::Normal(state) => state.command_sender.clone(),
-            GateState::Clone(state) => state.parent_command_sender.clone(),
+        let parent_clones = match &self.state {
+            GateState::Normal(state) => Arc::downgrade(&state.clone_senders),
+            GateState::Clone(state) => state.parent_clones.clone(),
         };
 
         let gate = Gate {
@@ -909,28 +832,16 @@ impl Clone for Gate {
             metrics: self.metrics.clone(),
             state: GateState::Clone(CloneGateState {
                 clone_id,
-                parent_command_sender: parent_command_sender.clone(),
+                parent_clones: parent_clones.clone(),
             }),
             tracer: self.tracer.clone(),
         };
 
-        // Ask the real gate to add our command sender to the set it sends
-        // command notifications to
-        let cloned_name = self.name.clone();
-        let copied_id = self.id();
-        crate::tokio::spawn("gate-attach-clone", async move {
-            let saved_clone_id = clone_id;
-            if let Err(_err) = parent_command_sender
-                .send(GateCommand::AttachClone { clone_id, tx })
-                .await
-            {
-                let clone_txt = format!("{} clone of ", saved_clone_id);
-                error!(
-                    "Gate[{} ({}{})]: Failed to attach clone to parent {}",
-                    cloned_name, clone_txt, copied_id, clone_id
-                );
-            }
-        });
+        // Register before exposing the clone. An asynchronously queued attach
+        // can be lost when reconfigure replaces the root command receiver.
+        if let Some(clones) = parent_clones.upgrade() {
+            clones.insert(clone_id, tx);
+        }
 
         gate
     }
@@ -1741,15 +1652,6 @@ enum GateCommand {
     },
 
     Terminate,
-
-    AttachClone {
-        clone_id: Uuid,
-        tx: Sender<GateCommand>,
-    },
-
-    DetachClone {
-        clone_id: Uuid,
-    },
 }
 
 impl Clone for GateCommand {
@@ -1798,8 +1700,6 @@ impl Display for GateCommand {
             }
             GateCommand::Trigger { .. } => f.write_str("Trigger"),
             GateCommand::Terminate => f.write_str("Terminate"),
-            GateCommand::AttachClone { .. } => f.write_str("AttachClone"),
-            GateCommand::DetachClone { .. } => f.write_str("DetachClone"),
         }
     }
 }
@@ -2060,15 +1960,9 @@ mod tests {
         let (gate, agent) = Gate::new(10);
         let gate_clone = gate.clone();
 
-        eprintln!("CHECKING GATE DOES NOT YET HAVE CLONE SENDER");
+        eprintln!("CHECKING GATE HAS CLONE SENDER IMMEDIATELY");
         assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
-                clone_senders, .. }) if clone_senders.is_empty()));
-
-        // Give the parent gate a chance to process the AttachClone command
-        // that will be sent by the new clone.
-        let _ = gate
-            .process_until(tokio::time::sleep(Duration::from_secs(1)))
-            .await;
+                clone_senders, .. }) if !clone_senders.is_empty()));
 
         eprintln!("CHECKING GATE HAS CLONE SENDER");
         assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
@@ -2101,18 +1995,12 @@ mod tests {
         let (gate, agent) = Gate::new(10);
         let gate_clone = gate.clone();
 
-        eprintln!("CHECKING GATE DOES NOT YET HAVE CLONE SENDER");
+        eprintln!("CHECKING GATE HAS CLONE SENDER IMMEDIATELY");
         assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
-                clone_senders, .. }) if clone_senders.is_empty()));
-
-        // Give the parent gate a chance to process the AttachClone command
-        // that will be sent by the new clone.
-        let _ = gate
-            .process_until(tokio::time::sleep(Duration::from_secs(1)))
-            .await;
+                clone_senders, .. }) if !clone_senders.is_empty()));
 
         eprintln!("CHECKING GATE HAS CLONE SENDER");
-        assert!(matches!(&gate.state, GateState::Normal(NormalGateState { 
+        assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
                 clone_senders, .. }) if !clone_senders.is_empty()));
 
         eprintln!("SENDING TERMINATION COMMAND");
@@ -2132,29 +2020,48 @@ mod tests {
         let (gate, _agent) = Gate::new(10);
         let gate_clone = gate.clone();
 
-        eprintln!("CHECKING GATE DOES NOT YET HAVE CLONE SENDER");
-        assert!(matches!(&gate.state, GateState::Normal(NormalGateState { 
-                clone_senders, .. }) if clone_senders.is_empty()));
-
-        // Give the parent gate a chance to process the AttachClone command
-        // that will be sent by the new clone.
-        let _ = gate
-            .process_until(tokio::time::sleep(Duration::from_secs(1)))
-            .await;
+        eprintln!("CHECKING GATE HAS CLONE SENDER IMMEDIATELY");
+        assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
+                clone_senders, .. }) if !clone_senders.is_empty()));
 
         eprintln!("CHECKING GATE HAS CLONE SENDER");
-        assert!(matches!(&gate.state, GateState::Normal(NormalGateState { 
+        assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
                 clone_senders, .. }) if !clone_senders.is_empty()));
 
         eprintln!("DROPPING CLONED GATE");
         drop(gate_clone);
 
-        // Allow the DetachClone command to be received and acted upon
-        eprintln!("PROCESS COMMANDS IN PARENT GATE");
-        gate.wait(1).await.unwrap();
-
         eprintln!("CHECKING GATE HAS NO CLONE SENDER");
-        assert!(matches!(&gate.state, GateState::Normal(NormalGateState { 
+        assert!(matches!(&gate.state, GateState::Normal(NormalGateState {
                 clone_senders, .. }) if clone_senders.is_empty()));
+    }
+    #[tokio::test]
+    async fn clones_survive_reconfigure_and_detach_without_a_runtime_block() {
+        let (gate, agent) = Gate::new(10);
+        let before = gate.clone();
+        let (new_gate, new_agent) = Gate::new(10);
+        let config = Unit::BmpTcpIn(
+            toml::from_str("listen = '127.0.0.1:11019'").unwrap(),
+        );
+        agent.reconfigure(config, new_gate).await.unwrap();
+        assert!(matches!(
+            gate.process().await,
+            Ok(GateStatus::Reconfiguring { .. })
+        ));
+        assert!(matches!(
+            before.process().await,
+            Ok(GateStatus::Reconfiguring { .. })
+        ));
+        let after = gate.clone();
+        let grandchild = before.clone();
+        new_agent.terminate().await;
+        assert_eq!(gate.process().await, Err(Terminated));
+        assert_eq!(before.process().await, Err(Terminated));
+        assert_eq!(after.process().await, Err(Terminated));
+        assert_eq!(grandchild.process().await, Err(Terminated));
+        drop((before, after, grandchild));
+        assert!(
+            matches!(&gate.state, GateState::Normal(s) if s.clone_senders.is_empty())
+        );
     }
 }
