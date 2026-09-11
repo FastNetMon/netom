@@ -15,10 +15,10 @@
 //------------ Sub-modules ---------------------------------------------------
 //
 // These contain all the actual unit types grouped by shared functionality.
+mod clickhouse;
 mod file;
 mod mqtt;
 mod null;
-mod clickhouse;
 
 pub use mqtt::DEF_MQTT_PORT;
 
@@ -42,6 +42,9 @@ pub enum Target {
 
     #[serde(rename = "null-out")]
     Null(null::Target),
+
+    #[serde(rename = "clickhouse-out")]
+    ClickHouse(clickhouse::ClickHouse),
 }
 
 impl Target {
@@ -53,6 +56,9 @@ impl Target {
         waitpoint: WaitPoint,
     ) -> Result<(), Terminated> {
         match self {
+            Target::ClickHouse(target) => {
+                target.run(component, cmd, waitpoint).await
+            }
             Target::File(target) => {
                 target.run(component, cmd, waitpoint).await
             }
@@ -67,6 +73,7 @@ impl Target {
 
     pub fn type_name(&self) -> &'static str {
         match self {
+            Target::ClickHouse(_) => "clickhouse-out",
             Target::File(_) => "file-out",
             Target::Mqtt(_) => "mqtt-out",
             Target::Null(_) => "null-out",

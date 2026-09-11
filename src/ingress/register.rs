@@ -183,6 +183,12 @@ macro_rules! info_for_field{
             // Internal generation for path-child activity; not exposed in APIs.
             #[serde(skip)]
             pub(crate) path_activity: u64,
+            // Stable across exporter cache eviction; changes when an ingress
+            // is claimed for a new connection. Scoped to this process.
+            #[serde(skip)]
+            pub(crate) history_generation: u64,
+            #[serde(skip)]
+            pub(crate) history_revision: u64,
         }
 
         impl $name {
@@ -204,6 +210,12 @@ macro_rules! info_for_field{
                 //log::debug!("update_info for {id} with {new_info:?}");
 
                 if let Some(mut old) = lock.remove(&id) {
+
+                    if new_info.state == Some(IngressState::Connected)
+                        && old.state != Some(IngressState::Connected) {
+                        old.history_generation = old.history_generation.saturating_add(1);
+                    }
+                    old.history_revision = old.history_revision.saturating_add(1);
 
                     $(
                         update_field!(old, new_info, $field);
@@ -434,6 +446,44 @@ impl Register {
         self.info.read().unwrap().get(&id).cloned()
     }
 
+    /// Borrow compact route/session identity under one register lock. The
+    /// callback must not call back into the register. Avoids cloning a wide
+    /// IngressInfo on every exported observation, including ADD-PATH children.
+    pub(crate) fn with_history_info<R>(
+        &self,
+        id: IngressId,
+        f: impl FnOnce(
+            IngressId,
+            Option<u32>,
+            Option<&IngressInfo>,
+            Option<&IngressInfo>,
+        ) -> R,
+    ) -> R {
+        let lock = self.info.read().unwrap();
+        let child = lock.get(&id);
+        let is_path = child
+            .is_some_and(|i| i.ingress_type == Some(IngressType::BgpPath));
+        let session = if is_path {
+            child.and_then(|i| i.parent_ingress).unwrap_or(id)
+        } else {
+            id
+        };
+        let info = lock.get(&session);
+        let router = info
+            .and_then(|i| i.parent_ingress)
+            .and_then(|id| lock.get(&id));
+        f(
+            session,
+            if is_path {
+                child.and_then(|i| i.path_id)
+            } else {
+                None
+            },
+            info,
+            router,
+        )
+    }
+
     /// Return the small identity subset used by route validation without
     /// cloning the complete ingress record (capabilities and strings).
     pub fn bgp_id_and_remote_asn(
@@ -584,6 +634,10 @@ impl Register {
                 {remote_addr, remote_asn, ingress_type},
             ) {
                 info.state = Some(IngressState::Connected);
+                info.history_generation =
+                    info.history_generation.saturating_add(1);
+                info.history_revision =
+                    info.history_revision.saturating_add(1);
                 return Some((*id, info.clone()));
             }
         }
@@ -598,6 +652,7 @@ impl Register {
             return false;
         };
         info.state = Some(IngressState::Disconnected);
+        info.history_revision = info.history_revision.saturating_add(1);
         true
     }
 
@@ -642,6 +697,7 @@ impl Register {
             return false;
         }
         info.state = Some(IngressState::Disconnected);
+        info.history_revision = info.history_revision.saturating_add(1);
         true
     }
 
@@ -741,6 +797,10 @@ impl Register {
                 {rib_type, peer_rib_type, peer_type, distinguisher, vrf_name}
             ) {
                 info.state = Some(IngressState::Connected);
+                info.history_generation =
+                    info.history_generation.saturating_add(1);
+                info.history_revision =
+                    info.history_revision.saturating_add(1);
                 return Some((*id, info.clone()));
             }
         }
@@ -771,6 +831,10 @@ impl Register {
                 && info.path_id == Some(path_id)
             {
                 info.state = Some(IngressState::Connected);
+                info.history_generation =
+                    info.history_generation.saturating_add(1);
+                info.history_revision =
+                    info.history_revision.saturating_add(1);
                 info.path_activity = info.path_activity.saturating_add(1);
                 return Some(*id);
             }
@@ -818,6 +882,10 @@ impl Register {
             ) {
                 log::debug!("found matching bmp router, id {id}");
                 info.state = Some(IngressState::Connected);
+                info.history_generation =
+                    info.history_generation.saturating_add(1);
+                info.history_revision =
+                    info.history_revision.saturating_add(1);
                 return Some((*id, info.clone()));
             }
         }
@@ -1038,8 +1106,9 @@ mod tests {
         res.update_info(id, info.clone());
         assert_eq!(res.get(id), Some(info));
 
-        let newinfo = IngressInfo::new().with_local_asn(Asn::from_u32(65537));
+        let mut newinfo = IngressInfo::new().with_local_asn(Asn::from_u32(65537));
         res.update_info(id, newinfo.clone());
+        newinfo.history_revision = 1;
         assert_eq!(res.get(id), Some(newinfo));
 
         let newinfo_2 = IngressInfo::new().with_rib_type(RibType::LocRib);
@@ -1202,7 +1271,9 @@ mod tests {
             .with_ingress_type(IngressType::Bgp);
 
         let found = res.find_existing_bgp_session_and_claim(&query);
-        let connected = info.with_state(IngressState::Connected);
+        let mut connected = info.with_state(IngressState::Connected);
+        connected.history_generation = 1;
+        connected.history_revision = 1;
         assert_eq!(found, Some((id, connected.clone())));
         assert_eq!(res.get(id), Some(connected));
         assert!(res.remove_if_disconnected(id).is_none());
