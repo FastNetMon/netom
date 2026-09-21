@@ -91,6 +91,152 @@ mod tests {
         .unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    // An RFC 8669 Prefix-SID (type 40) is an attribute netom never models —
+    // routecore leaves it Unimplemented — so raw_attrs is the only record that
+    // one arrived. Insert the well-formed shape and the two malformed ones
+    // that reset sessions on some equipment, then prove ClickHouse returns
+    // every byte and that the operator TLV walk actually finds type 40.
+    #[tokio::test]
+    #[ignore = "requires NETOM_CLICKHOUSE_TEST_ENDPOINT and netom_test database"]
+    async fn real_clickhouse_preserves_prefix_sid_attribute() {
+        let endpoint = std::env::var("NETOM_CLICKHOUSE_TEST_ENDPOINT")
+            .expect("test endpoint");
+        let table = format!("test_{}", uuid::Uuid::new_v4().simple());
+        let config = Config {
+            endpoint,
+            database: "netom_test".into(),
+            table: table.clone(),
+            ..Default::default()
+        };
+        let t = Transport::new(config).unwrap();
+        let ddl = include_str!("../../../docs/clickhouse/schema.sql")
+            .split("CREATE VIEW")
+            .next()
+            .unwrap()
+            .replace(
+                "CREATE TABLE events",
+                &format!("CREATE TABLE netom_test.{table}"),
+            );
+        Transport::response(t.request().body(ddl).send().await.unwrap())
+            .await
+            .unwrap();
+        t.check().await.unwrap();
+
+        // (attribute value length, inner TLV length, expected attrs_parse_ok).
+        // Row 1 is well formed. Row 2 keeps valid outer framing — every parser
+        // walks past it — but the Label-Index TLV overruns the attribute.
+        // Row 3 overruns the attribute length itself, so derivation fails.
+        let shapes: [(u8, u16, u8); 3] =
+            [(10, 7, 1), (10, 0x00FF, 1), (0xFF, 7, 0)];
+        let blob = |value_len: u8, tlv_len: u16| {
+            let mut raw = vec![0, 1, 64, 1, 1, 0, 64, 2, 10, 2, 2];
+            raw.extend_from_slice(&65000u32.to_be_bytes());
+            raw.extend_from_slice(&65001u32.to_be_bytes());
+            raw.extend_from_slice(&[0xC0, 40, value_len, 1]);
+            raw.extend_from_slice(&tlv_len.to_be_bytes());
+            raw.extend_from_slice(&[0, 0, 0, 0, 0, 0, 100]);
+            raw.extend_from_slice(&[0xC0, 8, 4, 0xFD, 0xE8, 0, 7]);
+            raw
+        };
+
+        let dir = std::env::temp_dir()
+            .join(format!("netom-ch-sid-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut s = spool::Segment::create(&dir).unwrap();
+        let mut body = Vec::new();
+        for (seq, (value_len, tlv_len, _)) in shapes.iter().enumerate() {
+            Event {
+                seq: seq as u64,
+                received_ms: chrono::Utc::now().timestamp_millis(),
+                expires: u32::MAX,
+                class: 1,
+                kind: 1,
+                afi: 1,
+                safi: 1,
+                prefix: "192.0.2.0"
+                    .parse()
+                    .map(crate::targets::clickhouse::event::ip_bytes)
+                    .unwrap(),
+                prefix_len: 24,
+                attrs: Arc::from(blob(*value_len, *tlv_len)),
+                ..Default::default()
+            }
+            .encode(&mut body);
+        }
+        s.append(&body, shapes.len() as u32).unwrap();
+        assert_eq!(
+            t.insert(s.seal().unwrap()).await.unwrap(),
+            shapes.len() as u32
+        );
+
+        // Every byte back, and the AS_PATH either side of the attribute still
+        // derived for the two rows whose outer framing is valid.
+        let sql = format!(
+            "SELECT event_seq, hex(raw_attrs), attrs_parse_ok, as_path \
+             FROM netom_test.{table} ORDER BY event_seq FORMAT TabSeparated"
+        );
+        let rows = Transport::response(
+            t.request().query(&[("query", sql)]).send().await.unwrap(),
+        )
+        .await
+        .unwrap();
+        let rows: Vec<&str> = rows.trim().lines().collect();
+        assert_eq!(rows.len(), shapes.len());
+        for (seq, (value_len, tlv_len, ok)) in shapes.iter().enumerate() {
+            let stored = blob(*value_len, *tlv_len);
+            let want_hex = stored[2..]
+                .iter()
+                .map(|b| format!("{b:02X}"))
+                .collect::<String>();
+            let want_path = if *ok == 1 { "[65000,65001]" } else { "[]" };
+            assert_eq!(
+                rows[seq],
+                format!("{seq}\t{want_hex}\t{ok}\t{want_path}")
+            );
+        }
+
+        // The same attribute walk an operator runs over production: the byte
+        // pattern alone is not enough (it matches inside other attributes'
+        // payloads), so this pins that type 40 is found at a real TLV
+        // boundary, in the two rows whose outer framing lets a walk reach it.
+        let sql = format!(
+            r#"WITH
+  ((s, p) -> reinterpretAsUInt8(substring(s, p, 1))) AS B,
+  ((s, p) -> if(bitAnd(B(s, p), 16) != 0, B(s, p+2)*256 + B(s, p+3), B(s, p+2))) AS ALEN,
+  ((s, p) -> if(bitAnd(B(s, p), 16) != 0, 4, 3)) AS AHDR,
+  arrayFold(
+    (acc, i) -> if(
+      acc.1 = 0 OR acc.1 + 2 > length(raw_attrs),
+      (toUInt32(0), acc.2),
+      if(acc.1 + AHDR(raw_attrs, acc.1) + ALEN(raw_attrs, acc.1) > length(raw_attrs) + 1,
+         (toUInt32(0), arrayPushBack(acc.2, toUInt16(256))),
+         (toUInt32(acc.1 + AHDR(raw_attrs, acc.1) + ALEN(raw_attrs, acc.1)),
+          arrayPushBack(acc.2, toUInt16(B(raw_attrs, acc.1 + 1)))))
+    ),
+    range(64), (toUInt32(1), emptyArrayUInt16())
+  ).2 AS types
+SELECT countIf(has(types, 40)), countIf(has(types, 256))
+FROM netom_test.{table} FORMAT TabSeparated"#
+        );
+        let walked = Transport::response(
+            t.request().query(&[("query", sql)]).send().await.unwrap(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(walked.trim(), "2\t1");
+
+        Transport::response(
+            t.request()
+                .body(format!("DROP TABLE netom_test.{table}"))
+                .send()
+                .await
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 impl Transport {
     pub fn new(config: Config) -> anyhow::Result<Self> {

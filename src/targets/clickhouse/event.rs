@@ -254,6 +254,85 @@ mod tests {
         e.encode(&mut bytes);
         assert!(bytes.windows(raw.len() - 2).any(|v| v == &raw[2..]));
     }
+    // RFC 8669 BGP Prefix-SID (type 40). Netom does not model it — routecore
+    // leaves it Unimplemented — so the only record of one ever arriving is the
+    // raw_attrs blob. These pin that: the attribute survives byte-for-byte,
+    // including the malformed shapes that reset sessions on some routers.
+    //
+    // Attribute: flags 0xC0 (optional transitive), type 40, then a TLV run of
+    // type(1) length(2) value. The Label-Index TLV is type 1, length 7:
+    // RESERVED(1), Flags(2), Label Index(4).
+    fn prefix_sid(value_len: u8, tlv_len: u16) -> Vec<u8> {
+        let mut a = vec![0xC0, 40, value_len, 1];
+        a.extend_from_slice(&tlv_len.to_be_bytes());
+        a.extend_from_slice(&[0, 0, 0, 0, 0, 0, 100]);
+        a
+    }
+
+    // ORIGIN, AS_PATH, <prefix-sid>, COMMUNITIES — the attribute sits between
+    // two derived ones so a framing error would be visible as a lost
+    // derivation, not just a changed blob.
+    fn update_with(sid: &[u8]) -> Vec<u8> {
+        let mut raw = vec![0, 1, 64, 1, 1, 0, 64, 2, 10, 2, 2];
+        raw.extend_from_slice(&65000u32.to_be_bytes());
+        raw.extend_from_slice(&65001u32.to_be_bytes());
+        raw.extend_from_slice(sid);
+        raw.extend_from_slice(&[0xC0, 8, 4, 0xFD, 0xE8, 0, 7]);
+        raw
+    }
+
+    // The encoded row ends with attrs_parse_ok then the identity string, and
+    // identity is empty here (one varint zero byte).
+    fn encoded(raw: &[u8]) -> (Vec<u8>, u8) {
+        let mut bytes = Vec::new();
+        Event {
+            attrs: Arc::from(raw),
+            afi: 1,
+            safi: 1,
+            ..Default::default()
+        }
+        .encode(&mut bytes);
+        let ok = bytes[bytes.len() - 2];
+        (bytes, ok)
+    }
+
+    #[test]
+    fn prefix_sid_attribute_is_stored_and_does_not_disturb_derivation() {
+        let raw = update_with(&prefix_sid(10, 7));
+        let d = Derived::parse(&raw[2..], 4, 1, 1).unwrap();
+        assert_eq!(d.path, [65000, 65001]);
+        assert_eq!(d.communities, [0xFDE80007]);
+        let (bytes, ok) = encoded(&raw);
+        assert_eq!(ok, 1);
+        assert!(bytes.windows(raw.len() - 2).any(|w| w == &raw[2..]));
+    }
+
+    // The session-resetting shape: outer framing is valid, so every parser
+    // walks past it, but the inner TLV length runs off the end of the
+    // attribute. Netom must still store it verbatim.
+    #[test]
+    fn prefix_sid_with_malformed_inner_tlv_is_stored_verbatim() {
+        let sid = prefix_sid(10, 0x00FF);
+        let raw = update_with(&sid);
+        let d = Derived::parse(&raw[2..], 4, 1, 1).unwrap();
+        assert_eq!(d.path, [65000, 65001]);
+        assert_eq!(d.communities, [0xFDE80007]);
+        let (bytes, ok) = encoded(&raw);
+        assert_eq!(ok, 1);
+        assert!(bytes.windows(sid.len()).any(|w| w == sid));
+    }
+
+    // Outer length overrun: derivation must fail (attrs_parse_ok = 0) while
+    // the bytes are still written, so the evidence is not silently dropped.
+    #[test]
+    fn prefix_sid_with_overrunning_length_is_stored_with_parse_not_ok() {
+        let raw = update_with(&prefix_sid(0xFF, 7));
+        assert!(Derived::parse(&raw[2..], 4, 1, 1).is_none());
+        let (bytes, ok) = encoded(&raw);
+        assert_eq!(ok, 0);
+        assert!(bytes.windows(raw.len() - 2).any(|w| w == &raw[2..]));
+    }
+
     #[test]
     fn malformed_attributes_never_panic_or_publish_partial_derivations() {
         let raw = [64, 5, 4, 0, 0, 0, 100, 128, 99, 255];
