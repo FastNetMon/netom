@@ -2284,8 +2284,7 @@ dependencies = [
 [[package]]
 name = "octseq"
 version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "126c3ca37c9c44cec575247f43a3e4374d8927684f129d2beeb0d2cef262fe12"
+source = "git+https://github.com/FastNetMon/octseq.git?rev=837ea258a7ff0af2e914e2eedc6a1a34cb657fce#837ea258a7ff0af2e914e2eedc6a1a34cb657fce"
 dependencies = [
  "bytes",
 ]
@@ -2947,7 +2946,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/FastNetMon/routecore.git#7d7c88ee78485e3836ac367a78fa0ae747632c57"
+source = "git+https://github.com/FastNetMon/routecore.git#3736edc9438fa25a886a94582efe10f2d1657fdc"
 dependencies = [
  "bytes",
  "chrono",
