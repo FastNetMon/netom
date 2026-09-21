@@ -9,7 +9,7 @@ without bound while the RIB it describes stays exactly the same size.
 
 Observed on a production collector: 1.34M children from 166 peers, one
 peer holding 110,914 of them, path ids spanning 146.8M values at a density
-of 0.001. See MEMLEAK_TRACKING.md.
+of 0.001. See docs/planning/MEMLEAK_TRACKING.md.
 
 This drives the same shape against a local netom: announce one prefix under
 a fresh path id, withdraw it, repeat. The RIB should hold one prefix
@@ -295,7 +295,7 @@ def main():
             f"{after['records']} records under {after['prefixes']} prefix(es), "
             "one withdrawn tombstone per retired path id."
         )
-        print("      See MEMLEAK_TRACKING.md open item 2. Expected to fail "
+        print("      See docs/planning/MEMLEAK_TRACKING.md open item 2. Expected to fail "
               "until a child is retired when its last route leaves.")
         return 1
 

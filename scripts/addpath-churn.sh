@@ -4,7 +4,7 @@
 # register forever while its RIB stays one prefix.
 #
 # Run by hand; not part of the CI matrix, since it is currently expected to
-# fail — it reproduces an open bug (MEMLEAK_TRACKING.md open item 2).
+# fail — it reproduces an open bug (docs/planning/MEMLEAK_TRACKING.md open item 2).
 #
 #   scripts/addpath-churn.sh                 # 2000 path ids
 #   CHURN=50000 scripts/addpath-churn.sh     # longer, slower

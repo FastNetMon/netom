@@ -1571,7 +1571,7 @@ impl RibUnitRunner {
                 // the store sets `mui_new` unconditionally for a prefix it
                 // already holds, so it reads true even when an existing
                 // record was overwritten. See the RIB metrics item in
-                // TODO.md.
+                // docs/planning/TODO.md.
                 let change = if route_status == RouteStatus::Withdrawn {
                     StoreInsertionEffect::RoutesWithdrawn(usize::from(
                         report.mui_count > 0,

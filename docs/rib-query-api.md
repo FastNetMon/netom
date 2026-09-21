@@ -343,7 +343,7 @@ table, and is treated differently from a bounded lookup:
 
 `?ingressId=` narrows a dump's *output* but not its cost: the walk still visits
 every prefix, because the store has no per-mui prefix index. See the RIB query
-API section of `TODO.md`.
+API section of [the planning TODO](planning/TODO.md).
 
 ## Errors
 
