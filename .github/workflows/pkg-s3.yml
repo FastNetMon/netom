@@ -3,6 +3,9 @@ name: Build and Upload DEBs to S3
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   prepare:
     runs-on: ubuntu-latest
@@ -10,7 +13,9 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Determine version
         id: version
@@ -25,7 +30,7 @@ jobs:
             }
           ' Cargo.toml)
           test -n "${VERSION}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "Version: ${VERSION}"
 
   build-jammy:
@@ -35,7 +40,9 @@ jobs:
       image: ubuntu:22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -45,7 +52,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-deb
         run: |
@@ -69,7 +76,7 @@ jobs:
           cargo deb --variant ubuntu-jammy
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-jammy
           path: target/debian/*.deb
@@ -81,7 +88,9 @@ jobs:
       image: ubuntu:24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -91,7 +100,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-deb
         run: |
@@ -115,7 +124,7 @@ jobs:
           cargo deb
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-noble
           path: target/debian/*.deb
@@ -127,7 +136,9 @@ jobs:
       image: ubuntu:26.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -137,7 +148,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-deb
         run: |
@@ -161,7 +172,7 @@ jobs:
           cargo deb
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-resolute
           path: target/debian/*.deb
@@ -173,7 +184,9 @@ jobs:
       image: debian:trixie
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Install build dependencies
         run: |
@@ -183,7 +196,7 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Install cargo-deb
         run: |
@@ -207,7 +220,7 @@ jobs:
           cargo deb
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: deb-trixie
           path: target/debian/*.deb
@@ -223,7 +236,7 @@ jobs:
           sudo gem install deb-s3
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: packages
 
@@ -231,49 +244,27 @@ jobs:
         run: find packages -name "*.deb" -type f
 
       - name: Upload to S3 repository
+        shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_REGION: ${{ secrets.AWS_REGION }}
+          DEB_S3_BUCKET: ${{ secrets.DEB_S3_BUCKET }}
+          S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
         run: |
-          # Set endpoint flag for S3-compatible storage (empty for AWS S3)
-          ENDPOINT_FLAG=""
-          if [ -n "${{ secrets.S3_ENDPOINT }}" ]; then
-            ENDPOINT_FLAG="--s3-region=${{ secrets.AWS_REGION }} --endpoint=${{ secrets.S3_ENDPOINT }}"
+          # Optional endpoint for S3-compatible storage.
+          endpoint_flags=()
+          if [ -n "$S3_ENDPOINT" ]; then
+            endpoint_flags=("--s3-region=$AWS_REGION" "--endpoint=$S3_ENDPOINT")
           fi
 
-          deb-s3 upload \
-            --bucket ${{ secrets.DEB_S3_BUCKET }} \
-            --codename jammy \
-            --component main \
-            --arch amd64 \
-            --visibility private \
-            $ENDPOINT_FLAG \
-            packages/deb-jammy/*.deb
-
-          deb-s3 upload \
-            --bucket ${{ secrets.DEB_S3_BUCKET }} \
-            --codename noble \
-            --component main \
-            --arch amd64 \
-            --visibility private \
-            $ENDPOINT_FLAG \
-            packages/deb-noble/*.deb
-
-          deb-s3 upload \
-            --bucket ${{ secrets.DEB_S3_BUCKET }} \
-            --codename resolute \
-            --component main \
-            --arch amd64 \
-            --visibility private \
-            $ENDPOINT_FLAG \
-            packages/deb-resolute/*.deb
-
-          deb-s3 upload \
-            --bucket ${{ secrets.DEB_S3_BUCKET }} \
-            --codename trixie \
-            --component main \
-            --arch amd64 \
-            --visibility private \
-            $ENDPOINT_FLAG \
-            packages/deb-trixie/*.deb
+          for codename in jammy noble resolute trixie; do
+            deb-s3 upload \
+              --bucket "$DEB_S3_BUCKET" \
+              --codename "$codename" \
+              --component main \
+              --arch amd64 \
+              --visibility private \
+              "${endpoint_flags[@]}" \
+              "packages/deb-${codename}/"*.deb
+          done

@@ -6,21 +6,26 @@ on:
       - main
 
   pull_request:
-    types: [review_requested, ready_for_review]
+    branches: [main]
 
   workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
     - name: Ensure correct Rust toolchain version
       uses: dtolnay/rust-toolchain@stable
     - name: Build
-      run: cargo build --verbose
+      run: cargo build --locked --verbose
     - name: Run tests, including mrtgen MRT corpus
-      run: cargo test --lib --verbose
+      run: cargo test --locked --lib --verbose
