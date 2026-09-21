@@ -11,11 +11,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   mrt:
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
     - name: Ensure correct Rust toolchain version
       uses: dtolnay/rust-toolchain@stable
     - name: FlowSpec MRT ingest end-to-end
@@ -24,7 +29,9 @@ jobs:
   exabgp:
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
+      with:
+        persist-credentials: false
     - name: Ensure correct Rust toolchain version
       uses: dtolnay/rust-toolchain@stable
     - name: FlowSpec BGP (exabgp) end-to-end
