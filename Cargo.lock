@@ -333,7 +333,7 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 [[package]]
 name = "bcder"
 version = "0.7.6"
-source = "git+https://github.com/FastNetMon/rpki.git?tag=v0.19.2-fnm1#51a49dfc4949e2ca09c7a0ca4045b8b3f8d86c98"
+source = "git+https://github.com/FastNetMon/rpki.git?tag=v0.19.2-fnm2#5009633903b1b073ea98fa646661411f6829f2b3"
 dependencies = [
  "bytes",
  "smallvec",
@@ -1091,7 +1091,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1594,7 +1594,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -1773,7 +1773,7 @@ dependencies = [
 [[package]]
 name = "inetnum"
 version = "0.1.1"
-source = "git+https://github.com/FastNetMon/inetnum.git?tag=v0.1.1#1f8a285aff36d85eeb345e59bcbe9b9e552eec5d"
+source = "git+https://github.com/FastNetMon/inetnum.git?tag=v0.1.1-fnm1#c2ec77cea59019178c91facb28eaf9a0d5ff339b"
 dependencies = [
  "arbitrary",
  "serde",
@@ -2244,7 +2244,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2284,7 +2284,7 @@ dependencies = [
 [[package]]
 name = "octseq"
 version = "0.5.2"
-source = "git+https://github.com/FastNetMon/octseq.git?rev=837ea258a7ff0af2e914e2eedc6a1a34cb657fce#837ea258a7ff0af2e914e2eedc6a1a34cb657fce"
+source = "git+https://github.com/FastNetMon/octseq.git?rev=e3401f9815887978fcfe7989dcff7e8d36c49473#e3401f9815887978fcfe7989dcff7e8d36c49473"
 dependencies = [
  "bytes",
 ]
@@ -2533,7 +2533,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2571,9 +2571,9 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.3",
+ "socket2 0.5.10",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2897,7 +2897,7 @@ dependencies = [
 [[package]]
 name = "roto"
 version = "0.7.1"
-source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm1#14883d6c1e89b06f6e1aafee9bd8cafe7864796e"
+source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm2#2a857e32bf91f6ed8deca19f555f5f4e288be1b6"
 dependencies = [
  "ariadne",
  "clap",
@@ -2914,7 +2914,7 @@ dependencies = [
 [[package]]
 name = "roto-macros"
 version = "0.7.1"
-source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm1#14883d6c1e89b06f6e1aafee9bd8cafe7864796e"
+source = "git+https://github.com/FastNetMon/roto.git?tag=v0.7.1-fnm2#2a857e32bf91f6ed8deca19f555f5f4e288be1b6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2924,7 +2924,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#9e4eb6d2bb9649ecc783909417851a2cfd86dc40"
+source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#2bb37ffe257911f27253281e1282b0cf945c8500"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
@@ -2946,7 +2946,7 @@ dependencies = [
 [[package]]
 name = "routecore"
 version = "0.7.3-dev"
-source = "git+https://github.com/FastNetMon/routecore.git#3736edc9438fa25a886a94582efe10f2d1657fdc"
+source = "git+https://github.com/FastNetMon/routecore.git#1a7a8473c8c03130f74d21ba93f1da63a532cfc6"
 dependencies = [
  "bytes",
  "chrono",
@@ -2964,7 +2964,7 @@ dependencies = [
 [[package]]
 name = "rpki"
 version = "0.19.2"
-source = "git+https://github.com/FastNetMon/rpki.git?tag=v0.19.2-fnm1#51a49dfc4949e2ca09c7a0ca4045b8b3f8d86c98"
+source = "git+https://github.com/FastNetMon/rpki.git?tag=v0.19.2-fnm2#5009633903b1b073ea98fa646661411f6829f2b3"
 dependencies = [
  "base64 0.22.1",
  "bcder",
@@ -3089,7 +3089,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -3516,7 +3516,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
