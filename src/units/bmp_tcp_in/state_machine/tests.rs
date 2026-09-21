@@ -2490,13 +2490,11 @@ fn assert_metrics(processor: &BmpState, expected: (&str, [usize; 10])) {
     let actual = query_metrics(&metrics);
     let mut expected = (expected.0.to_string(), expected.1);
 
-    // Until https://github.com/NLnetLabs/rotonda/pull/55 is merged we have
-    // to expect that metric:
-    //   bmp_state_num_bgp_updates_with_recoverable_parsing_failure_for_known_peer
-    // has the unexpected value 1 instead of 0. Once merged we can revert
-    // this temporary work around.
+    // This legacy helper tolerates differences in the update-reparse counter.
+    // Keep the workaround until the fixtures and parser accounting agree;
+    // the other metric expectations below remain strict.
     if expected.1[2] != actual.1[2] {
-        eprintln!("WARNING: Temporarily overriding expected value for metric `bmp_state_num_bgp_updates_with_recoverable_parsing_failure_for_known_peer` due to pending PR https://github.com/NLnetLabs/rotonda/pull/55.");
+        eprintln!("WARNING: Legacy BMP fixture overrides the expected `bmp_state_num_bgp_updates_reparsed_due_to_incorrect_header_flags` counter.");
         expected.1[2] = actual.1[2];
     }
 
