@@ -39,8 +39,10 @@ API.
 Future versions of Netom will support an on-disk database, using external
 datasets in filters, reading routes from Kafka streams, and more.
 
-Read the fork documentation and release notes in this repository to install and
-use this FastNetMon-maintained build of Netom.
+Read the [Netom manual](https://fastnetmon.github.io/netom/) for installation,
+configuration, CLI usage, and API guides. Its Markdown sources live in
+[`docs/`](docs/); see [maintaining the documentation](docs/documentation.md)
+to build or update it.
 
 For DEB/RPM packages, multi-architecture containers, and the release workflow,
 see [Releases](docs/releases.md).

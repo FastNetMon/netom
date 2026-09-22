@@ -31,7 +31,8 @@ with (ROOT / 'Cargo.lock').open('rb') as source:
 # Match network locations and GitHub Action references, not author names or
 # license notices. Also reject images in the upstream Docker Hub namespace.
 upstream = re.compile(r'''https?://[^\s"'<>]*nlnetlabs[^\s"'<>]*|\bnlnetlabs/''', re.I)
-paths = [ROOT / 'Dockerfile', ROOT / 'build.rs']
+paths = [ROOT / 'Dockerfile', ROOT / 'build.rs',
+         ROOT / 'docs/conf.py', ROOT / 'docs/requirements.txt']
 for directory in ('.github/workflows', 'pkg', 'scripts', '.cargo'):
     paths.extend(path for path in (ROOT / directory).rglob('*')
                  if path.is_file() and '__pycache__' not in path.parts)

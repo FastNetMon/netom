@@ -108,9 +108,10 @@ the same route shape as `data`.
 
 ### JSONL (`format=jsonl`)
 
-One flat object per line, each uniquely identified by `(prefix, ingress.id)`:
+One flat object per line, each uniquely identified by `(prefix, ingress.id)`
+(nested fields abbreviated below):
 
-```json
+```text
 {"prefix":"10.0.0.0/24","section":"data","status":"active","ingress":{…},"source":{…},"rpki":{…},"pathAttributes":[…]}
 ```
 
@@ -120,7 +121,9 @@ the response is a stream of independent lines.
 
 ### FlowSpec
 
-```json
+Nested attributes are abbreviated in this response example:
+
+```text
 {"data": [
   {
     "keyPrefix": "10.0.0.0/24",
@@ -343,7 +346,7 @@ table, and is treated differently from a bounded lookup:
 
 `?ingressId=` narrows a dump's *output* but not its cost: the walk still visits
 every prefix, because the store has no per-mui prefix index. See the RIB query
-API section of [the planning TODO](planning/TODO.md).
+API section of [the planning TODO](https://github.com/FastNetMon/netom/blob/main/docs/planning/TODO.md).
 
 ## Errors
 

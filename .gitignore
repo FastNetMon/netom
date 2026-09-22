@@ -2,6 +2,7 @@
 /target
 /dist
 /dist-rpm
+/docs/_build/
 __pycache__/
 
 # Hidden files: editor, OS and local tool state.
