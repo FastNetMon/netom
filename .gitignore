@@ -1,5 +1,8 @@
 # Build artifacts
 /target
+/dist
+/dist-rpm
+__pycache__/
 
 # Hidden files: editor, OS and local tool state.
 # Whitelist the ones that belong in the repository.

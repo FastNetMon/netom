@@ -25,6 +25,10 @@ jobs:
         persist-credentials: false
     - name: Ensure correct Rust toolchain version
       uses: dtolnay/rust-toolchain@stable
+    - name: Check build sources
+      run: python3 pkg/check-build-sources.py
+    - name: Test release planning
+      run: python3 -B pkg/test-release-metadata.py
     - name: Build
       run: cargo build --locked --verbose
     - name: Run tests, including mrtgen MRT corpus

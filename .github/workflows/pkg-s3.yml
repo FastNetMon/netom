@@ -6,228 +6,18 @@ on:
 permissions:
   contents: read
 
+# Serialize repository index updates, including manual runs on different refs.
+concurrency:
+  group: deb-s3-publish
+  cancel-in-progress: false
+
 jobs:
-  prepare:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Determine version
-        id: version
-        run: |
-          VERSION=$(awk '
-            $0 == "[workspace.package]" { in_workspace_package = 1; next }
-            in_workspace_package && /^\[/ { exit }
-            in_workspace_package && /^version[[:space:]]*=/ {
-              gsub(/^[^"]*"|".*$/, "")
-              print
-              exit
-            }
-          ' Cargo.toml)
-          test -n "${VERSION}"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Version: ${VERSION}"
-
-  build-jammy:
-    needs: prepare
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:22.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y build-essential ca-certificates curl pkg-config libssl-dev
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-deb
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install cargo-deb --locked
-
-      - name: Generate changelog
-        run: |
-          mkdir -p target/debian
-          cat > target/debian/changelog << EOF
-          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
-
-            * Release ${{ needs.prepare.outputs.version }}
-
-           -- Package Builder <builder@localhost>  $(date -R)
-          EOF
-
-      - name: Build package
-        run: |
-          . "$HOME/.cargo/env"
-          cargo deb --variant ubuntu-jammy
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: deb-jammy
-          path: target/debian/*.deb
-
-  build-noble:
-    needs: prepare
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:24.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y build-essential ca-certificates curl pkg-config libssl-dev
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-deb
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install cargo-deb --locked
-
-      - name: Generate changelog
-        run: |
-          mkdir -p target/debian
-          cat > target/debian/changelog << EOF
-          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
-
-            * Release ${{ needs.prepare.outputs.version }}
-
-           -- Package Builder <builder@localhost>  $(date -R)
-          EOF
-
-      - name: Build package
-        run: |
-          . "$HOME/.cargo/env"
-          cargo deb
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: deb-noble
-          path: target/debian/*.deb
-
-  build-resolute:
-    needs: prepare
-    runs-on: ubuntu-latest
-    container:
-      image: ubuntu:26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y build-essential ca-certificates curl pkg-config libssl-dev
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-deb
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install cargo-deb --locked
-
-      - name: Generate changelog
-        run: |
-          mkdir -p target/debian
-          cat > target/debian/changelog << EOF
-          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
-
-            * Release ${{ needs.prepare.outputs.version }}
-
-           -- Package Builder <builder@localhost>  $(date -R)
-          EOF
-
-      - name: Build package
-        run: |
-          . "$HOME/.cargo/env"
-          cargo deb
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: deb-resolute
-          path: target/debian/*.deb
-
-  build-trixie:
-    needs: prepare
-    runs-on: ubuntu-latest
-    container:
-      image: debian:trixie
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - name: Install build dependencies
-        run: |
-          apt-get update
-          apt-get install -y build-essential ca-certificates curl pkg-config libssl-dev
-
-      - name: Install Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-
-      - name: Install cargo-deb
-        run: |
-          . "$HOME/.cargo/env"
-          cargo install cargo-deb --locked
-
-      - name: Generate changelog
-        run: |
-          mkdir -p target/debian
-          cat > target/debian/changelog << EOF
-          netom (${{ needs.prepare.outputs.version }}) unstable; urgency=medium
-
-            * Release ${{ needs.prepare.outputs.version }}
-
-           -- Package Builder <builder@localhost>  $(date -R)
-          EOF
-
-      - name: Build package
-        run: |
-          . "$HOME/.cargo/env"
-          cargo deb
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: deb-trixie
-          path: target/debian/*.deb
+  build:
+    uses: ./.github/workflows/pkg-deb.yml
 
   upload:
-    needs: [build-jammy, build-noble, build-resolute, build-trixie]
-    runs-on: ubuntu-latest
+    needs: build
+    runs-on: ubuntu-24.04
     steps:
       - name: Install deb-s3
         run: |
@@ -235,13 +25,11 @@ jobs:
           sudo apt-get install -y ruby ruby-dev
           sudo gem install deb-s3
 
-      - name: Download all artifacts
+      - name: Download DEB artifacts
         uses: actions/download-artifact@v8
         with:
+          pattern: package-deb-*
           path: packages
-
-      - name: List packages
-        run: find packages -name "*.deb" -type f
 
       - name: Upload to S3 repository
         shell: bash
@@ -251,20 +39,24 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
           DEB_S3_BUCKET: ${{ secrets.DEB_S3_BUCKET }}
           S3_ENDPOINT: ${{ secrets.S3_ENDPOINT }}
+          APT_SUITES: ${{ needs.build.outputs.apt-suites }}
         run: |
-          # Optional endpoint for S3-compatible storage.
           endpoint_flags=()
           if [ -n "$S3_ENDPOINT" ]; then
             endpoint_flags=("--s3-region=$AWS_REGION" "--endpoint=$S3_ENDPOINT")
           fi
 
-          for codename in jammy noble resolute trixie; do
-            deb-s3 upload \
-              --bucket "$DEB_S3_BUCKET" \
-              --codename "$codename" \
-              --component main \
-              --arch amd64 \
-              --visibility private \
-              "${endpoint_flags[@]}" \
-              "packages/deb-${codename}/"*.deb
+          mapfile -t suites < <(jq -r '.[]' <<< "$APT_SUITES")
+          for codename in "${suites[@]}"; do
+            for artifact in packages/package-deb-*; do
+              arch=${artifact##*/package-deb-}
+              deb-s3 upload \
+                --bucket "$DEB_S3_BUCKET" \
+                --codename "$codename" \
+                --component main \
+                --arch "$arch" \
+                --visibility private \
+                "${endpoint_flags[@]}" \
+                "$artifact/"*.deb
+            done
           done

@@ -1,0 +1,22 @@
+# Build on the oldest supported distribution; test the same artifact everywhere.
+rust_version = "1.97.1"
+cargo_deb_version = "3.7.0"
+
+[[architectures]]
+arch = "amd64"
+runner = "ubuntu-24.04"
+rpm_arch = "x86_64"
+
+[[architectures]]
+arch = "arm64"
+runner = "ubuntu-24.04-arm"
+rpm_arch = "aarch64"
+
+[packages.deb]
+build_image = "ubuntu:22.04"
+test_images = ["ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04", "debian:trixie"]
+apt_suites = ["jammy", "noble", "resolute", "trixie"]
+
+[packages.rpm]
+build_image = "almalinux:8"
+test_images = ["almalinux:8", "almalinux:9", "almalinux:10"]

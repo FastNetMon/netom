@@ -1,0 +1,109 @@
+name: Release packages and containers
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    uses: ./.github/workflows/pkg-build.yml
+
+  push-images:
+    needs: build
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.build.outputs.architectures) }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: container-${{ matrix.arch }}
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push tested image and record immutable digest
+        env:
+          REPOSITORY: ${{ github.repository }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          image="ghcr.io/${REPOSITORY,,}"
+          staging="$image:build-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$ARCH"
+          docker load < image.tar.gz
+          docker tag netom:ci "$staging"
+          docker push "$staging"
+          mkdir -p digests
+          docker inspect --format '{{json .RepoDigests}}' "$staging" \
+            | jq -er --arg image "$image" '.[] | select(startswith($image + "@"))' > "digests/$ARCH"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          if-no-files-found: error
+
+  publish:
+    needs: [build, push-images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: package-*
+          path: packages
+          merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: digest-*
+          path: digests
+          merge-multiple: true
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Publish manifest and draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.build.outputs.version }}
+          ARCHITECTURES: ${{ needs.build.outputs.architectures }}
+        run: |
+          if ! gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --draft --generate-notes
+          fi
+          test "$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)" = true
+          image="ghcr.io/${GH_REPO,,}"
+          mapfile -t architectures < <(jq -r '.include[].arch' <<< "$ARCHITECTURES")
+          sources=()
+          for arch in "${architectures[@]}"; do
+            sources+=("$(cat "digests/$arch")")
+          done
+          docker buildx imagetools create --tag "$image:$VERSION" "${sources[@]}"
+          docker buildx imagetools inspect "$image:$VERSION" --raw > packages/container-manifest.json
+          python3 - <<'PY'
+          import json
+          import os
+          with open('packages/container-manifest.json') as source:
+              manifest = json.load(source)
+          platforms = {(m['platform']['os'], m['platform']['architecture']) for m in manifest['manifests']}
+          expected = {('linux', row['arch']) for row in json.loads(os.environ['ARCHITECTURES'])['include']}
+          assert platforms == expected, (platforms, expected)
+          PY
+          (cd packages && sha256sum ./*.deb ./*.rpm ./container-manifest.json > SHA256SUMS)
+          gh release upload "$RELEASE_TAG" packages/* --clobber

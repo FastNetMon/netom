@@ -1,0 +1,161 @@
+name: Build release artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      package-format:
+        type: choice
+        default: all
+        options: [all, deb, rpm]
+      build-images:
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      package-format:
+        type: string
+        default: all
+      build-images:
+        type: boolean
+        default: true
+    outputs:
+      version:
+        value: ${{ jobs.prepare.outputs.version }}
+      architectures:
+        value: ${{ jobs.prepare.outputs.architectures }}
+      apt-suites:
+        value: ${{ jobs.prepare.outputs.apt_suites }}
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.metadata.outputs.version }}
+      build_matrix: ${{ steps.metadata.outputs.build_matrix }}
+      test_matrix: ${{ steps.metadata.outputs.test_matrix }}
+      architectures: ${{ steps.metadata.outputs.architectures }}
+      apt_suites: ${{ steps.metadata.outputs.apt_suites }}
+      rust_version: ${{ steps.metadata.outputs.rust_version }}
+      cargo_deb_version: ${{ steps.metadata.outputs.cargo_deb_version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check build sources
+        run: python3 pkg/check-build-sources.py
+      - name: Test release planning
+        run: python3 -B pkg/test-release-metadata.py
+      - name: Plan builds and validate release tag
+        id: metadata
+        env:
+          PACKAGE_FORMAT: ${{ inputs.package-format || 'all' }}
+        run: python3 pkg/release-metadata.py
+
+  build:
+    needs: prepare
+    name: Build ${{ matrix.format }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.build_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build package on its oldest supported distribution
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: pkg/Dockerfile
+          target: artifacts
+          platforms: linux/${{ matrix.arch }}
+          build-args: |
+            DISTRO_IMAGE=${{ matrix.image }}
+            PACKAGE_FORMAT=${{ matrix.format }}
+            NETOM_VERSION=${{ needs.prepare.outputs.version }}
+            RUST_VERSION=${{ needs.prepare.outputs.rust_version }}
+            CARGO_DEB_VERSION=${{ needs.prepare.outputs.cargo_deb_version }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=package-${{ matrix.format }}-${{ matrix.arch }}
+          cache-to: type=gha,scope=package-${{ matrix.format }}-${{ matrix.arch }},mode=max
+      - uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.format }}-${{ matrix.arch }}
+          path: dist/*.${{ matrix.format }}
+          if-no-files-found: error
+
+  test:
+    needs: [prepare, build]
+    name: Test ${{ matrix.image }} / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.test_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-${{ matrix.format }}-${{ matrix.arch }}
+          path: dist
+      - name: Install, reinstall, and remove package
+        env:
+          DISTRO_IMAGE: ${{ matrix.image }}
+          PACKAGE_FORMAT: ${{ matrix.format }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
+          RPM_ARCH: ${{ matrix.rpm_arch }}
+          NETOM_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          docker run --rm --platform "linux/$PACKAGE_ARCH" \
+            --volume "$PWD/dist:/packages:ro" \
+            --volume "$PWD/pkg/test-scripts/smoke-package.sh:/smoke-package.sh:ro" \
+            --env PACKAGE_FORMAT --env PACKAGE_ARCH --env RPM_ARCH --env NETOM_VERSION \
+            "$DISTRO_IMAGE" bash /smoke-package.sh
+
+  image:
+    if: ${{ inputs.build-images && inputs.package-format != 'rpm' }}
+    needs: [prepare, test]
+    name: Docker / ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.architectures) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: package-deb-${{ matrix.arch }}
+          path: dist
+      - uses: docker/setup-buildx-action@v4
+      - name: Assemble runtime image from tested DEB
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          tags: netom:ci
+          build-args: |
+            VERSION=${{ needs.prepare.outputs.version }}
+            REVISION=${{ github.sha }}
+          cache-from: type=gha,scope=runtime-${{ matrix.arch }}
+          cache-to: type=gha,scope=runtime-${{ matrix.arch }},mode=max
+      - name: Test non-root runtime and HTTP startup
+        env:
+          NETOM_VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash pkg/test-scripts/smoke-image.sh netom:ci "$NETOM_VERSION"
+      - name: Save tested image for publishing
+        run: docker save netom:ci | gzip > image.tar.gz
+      - uses: actions/upload-artifact@v7
+        with:
+          name: container-${{ matrix.arch }}
+          path: image.tar.gz
+          compression-level: 0
+          retention-days: 7
+          if-no-files-found: error

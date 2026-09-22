@@ -159,7 +159,7 @@ originally developed by NLnet Labs. Applications that you can build with
 Netom include, but are not limited to, a route monitor, a route collector,
 a route server, or a route reflector."""
 # ensure that the useradd tools are present by installing their respective packages
-depends = "$auto, passwd"
+depends = "$auto, adduser, passwd"
 section = "net"
 priority = "optional"
 assets = [
@@ -204,25 +204,3 @@ systemd-units = { unit-name = "netom", unit-scripts = "pkg/common", enable = fal
 
 
 [package.metadata.deb.variants.minimal]
-
-[package.metadata.generate-rpm]
-license = "MPL-2.0"
-assets = [
-    { source = "target/release/netom", dest = "/usr/bin/netom", mode = "755" },
-    { source = "target/release/netom-cli", dest = "/usr/bin/netom-cli", mode = "755" },
-    { source = "target/rpm/netom.service", dest = "/lib/systemd/system/netom.service", mode = "644" },
-    { source = "NOTICE.md", dest = "/usr/share/doc/netom/NOTICE.md", mode = "644", doc = true },
-    { source = "doc/netom.1", dest = "/usr/share/man/man1/netom.1", mode = "644", doc = true },
-    { source = "doc/netom-cli.1", dest = "/usr/share/man/man1/netom-cli.1", mode = "644", doc = true },
-    { source = "etc/netom.conf", dest = "/etc/netom/netom.conf", mode = "644", config = true },
-
-    { source = "etc/examples/filters.roto.example", dest = "/usr/share/netom/examples/filters.roto.example", mode = "644", config = false },
-]
-# These get set using cargo-generate-rpm --set-metadata at package build time.
-#post_install_script = ...
-#pre_uninstall_script = ...
-#post_uninstall_script = ...
-
-# ensure that the useradd tools are present by installing their respective packages
-[package.metadata.generate-rpm.requires]
-shadow-utils = "*"

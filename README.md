@@ -42,6 +42,9 @@ datasets in filters, reading routes from Kafka streams, and more.
 Read the fork documentation and release notes in this repository to install and
 use this FastNetMon-maintained build of Netom.
 
+For DEB/RPM packages, multi-architecture containers, and the release workflow,
+see [Releases](docs/releases.md).
+
 > `Netom` is under active development and features are added regularly.
 > The APIs, the configuration and the `Roto` syntax may change between
 > 0.x versions.
