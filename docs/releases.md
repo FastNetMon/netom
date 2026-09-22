@@ -66,7 +66,7 @@ both tested image digests. It also creates a draft GitHub release with all four
 packages, the container manifest, SHA-256 checksums, and generated release notes.
 Review and publish the draft in GitHub. A rerun can update an existing draft,
 but refuses to replace the assets or versioned image of a published release.
-There is no automatic `latest` alias: versions such as `0.6.0-fnm15` are explicit.
+There is no automatic `latest` alias: versions such as `0.6.0` are explicit.
 Temporary `build-<run>-<attempt>-<architecture>` tags retain the individual images.
 
 GHCR uses the repository's `GITHUB_TOKEN` with `packages: write`; no separate
@@ -92,15 +92,15 @@ python3 pkg/release-metadata.py
 # Match NETOM_VERSION to Cargo.toml. The Dockerfile defaults match targets.toml.
 docker build -f pkg/Dockerfile --target artifacts \
   --build-arg DISTRO_IMAGE=ubuntu:22.04 --build-arg PACKAGE_FORMAT=deb \
-  --build-arg NETOM_VERSION=0.6.0-fnm15 --output type=local,dest=dist .
+  --build-arg NETOM_VERSION=0.6.0 --output type=local,dest=dist .
 
 docker build -f pkg/Dockerfile --target artifacts \
   --build-arg DISTRO_IMAGE=almalinux:8 --build-arg PACKAGE_FORMAT=rpm \
-  --build-arg NETOM_VERSION=0.6.0-fnm15 --output type=local,dest=dist-rpm .
+  --build-arg NETOM_VERSION=0.6.0 --output type=local,dest=dist-rpm .
 
 # dist/ must contain only the DEB for the current native architecture.
-docker build --build-arg VERSION=0.6.0-fnm15 -t netom:local .
-bash pkg/test-scripts/smoke-image.sh netom:local 0.6.0-fnm15
+docker build --build-arg VERSION=0.6.0 -t netom:local .
+bash pkg/test-scripts/smoke-image.sh netom:local 0.6.0
 ```
 
 Use `--output type=local` with BuildKit to export packages without copying files
@@ -113,7 +113,7 @@ To run the published image with your own configuration:
 ```sh
 docker run --rm -p 8080:8080 -p 11019:11019 \
   -v "$PWD/netom.conf:/etc/netom/netom.conf:ro" \
-  ghcr.io/fastnetmon/netom:0.6.0-fnm15
+  ghcr.io/fastnetmon/netom:0.6.0
 ```
 
 The packaged example configuration is installed as `netom.conf.example` in host
