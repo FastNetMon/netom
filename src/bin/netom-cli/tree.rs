@@ -115,6 +115,9 @@ pub enum Flag {
     /// keyword, which delegates to the shared route-filter subtree, so the
     /// filters narrow the *candidates* the decision process weighs.
     Best,
+    /// Print every attribute of each path rather than one table row. Set by
+    /// the `detail` keyword; like `best` it rides the shared filter subtree.
+    Detail,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -235,6 +238,10 @@ impl Captures {
 
     pub fn best(&self) -> bool {
         self.flags.contains(&Flag::Best)
+    }
+
+    pub fn detail(&self) -> bool {
+        self.flags.contains(&Flag::Detail)
     }
 }
 
@@ -749,6 +756,40 @@ static BGP_BODY: &[Node] = &[
         run: None,
         children: BGP_BEST_ADDR,
     },
+    // `show ip bgp detail [<prefix>|<filter>]` -- the same queries, with
+    // every attribute of each path spelled out.
+    Node {
+        kw: Kw::Lit("detail"),
+        help: "Every attribute of each path",
+        set: Some(Flag::Detail),
+        run: Some(commands::bgp::routes),
+        children: BGP_DETAIL_BODY,
+    },
+    FILTER_SOURCE,
+    FILTER_INGRESS,
+    FILTER_ORIGIN_AS,
+    FILTER_COMMUNITY,
+];
+
+/// `detail` as the last word of a route query: `show ip bgp <prefix> detail`,
+/// `show ip bgp neighbors <ip> routes detail`.
+const DETAIL_LEAF: Node = Node {
+    kw: Kw::Lit("detail"),
+    help: "Every attribute of each path",
+    set: Some(Flag::Detail),
+    run: Some(commands::bgp::routes),
+    children: &[],
+};
+
+/// What can follow `show ip bgp detail`: a prefix or one route filter.
+static BGP_DETAIL_BODY: &[Node] = &[
+    Node {
+        kw: Kw::Arg(ArgKind::Prefix),
+        help: "Network in the BGP routing table",
+        set: None,
+        run: Some(commands::bgp::routes),
+        children: &[],
+    },
     FILTER_SOURCE,
     FILTER_INGRESS,
     FILTER_ORIGIN_AS,
@@ -762,13 +803,16 @@ static BGP_BODY: &[Node] = &[
 /// all run `commands::bgp::routes`, which dispatches on the flag; giving
 /// `best` its own handler would mean either duplicating the whole filter
 /// subtree or having `... best source bgp` silently run the plain route query.
-static BGP_PREFIX_BODY: &[Node] = &[Node {
-    kw: Kw::Lit("best"),
-    help: "Only the best path, and why the others lost",
-    set: Some(Flag::Best),
-    run: Some(commands::bgp::routes),
-    children: BGP_BEST_FILTERS,
-}];
+static BGP_PREFIX_BODY: &[Node] = &[
+    Node {
+        kw: Kw::Lit("best"),
+        help: "Only the best path, and why the others lost",
+        set: Some(Flag::Best),
+        run: Some(commands::bgp::routes),
+        children: BGP_BEST_FILTERS,
+    },
+    DETAIL_LEAF,
+];
 
 static BGP_BEST_ADDR: &[Node] = &[Node {
     kw: Kw::Arg(ArgKind::Ip),
@@ -809,11 +853,13 @@ static BGP_NEIGHBORS: &[Node] = &[Node {
     children: BGP_NEIGHBOR_BODY,
 }];
 
-static BGP_NEIGHBOR_BODY: &[Node] = &[leaf!(
-    "routes",
-    "Routes learned from this neighbor",
-    commands::bgp::routes
-)];
+static BGP_NEIGHBOR_BODY: &[Node] = &[Node {
+    kw: Kw::Lit("routes"),
+    help: "Routes learned from this neighbor",
+    set: None,
+    run: Some(commands::bgp::routes),
+    children: &[DETAIL_LEAF],
+}];
 
 // The FlowSpec endpoint rejects every filter but these two with a 400, so
 // only these two are typeable here.

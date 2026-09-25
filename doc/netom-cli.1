@@ -142,6 +142,13 @@ Routes learned from one neighbor.
 .B show ip bgp [\fIprefix\fB]
 Routes for one prefix, or the whole table when no prefix is given.
 .TP
+.B show ip bgp detail [\fIprefix\fB|\fIfilter\fB]
+Every attribute of each path: peer, ingress, RPKI, origin, AS path, next
+hop, MED, local preference, aggregator and communities. Also accepted as
+.B show ip bgp \fIprefix\fB detail
+and
+.BR "show ip bgp neighbors \fIaddress\fB routes detail" .
+.TP
 .B show ip bgp source bgp|bmp|mrt
 Only routes learned over one kind of ingress: sessions netom terminates
 itself, peers monitored through BMP, or peers replayed from MRT files.

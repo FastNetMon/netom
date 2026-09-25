@@ -347,7 +347,11 @@ pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
             }
             let body = session.get(&path)?.body_string()?;
             let mut out = session.writer();
-            render_prefix(&mut out, &body)?;
+            if c.detail() {
+                render_prefix_detail(&mut out, &body)?;
+            } else {
+                render_prefix(&mut out, &body)?;
+            }
             out.finish()?;
             Ok(())
         }
@@ -362,13 +366,19 @@ pub fn routes(session: &mut Session, c: &Captures) -> Result<(), CliError> {
             if session.json {
                 return session.passthrough(&path);
             }
-            stream_table(session, &path)
+            stream_table(session, &path, c.detail())
         }
     }
 }
 
-static ROUTE_COLS: &[Col] =
-    &[left("Network", 20), left("Next Hop", 20), left("Path", 20)];
+// `Peer` is what tells two rows for the same prefix apart: the same route
+// heard from two neighbors, or pre- and post-policy copies from one.
+static ROUTE_COLS: &[Col] = &[
+    left("Network", 20),
+    left("Next Hop", 20),
+    left("Peer", 15),
+    left("Path", 20),
+];
 
 /// Render the routes for one prefix.
 pub fn render_prefix<W: Write>(
@@ -389,10 +399,251 @@ pub fn render_prefix<W: Write>(
     let mut table = Table::fit(out, ROUTE_COLS);
     for route in routes {
         let attrs = route_attrs(route);
-        table.row(&[nlri.to_string(), attrs.next_hop, attrs.as_path])?;
+        table.row(&[
+            nlri.to_string(),
+            attrs.next_hop,
+            peer_addr(route),
+            attrs.as_path,
+        ])?;
     }
     table.finish()?;
     Ok(())
+}
+
+/// Render the routes for one prefix with every attribute spelled out.
+pub fn render_prefix_detail<W: Write>(
+    out: &mut W,
+    body: &str,
+) -> Result<(), CliError> {
+    let value: serde_json::Value = parse(body)?;
+    let data = &value["data"];
+    let nlri = data["nlri"].as_str().unwrap_or("-");
+
+    let Some(routes) = data["routes"].as_array().filter(|r| !r.is_empty())
+    else {
+        writeln!(out, "% Network not in table.")?;
+        return Ok(());
+    };
+
+    writeln!(
+        out,
+        "BGP routing table entry for {nlri}, {} path(s)",
+        routes.len()
+    )?;
+    for route in routes {
+        writeln!(out)?;
+        render_route_detail(out, route)?;
+    }
+    Ok(())
+}
+
+/// One path, one attribute per line, in the order an operator reads them:
+/// who sent it, then the attributes the decision process weighs, then the
+/// tags. Anything the CLI does not know by name is still printed, so a new
+/// attribute is never silently hidden.
+fn render_route_detail<W: Write>(
+    out: &mut W,
+    route: &serde_json::Value,
+) -> Result<(), CliError> {
+    let ingress = &route["ingress"];
+    let source = &route["source"];
+
+    let mut peer = peer_addr(route);
+    if let Some(asn) = ingress["remote_asn"].as_u64() {
+        peer.push_str(&format!(" (AS{asn})"));
+    }
+    writeln!(out, "  Peer: {peer}")?;
+
+    // The session, not the ADD-PATH child, so it matches `show ingresses`.
+    let mut via = Vec::new();
+    if let Some(id) = source["ingressId"].as_u64() {
+        via.push(format!("ingress {id}"));
+    }
+    if let Some(kind) = ingress["ingress_type"].as_str() {
+        via.push(kind.to_string());
+    }
+    if let Some(rib) = ingress["peer_rib_type"].as_str() {
+        via.push(match rib {
+            "inPre" => "pre-policy".to_string(),
+            "inPost" => "post-policy".to_string(),
+            "locRib" => "Loc-RIB".to_string(),
+            other => other.to_string(),
+        });
+    }
+    if let Some(path_id) = source["pathId"].as_u64() {
+        via.push(format!("path id {path_id}"));
+    }
+    if !via.is_empty() {
+        writeln!(out, "  Learned via: {}", via.join(", "))?;
+    }
+
+    if let Some(status) = route["status"].as_str() {
+        writeln!(out, "  Status: {status}")?;
+    }
+    if let Some(rpki) = route["rpki"].as_object().filter(|r| !r.is_empty()) {
+        let checks: Vec<String> = rpki
+            .iter()
+            .map(|(key, value)| format!("{key} {}", scalar(value)))
+            .collect();
+        writeln!(out, "  RPKI: {}", checks.join(", "))?;
+    }
+
+    let Some(attrs) = route["pathAttributes"].as_array() else {
+        return Ok(());
+    };
+    let mut saw_as_path = false;
+    for attr in attrs {
+        let Some((key, value)) =
+            attr.as_object().and_then(|o| o.iter().next())
+        else {
+            continue;
+        };
+        match key.as_str() {
+            "origin" => writeln!(
+                out,
+                "  Origin: {}",
+                match value.as_str() {
+                    Some("Igp") => "IGP",
+                    Some("Egp") => "EGP",
+                    Some("Incomplete") => "incomplete",
+                    Some(other) => other,
+                    None => "-",
+                }
+            )?,
+            "asPath" => {
+                saw_as_path = true;
+                let path = as_path_str(value);
+                writeln!(
+                    out,
+                    "  AS path: {}",
+                    if path.is_empty() { "(empty)" } else { &path }
+                )?;
+            }
+            "conventionalNextHop" => {
+                writeln!(out, "  Next hop: {}", scalar(value))?
+            }
+            "mpReachNlri" => {
+                let nh = &value["nextHop"];
+                writeln!(out, "  Next hop: {}", next_hop_str(nh))?;
+                if let Some(ll) = nh["ipv6LL"]["linkLocal"].as_str() {
+                    writeln!(out, "  Link-local next hop: {ll}")?;
+                }
+            }
+            "multiExitDisc" => writeln!(out, "  MED: {}", scalar(value))?,
+            "localPref" => {
+                writeln!(out, "  Local preference: {}", scalar(value))?
+            }
+            "atomicAggregate" => writeln!(out, "  Atomic aggregate")?,
+            "aggregator" => writeln!(
+                out,
+                "  Aggregator: AS{} {}",
+                scalar(&value["asn"]),
+                scalar(&value["address"]),
+            )?,
+            "standardCommunities" => writeln!(
+                out,
+                "  Communities: {}",
+                list(value, |c| strip_as(c).to_string())
+            )?,
+            "extendedCommunities" => writeln!(
+                out,
+                "  Extended communities: {}",
+                list(value, str::to_string)
+            )?,
+            "largeCommunities" => writeln!(
+                out,
+                "  Large communities: {}",
+                list(value, str::to_string)
+            )?,
+            other => writeln!(out, "  {other}: {}", scalar(value))?,
+        }
+    }
+    if !saw_as_path {
+        writeln!(out, "  AS path: (none)")?;
+    }
+    Ok(())
+}
+
+/// A JSON value on one line: strings bare, everything else compact JSON.
+fn scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Null => "-".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// A string array joined by spaces, each element mapped for display.
+fn list(value: &serde_json::Value, f: impl Fn(&str) -> String) -> String {
+    match value.as_array() {
+        Some(items) => items
+            .iter()
+            .map(|v| match v.as_str() {
+                Some(s) => f(s),
+                None => v.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" "),
+        None => scalar(value),
+    }
+}
+
+/// The API renders ASNs as "AS65001"; operators read plain numbers.
+fn strip_as(s: &str) -> &str {
+    match s.strip_prefix("AS") {
+        Some(rest) if rest.starts_with(|c: char| c.is_ascii_digit()) => rest,
+        _ => s,
+    }
+}
+
+fn as_path_str(value: &serde_json::Value) -> String {
+    value
+        .as_array()
+        .map(|hops| {
+            hops.iter()
+                .map(|h| match h.as_str() {
+                    Some(s) => strip_as(s).to_string(),
+                    // An AS_SET or confed segment is not a plain string;
+                    // show it as-is rather than drop it.
+                    None => h.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default()
+}
+
+/// An MP_REACH next hop, which routecore tags with its family:
+/// `{"ipv6Unicast": "2001:db8::1"}`, or for a global plus link-local pair
+/// `{"ipv6LL": {"global": …, "linkLocal": …}}`. The global address is the
+/// one to show; the link-local only means something on the peering LAN.
+fn next_hop_str(nh: &serde_json::Value) -> String {
+    if let Some(s) = nh.as_str() {
+        return s.to_string();
+    }
+    let Some((kind, inner)) = nh.as_object().and_then(|o| o.iter().next())
+    else {
+        return "-".to_string();
+    };
+    if let Some(s) = inner.as_str() {
+        return s.to_string();
+    }
+    if let Some(global) = inner["global"].as_str() {
+        return global.to_string();
+    }
+    format!("{kind} {inner}")
+}
+
+/// The address of the neighbor a route came from, falling back to the
+/// ingress id when the ingress record carries no address.
+fn peer_addr(route: &serde_json::Value) -> String {
+    if let Some(addr) = route["ingress"]["remote_addr"].as_str() {
+        return addr.to_string();
+    }
+    match route["source"]["ingressId"].as_u64() {
+        Some(id) => format!("ingress {id}"),
+        None => "-".to_string(),
+    }
 }
 
 struct RouteAttrs {
@@ -413,20 +664,13 @@ fn route_attrs(route: &serde_json::Value) -> RouteAttrs {
             if let Some(nh) = attr["conventionalNextHop"].as_str() {
                 next_hop = nh.to_string();
             }
-            if let Some(nh) = attr["mpReachNlri"]["nextHop"].as_str() {
+            if let Some(nh) = attr.get("mpReachNlri") {
                 if next_hop == "-" {
-                    next_hop = nh.to_string();
+                    next_hop = next_hop_str(&nh["nextHop"]);
                 }
             }
-            if let Some(path) = attr["asPath"].as_array() {
-                // The API renders hops as "AS65001"; operators read plain
-                // numbers in this column.
-                as_path = path
-                    .iter()
-                    .filter_map(|h| h.as_str())
-                    .map(|h| h.trim_start_matches("AS").to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+            if let Some(path) = attr.get("asPath") {
+                as_path = as_path_str(path);
             }
         }
     }
@@ -706,33 +950,20 @@ pub fn render_flowspec<W: Write>(
     Ok(())
 }
 
-fn stream_table(session: &mut Session, path: &str) -> Result<(), CliError> {
+fn stream_table(
+    session: &mut Session,
+    path: &str,
+    detail: bool,
+) -> Result<(), CliError> {
     let mut resp = session.get(path)?;
     let mut out = session.writer();
-    let mut table = Table::fixed(&mut out, ROUTE_COLS);
 
-    let mut count = 0u64;
-    {
-        let reader = BufReader::new(&mut resp);
-        for line in reader.lines() {
-            let line = line?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let Ok(record) = serde_json::from_str::<serde_json::Value>(&line)
-            else {
-                continue;
-            };
-            let attrs = route_attrs(&record);
-            table.row(&[
-                record["prefix"].as_str().unwrap_or("-").to_string(),
-                attrs.next_hop,
-                attrs.as_path,
-            ])?;
-            count += 1;
-        }
-    }
-    table.finish()?;
+    let reader = BufReader::new(&mut resp);
+    let count = if detail {
+        stream_detail(&mut out, reader)?
+    } else {
+        stream_rows(&mut out, reader)?
+    };
     writeln!(out, "\nTotal routes {}", fmt::count(count))?;
     out.finish()?;
 
@@ -746,6 +977,55 @@ fn stream_table(session: &mut Session, path: &str) -> Result<(), CliError> {
         ));
     }
     Ok(())
+}
+
+/// The NDJSON records of a table dump, skipping blank or unparseable lines.
+fn records<R: BufRead>(
+    reader: R,
+) -> impl Iterator<Item = Result<serde_json::Value, CliError>> {
+    reader.lines().filter_map(|line| match line {
+        Err(e) => Some(Err(e.into())),
+        Ok(line) if line.trim().is_empty() => None,
+        Ok(line) => serde_json::from_str(&line).ok().map(Ok),
+    })
+}
+
+fn stream_rows<W: Write, R: BufRead>(
+    out: &mut W,
+    reader: R,
+) -> Result<u64, CliError> {
+    let mut table = Table::fixed(out, ROUTE_COLS);
+    let mut count = 0u64;
+    for record in records(reader) {
+        let record = record?;
+        let attrs = route_attrs(&record);
+        table.row(&[
+            record["prefix"].as_str().unwrap_or("-").to_string(),
+            attrs.next_hop,
+            peer_addr(&record),
+            attrs.as_path,
+        ])?;
+        count += 1;
+    }
+    table.finish()?;
+    Ok(count)
+}
+
+fn stream_detail<W: Write, R: BufRead>(
+    out: &mut W,
+    reader: R,
+) -> Result<u64, CliError> {
+    let mut count = 0u64;
+    for record in records(reader) {
+        let record = record?;
+        if count > 0 {
+            writeln!(out)?;
+        }
+        writeln!(out, "{}", record["prefix"].as_str().unwrap_or("-"))?;
+        render_route_detail(out, &record)?;
+        count += 1;
+    }
+    Ok(count)
 }
 
 //------------ helpers -------------------------------------------------------
@@ -1053,6 +1333,152 @@ mod tests {
         // AS path hops lose the API's "AS" prefix.
         assert!(out.contains("65001"));
         assert!(!out.contains("AS65001"));
+    }
+
+    /// IPv6 next hops arrive tagged with their family, not as a string; a
+    /// plain string lookup rendered every IPv6 route's next hop as `-`.
+    #[test]
+    fn ipv6_next_hops_are_decoded() {
+        let v6 = serde_json::json!({"ipv6Unicast": "2001:db8::1"});
+        assert_eq!(next_hop_str(&v6), "2001:db8::1");
+        let ll = serde_json::json!(
+            {"ipv6LL": {"global": "2001:db8::1", "linkLocal": "fe80::1"}}
+        );
+        assert_eq!(next_hop_str(&ll), "2001:db8::1");
+
+        let route = serde_json::json!({"pathAttributes": [
+            {"mpReachNlri": {"nextHop": ll}}
+        ]});
+        assert_eq!(route_attrs(&route).next_hop, "2001:db8::1");
+    }
+
+    const DETAIL_ROUTE: &str = r#"{"status":"active",
+        "ingress":{"id":4,"ingress_type":"bgpViaBmp","remote_addr":"192.0.2.7","remote_asn":65100,"peer_rib_type":"inPre"},
+        "source":{"ingressId":3,"pathId":1},
+        "rpki":{"rov":"valid"},
+        "pathAttributes":[{"origin":"Igp"},{"asPath":["AS65100","AS65010"]},
+          {"multiExitDisc":50},{"localPref":200},{"atomicAggregate":null},
+          {"aggregator":{"asn":65010,"address":"10.9.9.9"}},
+          {"standardCommunities":["AS65000:100","NO_EXPORT"]},
+          {"extendedCommunities":["rt:AS65000:42"]},
+          {"largeCommunities":["65001:1:2"]},
+          {"otc":65100},
+          {"mpReachNlri":{"nextHop":{"ipv6LL":{"global":"2001:db8::1","linkLocal":"fe80::1"}}}}]}"#;
+
+    fn detail(route: &str) -> String {
+        let body = format!(
+            r#"{{"data":{{"nlri":"2001:db8::/32","routes":[{route}]}}}}"#
+        );
+        let mut buf = Vec::new();
+        render_prefix_detail(&mut buf, &body).unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn detail_spells_out_every_attribute() {
+        let out = detail(DETAIL_ROUTE);
+        for line in [
+            "BGP routing table entry for 2001:db8::/32, 1 path(s)",
+            "  Peer: 192.0.2.7 (AS65100)",
+            "  Learned via: ingress 3, bgpViaBmp, pre-policy, path id 1",
+            "  Status: active",
+            "  RPKI: rov valid",
+            "  Origin: IGP",
+            "  AS path: 65100 65010",
+            "  MED: 50",
+            "  Local preference: 200",
+            "  Atomic aggregate",
+            "  Aggregator: AS65010 10.9.9.9",
+            "  Communities: 65000:100 NO_EXPORT",
+            "  Extended communities: rt:AS65000:42",
+            "  Large communities: 65001:1:2",
+            "  Next hop: 2001:db8::1",
+            "  Link-local next hop: fe80::1",
+        ] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "missing {line:?}:\n{out}"
+            );
+        }
+    }
+
+    /// An attribute the CLI has no name for must still be shown.
+    #[test]
+    fn detail_shows_unknown_attributes_raw() {
+        let out = detail(DETAIL_ROUTE);
+        assert!(out.lines().any(|l| l == "  otc: 65100"), "{out}");
+    }
+
+    #[test]
+    fn detail_reports_a_miss() {
+        let mut buf = Vec::new();
+        render_prefix_detail(
+            &mut buf,
+            r#"{"data":{"nlri":null,"routes":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            "% Network not in table.\n"
+        );
+    }
+
+    /// The streamed dump separates routes and names each prefix, so
+    /// `| include` on a prefix still finds its block's first line.
+    #[test]
+    fn detail_dump_streams_one_block_per_route() {
+        let line = format!(
+            r#"{{"prefix":"2001:db8::/32","section":"data",{}"#,
+            &DETAIL_ROUTE.trim_start()[1..]
+        )
+        .replace('\n', "");
+        let input = format!("{line}\n\n{line}\n");
+        let mut buf = Vec::new();
+        let count = stream_detail(&mut buf, input.as_bytes()).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(out.matches("\n2001:db8::/32\n").count(), 1, "{out}");
+        assert!(out.starts_with("2001:db8::/32\n  Peer: 192.0.2.7"), "{out}");
+    }
+
+    /// Two rows for one prefix must be told apart by who sent them.
+    #[test]
+    fn table_rows_name_the_peer() {
+        let line = format!(
+            r#"{{"prefix":"2001:db8::/32","section":"data",{}"#,
+            &DETAIL_ROUTE.trim_start()[1..]
+        )
+        .replace('\n', "");
+        let mut buf = Vec::new();
+        stream_rows(&mut buf, format!("{line}\n").as_bytes()).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let row = out.lines().nth(1).unwrap();
+        assert!(row.contains("2001:db8::1"), "{row}");
+        assert!(row.contains("192.0.2.7"), "{row}");
+        assert!(row.contains("65100 65010"), "{row}");
+    }
+
+    #[test]
+    fn the_detail_flag_is_set_by_every_detail_form() {
+        use crate::tree::resolve;
+
+        for line in [
+            "show ip bgp detail",
+            "show ipv6 bgp detail",
+            "show ip bgp detail 10.0.0.0/24",
+            "show ip bgp 10.0.0.0/24 detail",
+            "show ip bgp detail source bmp",
+            "show ip bgp detail origin-as 65001",
+            "show ip bgp neighbors 10.0.0.1 routes detail",
+        ] {
+            let (_, captures) =
+                resolve(line).unwrap_or_else(|_| panic!("{line} must parse"));
+            assert!(captures.detail(), "{line} lost the Detail flag");
+            assert!(!captures.best(), "{line}");
+        }
+
+        let (_, captures) = resolve("show ip bgp 10.0.0.0/24").unwrap();
+        assert!(!captures.detail());
     }
 
     #[test]

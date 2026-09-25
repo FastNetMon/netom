@@ -176,6 +176,44 @@ are not typeable there rather than failing at the daemon.
 A filter narrows the output, not the work: the daemon still walks the whole
 table to answer, so a narrowed dump is no faster than a full one.
 
+## Route detail
+
+The route table shows one line per path: network, next hop, the peer it came
+from, and the AS path. Add `detail` for every attribute of each path:
+
+```
+netom> show ipv6 bgp 2001:db8::/32 detail
+BGP routing table entry for 2001:db8::/32, 1 path(s)
+
+  Peer: 192.0.2.7 (AS65100)
+  Learned via: ingress 3, bgpViaBmp, pre-policy
+  Status: active
+  RPKI: rov notChecked
+  Origin: IGP
+  AS path: 65100 65010
+  MED: 50
+  Local preference: 200
+  Communities: 65000:100 NO_EXPORT
+  Large communities: 65001:1:2
+  Next hop: 2001:db8::1
+  Link-local next hop: fe80::1
+```
+
+It works on every route query:
+
+```
+netom> show ip bgp detail                          the whole table
+netom> show ip bgp detail 10.0.0.0/24              one prefix
+netom> show ip bgp 10.0.0.0/24 detail              the same
+netom> show ip bgp detail source bmp               with one filter
+netom> show ip bgp neighbors 10.1.0.1 routes detail
+```
+
+`Learned via` names the session's ingress id (as `show ingresses` lists it,
+even for an ADD-PATH path), its kind, and for BMP whether the copy is
+pre- or post-policy. An attribute the CLI has no name for is printed as
+`name: value` rather than dropped. `--json` returns the same data unchanged.
+
 ## Best path
 
 Which of the routes for a prefix wins the RFC 4271 decision process, and why

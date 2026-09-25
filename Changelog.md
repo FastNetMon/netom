@@ -27,6 +27,19 @@ Released yyyy-mm-dd.
 
 ### New
 
+* `netom-cli show ip bgp detail` (and `show ipv6 bgp detail`) prints every
+  attribute of each path: peer and AS, how it was learned (ingress, BMP,
+  pre/post-policy, ADD-PATH path id), status and RPKI, origin, AS path,
+  next hop including the IPv6 link-local, MED, local preference, atomic
+  aggregate, aggregator, and standard, extended and large communities. An
+  attribute the CLI has no name for is printed raw rather than hidden. It
+  takes a prefix or one route filter (`show ip bgp detail source bmp`), and
+  also ends `show ip bgp <prefix> detail` and
+  `show ip bgp neighbors <ip> routes detail`.
+* The `show ip bgp` route table gains a `Peer` column, so two rows for the
+  same prefix — one route heard from two neighbors, or pre- and post-policy
+  copies from one — can be told apart.
+
 * New `/api/v1/ribs/{ipv4,ipv6}unicast/best-path/{prefix}` and
   `.../best-path/{address}` endpoints: the RFC 4271 section 9.1 decision
   process over the routes for one prefix, returning the winner, the ranked
@@ -136,6 +149,11 @@ Released yyyy-mm-dd.
   `netom_ingress_register_addpath_path_children`.
 
 ### Bug fixes
+
+* `netom-cli show ipv6 bgp` showed `-` as the next hop of every IPv6
+  route: the API tags an MP_REACH next hop with its family
+  (`{"ipv6Unicast": …}`, `{"ipv6LL": {"global": …, "linkLocal": …}}`),
+  which the CLI read as a plain string. It now shows the global address.
 
 * The per-peer prefix count — `State/PfxRcd` in `netom-cli show ip bgp
   summary`, `prefixesReceived` in the HTTP API, and the Adj-RIB-In gauges
