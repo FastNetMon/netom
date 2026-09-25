@@ -121,7 +121,7 @@ syslog             = "7.0"
 # with the `profiling` feature, supports runtime heap profiling for leak
 # hunting (zero cost unless enabled via the `_RJEM_MALLOC_CONF` env var).
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator  = { version = "0.6", features = ["profiling", "background_threads_runtime_support"] }
+tikv-jemallocator  = { version = "0.7", features = ["profiling", "background_threads_runtime_support"] }
 
 [dev-dependencies]
 base64             = "0.22"
