@@ -647,11 +647,30 @@ impl Register {
     /// Mark an existing ingress down without resurrecting a GC'd child
     /// that remains in an input handler's cache until its next prune.
     pub fn mark_disconnected(&self, id: IngressId) -> bool {
+        self.mark_disconnected_with(id, None)
+    }
+
+    /// Like [`Register::mark_disconnected`], also recording why the session
+    /// went down when it is known (a BMP Peer Down Notification).
+    ///
+    /// The record is set under the same lock as the state change, and bumps
+    /// `history_revision` once, so exporters keyed on the revision pick up
+    /// both together. It is deliberately left in place when the peer comes
+    /// back up: `update_info` only merges fields that are set, and a PeerUp
+    /// never sets `last_down`.
+    pub fn mark_disconnected_with(
+        &self,
+        id: IngressId,
+        last_down: Option<PeerDownInfo>,
+    ) -> bool {
         let mut lock = self.info.write().unwrap();
         let Some(info) = lock.get_mut(&id) else {
             return false;
         };
         info.state = Some(IngressState::Disconnected);
+        if last_down.is_some() {
+            info.last_down = last_down;
+        }
         info.history_revision = info.history_revision.saturating_add(1);
         true
     }
@@ -983,8 +1002,114 @@ info_for_field!(IngressInfo{
    // SessionConfig::enabled_addpaths() (the negotiated set), not from
    // remote_capabilities (which is one side's OPEN, not the intersection).
    #[serde(serialize_with = "serialize_addpath_families")]
-   addpath_families: Vec<u8>
+   addpath_families: Vec<u8>,
+   // Why this BGP session last went down, from the monitored router's BMP
+   // Peer Down Notification. Kept across reconnects; see PeerDownInfo.
+   last_down: PeerDownInfo
 });
+
+/// Why a monitored router's BGP session went down, as reported by the
+/// router in a BMP Peer Down Notification (RFC 7854 §4.9).
+///
+/// This is about the BGP session between the monitored router and its peer,
+/// not the BMP session to netom. Only sessions that reached Established are
+/// ever reported: a router sends Peer Down only for a peer it sent Peer Up
+/// for, so a session that fails to come up (e.g. an OPEN rejected for a bad
+/// peer AS) never shows up here.
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, serde::Serialize)]
+pub struct PeerDownInfo {
+    /// When the session went down: the Peer Down per-peer header timestamp,
+    /// or the time netom received the message if the router sent 0.
+    pub time: DateTime<Utc>,
+    pub reason: PeerDownReason,
+    /// The raw Peer Down reason code, also for codes netom has no name for.
+    pub reason_code: u8,
+    /// Error code and subcode of the BGP NOTIFICATION the router sent
+    /// (reason 1) or received (reason 3).
+    pub notification_code: Option<u8>,
+    pub notification_subcode: Option<u8>,
+    /// The RFC 8203/9003 shutdown communication carried by a Cease
+    /// Administrative Shutdown or Administrative Reset NOTIFICATION.
+    pub shutdown_communication: Option<String>,
+    /// The BGP FSM event code that closed the session (reason 2).
+    pub fsm_event: Option<u16>,
+    /// A one-line human-readable summary, e.g.
+    /// `remote NOTIFICATION: Cease(AdministrativeShutdown)`.
+    pub description: String,
+}
+
+/// The reason code of a BMP Peer Down Notification (RFC 7854 §4.9, code 6
+/// from RFC 9069).
+#[derive(
+    Clone, Copy, Debug, Eq, Hash, PartialEq, Ord, PartialOrd, serde::Serialize,
+)]
+#[serde(rename_all = "camelCase")]
+pub enum PeerDownReason {
+    /// 0: reserved.
+    Reserved,
+    /// 1: the router closed the session and sent a NOTIFICATION.
+    LocalNotification,
+    /// 2: the router closed the session without a NOTIFICATION; an FSM
+    /// event code follows.
+    LocalFsm,
+    /// 3: the peer closed the session and sent a NOTIFICATION.
+    RemoteNotification,
+    /// 4: the peer closed the session without a NOTIFICATION.
+    RemoteNoData,
+    /// 5: the peer was de-configured; information for it stops.
+    PeerDeconfigured,
+    /// 6: the router closed the session, with TLV data (RFC 9069, Loc-RIB).
+    LocalTlv,
+    /// Any other code.
+    Unknown,
+}
+
+impl PeerDownReason {
+    /// All variants, in reason code order.
+    pub const ALL: [PeerDownReason; 8] = [
+        Self::Reserved,
+        Self::LocalNotification,
+        Self::LocalFsm,
+        Self::RemoteNotification,
+        Self::RemoteNoData,
+        Self::PeerDeconfigured,
+        Self::LocalTlv,
+        Self::Unknown,
+    ];
+
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Reserved,
+            1 => Self::LocalNotification,
+            2 => Self::LocalFsm,
+            3 => Self::RemoteNotification,
+            4 => Self::RemoteNoData,
+            5 => Self::PeerDeconfigured,
+            6 => Self::LocalTlv,
+            _ => Self::Unknown,
+        }
+    }
+
+    /// Position in [`PeerDownReason::ALL`], for per-reason counters.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+
+    /// The name used in JSON output and metric labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::LocalNotification => "localNotification",
+            Self::LocalFsm => "localFsm",
+            Self::RemoteNotification => "remoteNotification",
+            Self::RemoteNoData => "remoteNoData",
+            Self::PeerDeconfigured => "peerDeconfigured",
+            Self::LocalTlv => "localTlv",
+            Self::Unknown => "unknown",
+        }
+    }
+}
 
 /// Serialize a raw BGP capability blob (`capabilities_as_vec` wire format) as
 /// a human-readable list of capability names, e.g.
@@ -1122,6 +1247,71 @@ mod tests {
 
         // And the newly set RibType
         assert_eq!(res.get(id).unwrap().rib_type, Some(RibType::LocRib));
+    }
+
+    #[test]
+    fn mark_disconnected_with_records_and_keeps_the_peer_down() {
+        let register = Register::new();
+        let id = register.register();
+        register.update_info(
+            id,
+            IngressInfo::new().with_state(IngressState::Connected),
+        );
+
+        let down = PeerDownInfo {
+            time: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            reason: PeerDownReason::RemoteNotification,
+            reason_code: 3,
+            notification_code: Some(6),
+            notification_subcode: Some(2),
+            shutdown_communication: Some("maintenance".into()),
+            fsm_event: None,
+            description: "remote NOTIFICATION: \
+                          Cease(AdministrativeShutdown) \"maintenance\""
+                .into(),
+        };
+        assert!(register.mark_disconnected_with(id, Some(down.clone())));
+        let info = register.get(id).unwrap();
+        assert_eq!(info.state, Some(IngressState::Disconnected));
+        assert_eq!(info.last_down.as_ref(), Some(&down));
+
+        // A later disconnect without a reason (e.g. the whole BMP session
+        // closing) leaves the last known reason alone.
+        assert!(register.mark_disconnected(id));
+        assert_eq!(register.get(id).unwrap().last_down, Some(down));
+
+        // /api/v1/ingresses: snake_case keys like the rest of IngressInfo,
+        // absent fields omitted.
+        let json =
+            serde_json::to_value(IdAndInfo::from((id, &info))).unwrap();
+        assert_eq!(
+            json["last_down"],
+            serde_json::json!({
+                "time": "2023-11-14T22:13:20Z",
+                "reason": "remoteNotification",
+                "reason_code": 3,
+                "notification_code": 6,
+                "notification_subcode": 2,
+                "shutdown_communication": "maintenance",
+                "description": "remote NOTIFICATION: \
+                    Cease(AdministrativeShutdown) \"maintenance\"",
+            })
+        );
+    }
+
+    #[test]
+    fn peer_down_reason_names_match_their_codes() {
+        for (code, reason) in PeerDownReason::ALL.iter().enumerate() {
+            assert_eq!(reason.index(), code);
+            if code <= 6 {
+                assert_eq!(PeerDownReason::from_code(code as u8), *reason);
+            }
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::json!(reason.as_str())
+            );
+        }
+        assert_eq!(PeerDownReason::from_code(200), PeerDownReason::Unknown);
     }
 
     #[test]

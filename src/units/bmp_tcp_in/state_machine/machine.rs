@@ -719,6 +719,11 @@ where
 
         let removed_peers = self.details.remove_peer_identity_siblings(&pph);
         if !removed_peers.is_empty() {
+            // Why the router's BGP session went down, recorded on each view
+            // of the peer so /bgp/neighbors and /ingresses can report it.
+            let last_down =
+                super::peer_down::peer_down_info(&msg, Utc::now());
+
             // Reap every PeerState that shares this peer's identity. The
             // rib_type/policy-flag workaround in route_monitoring() can
             // create entries keyed on a synthesized post-policy PPH alongside
@@ -772,12 +777,21 @@ where
             )> = removed_peers
                 .iter()
                 .flat_map(|peer| {
-                    std::iter::once(peer.ingress_id)
-                        .chain(peer.path_children.values().copied())
+                    // The peer's own ingress (one per RIB view) carries the
+                    // reason; its ADD-PATH path-children are only flipped.
+                    std::iter::once((peer.ingress_id, Some(&last_down)))
+                        .chain(
+                            peer.path_children
+                                .values()
+                                .map(|&child| (child, None)),
+                        )
                 })
-                .filter_map(|ingress_id| {
+                .filter_map(|(ingress_id, last_down)| {
                     self.ingress_register
-                        .mark_disconnected(ingress_id)
+                        .mark_disconnected_with(
+                            ingress_id,
+                            last_down.cloned(),
+                        )
                         .then_some((ingress_id, None))
                 })
                 .collect();
@@ -983,6 +997,9 @@ where
                         ));
                     adapted_ingress_info.state =
                         Some(ingress::register::IngressState::Connected);
+                    // The source peer's last Peer Down is its own; don't
+                    // copy it onto this view.
+                    adapted_ingress_info.last_down = None;
                     // Layer D reuse: if this synthesized (peer, policy) was
                     // seen in a prior session and kept as Disconnected, rebind
                     // its IngressId instead of minting a fresh one each session.
@@ -1057,6 +1074,9 @@ where
                         ));
                     adapted_ingress_info.state =
                         Some(ingress::register::IngressState::Connected);
+                    // The source peer's last Peer Down is its own; don't
+                    // copy it onto this view.
+                    adapted_ingress_info.last_down = None;
                     // Layer D reuse (see the nulled-flags arm above).
                     let new_ingress_id = self
                         .ingress_register

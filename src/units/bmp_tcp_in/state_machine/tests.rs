@@ -2516,3 +2516,206 @@ fn assert_invalid_msg_starts_with(
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Why a monitored router's BGP session went down (Peer Down reasons)
+// ---------------------------------------------------------------------------
+
+/// A Peer Down for `pph` with reason 3: the peer sent a Cease
+/// Administrative Shutdown NOTIFICATION with a shutdown communication.
+fn mk_remote_shutdown_peer_down_msg(
+    pph: &crate::bgp::encode::PerPeerHeader,
+    text: &str,
+) -> BmpMsg<Bytes> {
+    let mut data = vec![text.len() as u8];
+    data.extend_from_slice(text.as_bytes());
+    let notification =
+        crate::bgp::encode::mk_bgp_notification_msg(6, 2, &data);
+    BmpMsg::from_octets(
+        crate::bgp::encode::mk_peer_down_notification_msg_with(
+            pph,
+            3,
+            &notification,
+        ),
+    )
+    .unwrap()
+}
+
+#[test]
+fn peer_down_records_why_the_session_went_down() {
+    use crate::ingress::register::{IngressState, PeerDownReason};
+
+    let register: Arc<crate::ingress::Register> = Arc::default();
+    let (pph, peer_up_msg_buf, real_pph) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let processor = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+    let ingress_id = if let BmpState::Dumping(p) = &processor {
+        p.details
+            .peer_states
+            .get_peer_ingress_id(&real_pph)
+            .unwrap()
+    } else {
+        unreachable!("expected Dumping after PeerUp");
+    };
+    assert_eq!(register.get(ingress_id).unwrap().last_down, None);
+
+    let processor = processor
+        .process_msg(
+            Instant::now(),
+            mk_remote_shutdown_peer_down_msg(&pph, "maintenance"),
+            None,
+        )
+        .next_state;
+
+    let info = register.get(ingress_id).unwrap();
+    assert_eq!(info.state, Some(IngressState::Disconnected));
+    let last_down = info.last_down.expect("Peer Down must record a reason");
+    assert_eq!(last_down.reason, PeerDownReason::RemoteNotification);
+    assert_eq!(last_down.notification_code, Some(6));
+    assert_eq!(last_down.notification_subcode, Some(2));
+    assert_eq!(
+        last_down.description,
+        "remote NOTIFICATION: Cease(AdministrativeShutdown) \"maintenance\""
+    );
+
+    // The record outlives the outage: a reconnect rebinds the same
+    // ingress without wiping why it last went down.
+    let (_, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    processor.process_msg(Instant::now(), peer_up_msg_buf, None);
+    let info = register.get(ingress_id).unwrap();
+    assert_eq!(info.state, Some(IngressState::Connected));
+    assert_eq!(
+        info.last_down.map(|down| down.reason),
+        Some(PeerDownReason::RemoteNotification)
+    );
+}
+
+#[test]
+fn peer_down_reason_is_recorded_on_every_view_of_the_peer() {
+    let register: Arc<crate::ingress::Register> = Arc::default();
+    let (pph_pre, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let mut pph_post = mk_per_peer_header("127.0.0.1", 12345);
+    pph_post.peer_flags = 0x40;
+
+    let processor = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state
+        // Post-policy Route Monitoring with no matching PeerUp: a
+        // synthesized post-policy view of the same peer.
+        .process_msg(Instant::now(), mk_route_monitoring_msg(&pph_post), None)
+        .next_state;
+    let views: Vec<_> = register
+        .cloned_info()
+        .into_iter()
+        .filter(|(_, info)| {
+            info.ingress_type
+                == Some(crate::ingress::register::IngressType::BgpViaBmp)
+        })
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(views.len(), 2, "pre-policy and synthesized post-policy");
+
+    processor.process_msg(
+        Instant::now(),
+        mk_remote_shutdown_peer_down_msg(&pph_pre, "bye"),
+        None,
+    );
+    for id in views {
+        let last_down = register.get(id).unwrap().last_down;
+        assert_eq!(
+            last_down.map(|down| down.shutdown_communication),
+            Some(Some("bye".to_string())),
+            "view {id} must carry the reason"
+        );
+    }
+}
+
+#[test]
+fn synthesized_views_do_not_inherit_a_stale_peer_down() {
+    let register: Arc<crate::ingress::Register> = Arc::default();
+    let (pph_pre, peer_up_msg_buf, real_pph) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let processor = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_remote_shutdown_peer_down_msg(&pph_pre, "first outage"),
+            None,
+        )
+        .next_state;
+
+    // The pre-policy view comes back carrying its last Peer Down...
+    let (_, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let processor = processor
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state;
+    let pre_id = if let BmpState::Dumping(p) = &processor {
+        p.details
+            .peer_states
+            .get_peer_ingress_id(&real_pph)
+            .unwrap()
+    } else {
+        unreachable!("expected Dumping after PeerUp");
+    };
+    assert!(register.get(pre_id).unwrap().last_down.is_some());
+
+    // ...but a post-policy view synthesized from it now has never been
+    // down, so it must not copy that record.
+    let mut pph_post = mk_per_peer_header("127.0.0.1", 12345);
+    pph_post.peer_flags = 0x40;
+    processor.process_msg(
+        Instant::now(),
+        mk_route_monitoring_msg(&pph_post),
+        None,
+    );
+    let synthesized: Vec<_> = register
+        .cloned_info()
+        .into_iter()
+        .filter(|(id, info)| {
+            *id != pre_id
+                && info.ingress_type
+                    == Some(crate::ingress::register::IngressType::BgpViaBmp)
+        })
+        .collect();
+    assert_eq!(synthesized.len(), 1);
+    assert_eq!(synthesized[0].1.last_down, None);
+}
