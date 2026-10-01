@@ -125,6 +125,8 @@ Released yyyy-mm-dd.
   their ingresses in `/api/v1/ingresses` gain a structured `last_down`. Both
   are kept after the session comes back up. Previously a BMP peer's row only
   said `Idle`. See `docs/bmp-tcp-in.md`.
+* `netom-cli show ip bgp neighbors` shows a BMP peer's last Peer Down as
+  `Last error` (why) and `Last down` (when, and how long ago).
 
 * Native BGP sessions now record `session_up_time` in the ingress register.
   Besides giving those peers an uptime, this fixes the per-peer header of

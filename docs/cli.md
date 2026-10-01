@@ -300,6 +300,30 @@ is waiting for a peer that has not connected. Only exactly-configured peers
 can be listed this way — a peer matched by a prefix has no single address to
 show until it connects.
 
+A peer seen through BMP is down when its router says so. The router's Peer
+Down Notification also says why, and netom keeps that after the session comes
+back:
+
+```
+netom> show ip bgp neighbors 192.0.2.8
+BGP neighbor is 192.0.2.8, remote AS 65101
+  BGP router identifier: 192.0.2.8
+  BGP state = Idle
+  Learned via: BMP feed
+  Monitored router: 10.99.0.1 (ingress 2)
+  RIB type: InPre
+  ...
+  Last error: remote NOTIFICATION: Cease(AdministrativeShutdown) "maintenance"
+  Last down: 2026-08-12T05:58:10Z (00:03:12 ago)
+```
+
+`remote` means the neighbor sent the NOTIFICATION and the router closed the
+session in response; `local` means the router sent it, e.g. `local
+NOTIFICATION: Cease(MaximumPrefixesReached)` when the neighbor exceeded a
+prefix limit. A router only reports sessions that came up, so a BMP peer that
+never established, for example over a peer AS mismatch, does not appear at
+all. See [BMP input](bmp-tcp-in.md#why-a-peers-session-went-down).
+
 ## Paging
 
 There is no built-in pager, and piping a whole-table dump into one is a bad
