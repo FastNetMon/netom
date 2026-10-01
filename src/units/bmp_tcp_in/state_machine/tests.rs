@@ -1745,7 +1745,6 @@ fn end_of_rib_ipv6_for_a_single_peer() {}
 fn end_of_rib_for_all_pending_peers() {}
 
 #[test]
-#[ignore = "TODO: Routecore should error out on update messages bgp_update() message"]
 fn route_monitoring_invalid_message() {
     // Given
     let processor = mk_test_processor();
@@ -1800,9 +1799,17 @@ fn route_monitoring_invalid_message() {
     assert!(matches!(res.next_state, BmpState::Dumping(_)));
     assert_invalid_msg_starts_with(
         &res,
-        "Invalid BMP RouteMonitoring BGP \
-    UPDATE message. One or more elements in the NLRI(s) cannot be parsed",
+        "Invalid BMP RouteMonitoring BGP UPDATE message:",
     );
+    let MessageType::InvalidMessage { err, .. } = &res.message_type else {
+        panic!("expected invalid message");
+    };
+    assert!(err.contains("invalid MP_REACH_NLRI"), "{err}");
+    assert!(err.contains("peer=127.0.0.1"), "{err}");
+    assert!(err.contains("asn=AS65530"), "{err}");
+    assert!(err.contains("bgp_id="), "{err}");
+    assert!(err.contains("rib_type=AdjRibIn"), "{err}");
+    assert!(err.contains("bmp_message_len="), "{err}");
 
     // Check the metrics
     let processor = res.next_state;

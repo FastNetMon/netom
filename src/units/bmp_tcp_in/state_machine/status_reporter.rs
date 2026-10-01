@@ -4,6 +4,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use log::warn;
 use routecore::bgp::ParseError;
 
 use crate::{
@@ -77,6 +78,10 @@ impl BmpStateMachineStatusReporter {
         err: String,
         bytes: Option<Bytes>,
     ) {
+        warn!(
+            "{}: BMP BGP UPDATE parsed with alternate configuration: router={}: {}",
+            self.name, router_id, err
+        );
         let metrics = self.metrics.router_metrics(router_id);
 
         metrics

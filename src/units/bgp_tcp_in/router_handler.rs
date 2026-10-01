@@ -249,6 +249,11 @@ impl Processor {
 
         // XXX is this all OK cancel-safety-wise?
         loop {
+            // tick() can clear the connection before returning a parse error.
+            // Snapshot its identity so the failure still identifies the peer.
+            let peer_addr = session.connected_addr();
+            let peer_asn = session.negotiated().map(|n| n.remote_asn());
+            let peer_bgp_id = session.negotiated().map(|n| n.remote_bgp_id());
             tokio::select! {
                 fsm_res = session.tick() => {
                     match fsm_res {
@@ -264,7 +269,9 @@ impl Processor {
                             }
                         },
                         Err(e) => {
-                            error!("error from fsm: {e}");
+                            error!(
+                                "BGP session error: peer={peer_addr:?} asn={peer_asn:?} bgp_id={peer_bgp_id:?} configured_peer={peer_addr_cfg:?} ingress_id={session_ingress_id}: {e}"
+                            );
                             if let Some(status) = &session_status {
                                 status.set_last_error(e.to_string());
                             }
@@ -392,6 +399,13 @@ impl Processor {
                                 break
                             };
 
+                            if bgp_msg.treatment() != UpdateTreatment::Normal {
+                                warn!(
+                                    "BGP UPDATE validation: peer={peer_addr:?} asn={peer_asn:?} bgp_id={peer_bgp_id:?} ingress_id={session_ingress_id} update_len={} treatment={:?}",
+                                    bgp_msg.as_ref().len(), bgp_msg.treatment()
+                                );
+                            }
+                            let update_len = bgp_msg.as_ref().len();
                             let verdict;
                             let mut osms = smallvec![];
                             let received = std::time::Instant::now();
@@ -483,7 +497,9 @@ impl Processor {
                                             self.gate.update_data(update).await;
                                         },
                                         Err(e) => {
-                                            error!("unexpected state: {e}");
+                                            error!(
+                                                "BGP UPDATE processing failed: peer={peer_addr:?} asn={peer_asn:?} bgp_id={peer_bgp_id:?} ingress_id={session_ingress_id} update_len={update_len}: {e}"
+                                            );
                                         },
                                     };
                                 }
@@ -885,15 +901,6 @@ impl Processor {
         //  RotondaRoute announcements:
         let mut rr_reach = explode_announcements(&bgp_msg)?;
         let mut rr_unreach = explode_withdrawals(&bgp_msg)?;
-        match bgp_msg.treatment() {
-            UpdateTreatment::Normal => {}
-            UpdateTreatment::AttributeDiscard => {
-                warn!("processing UPDATE after RFC 7606 attribute discard");
-            }
-            UpdateTreatment::TreatAsWithdraw => {
-                warn!("applying RFC 7606 treat-as-withdraw to UPDATE");
-            }
-        }
         apply_update_treatment(
             bgp_msg.treatment(),
             &mut rr_reach,

@@ -95,6 +95,20 @@ use super::{
 //use octseq::Octets;
 use routecore::Octets;
 
+/// Attach the monitored peer identity to a parser diagnostic. The router
+/// identity is added by the caller when logging the diagnostic.
+fn bmp_update_error_context(
+    err: impl std::fmt::Display,
+    pph: &PerPeerHeader<Bytes>,
+    message_len: usize,
+) -> String {
+    format!(
+        "{err}; peer={} asn={} bgp_id={:02x?} rib_type={:?} flags={:?} distinguisher={:02x?} bmp_message_len={message_len}",
+        pph.address(), pph.asn(), pph.bgp_id(), pph.rib_type(),
+        pph.flags(), pph.distinguisher(),
+    )
+}
+
 /// Extract the 8-byte route distinguisher from a parsed BMP per-peer header.
 ///
 /// `PerPeerHeader::distinguisher()` returns a slice that, per RFC 7854 and
@@ -1148,7 +1162,11 @@ where
                     if let Some(err_str) = retry_due_to_err {
                         self.status_reporter.bgp_update_parse_soft_fail(
                             self.router_id.clone(),
-                            err_str,
+                            bmp_update_error_context(
+                                err_str,
+                                &pph,
+                                msg.as_ref().len(),
+                            ),
                             Some(Bytes::copy_from_slice(msg.as_ref())),
                         );
 
@@ -1596,6 +1614,12 @@ impl BmpState {
         bmp_msg: BmpMsg<Bytes>,
         trace_id: Option<u8>,
     ) -> ProcessingResult {
+        let update_context = match &bmp_msg {
+            BmpMsg::RouteMonitoring(msg) => {
+                Some((msg.per_peer_header(), msg.as_ref().len()))
+            }
+            _ => None,
+        };
         let res = match self {
             BmpState::Initiating(inner) => {
                 inner.process_msg(bmp_msg, trace_id)
@@ -1620,13 +1644,25 @@ impl BmpState {
         if let ProcessingResult {
             message_type:
                 MessageType::InvalidMessage {
-                    known_peer: _known_peer,
+                    known_peer,
                     msg_bytes,
                     err,
                 },
             next_state,
         } = res
         {
+            let err = match update_context {
+                Some((pph, len)) => bmp_update_error_context(err, &pph, len),
+                None => err,
+            };
+            // Unknown-peer messages already have rate-limited logging above.
+            if known_peer == Some(true) {
+                warn!(
+                    "BMP message processing failed: router={}: {}",
+                    next_state.router_id(),
+                    err
+                );
+            }
             if let Some(reporter) = next_state.status_reporter() {
                 reporter.bgp_update_parse_hard_fail(
                     next_state.router_id(),
