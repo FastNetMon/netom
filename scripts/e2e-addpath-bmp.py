@@ -150,9 +150,19 @@ def fs_withdraw(path_id, rule):
     return bmp_msg(0, pph() + bgp_update(pas, b""))
 
 
+SHUTDOWN_COMMUNICATION = b"e2e: maintenance"
+
+
 def peer_down():
-    # Reason 4: remote system closed without notification.
-    return bmp_msg(2, pph() + bytes([4]))
+    # Reason 3: the peer sent a NOTIFICATION, here Cease (6) / Administrative
+    # Shutdown (2) carrying an RFC 8203 shutdown communication.
+    data = bytes([len(SHUTDOWN_COMMUNICATION)]) + SHUTDOWN_COMMUNICATION
+    notification = (
+        b"\xff" * 16
+        + struct.pack("!HBBB", 21 + len(data), 3, 6, 2)
+        + data
+    )
+    return bmp_msg(2, pph() + bytes([3]) + notification)
 
 
 # --- BMP consumer-side parsing --------------------------------------------------
@@ -461,6 +471,46 @@ def main():
             f"saw {peer_downs}"
         )
         print(f"{context}: peer down emitted exactly once: OK")
+
+    # HTTP: why the router's session went down, from the Peer Down's
+    # NOTIFICATION, on the session ingress and in the neighbor row.
+    with urllib.request.urlopen(
+        f"http://{HTTP_ADDR}/api/v1/ingresses", timeout=10
+    ) as resp:
+        ingresses = json.load(resp)["data"]
+    sessions = [
+        e for e in ingresses if e.get("ingress_type") == "bgpViaBmp"
+    ]
+    assert len(sessions) == 1, sessions
+    last_down = sessions[0].get("last_down")
+    assert last_down, f"FAIL: no last_down on the session: {sessions[0]}"
+    assert last_down["reason"] == "remoteNotification", last_down
+    assert last_down["reason_code"] == 3, last_down
+    assert (
+        last_down["notification_code"],
+        last_down["notification_subcode"],
+    ) == (6, 2), last_down
+    assert (
+        last_down["shutdown_communication"]
+        == SHUTDOWN_COMMUNICATION.decode()
+    ), last_down
+    # The feeder's per-peer header timestamp is 0, so netom stamps it.
+    assert last_down["time"].startswith("20"), last_down
+    print("/ingresses records why the session went down: OK")
+
+    with urllib.request.urlopen(
+        f"http://{HTTP_ADDR}/api/v1/bgp/neighbors/{PEER_IP}", timeout=10
+    ) as resp:
+        neighbors = json.load(resp)["data"]
+    assert neighbors, f"FAIL: no neighbor row for {PEER_IP}"
+    row = neighbors[0]
+    assert row.get("state") == "Idle", row
+    assert row.get("lastError") == (
+        "remote NOTIFICATION: Cease(AdministrativeShutdown) "
+        f'"{SHUTDOWN_COMMUNICATION.decode()}"'
+    ), row
+    assert row.get("lastDownTime") == last_down["time"], row
+    print("/bgp/neighbors reports lastError and lastDownTime: OK")
 
     feeder.close()
     for _, reader in consumers:

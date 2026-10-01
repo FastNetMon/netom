@@ -17,7 +17,10 @@
 #     path of each family (with its path id),
 #   * the /ingresses HTTP API shows the two bgpPath children with pathId and
 #     parentIngress,
-#   * PeerDown is emitted exactly once (for the session, not per child).
+#   * PeerDown is emitted exactly once (for the session, not per child),
+#   * the Peer Down's NOTIFICATION (Cease / Administrative Shutdown with a
+#     shutdown communication) is recorded as `last_down` in /ingresses and
+#     as lastError / lastDownTime in /bgp/neighbors.
 #
 # Requirements: cargo, python3. Set NETOM_BIN to skip the build.
 set -euo pipefail
