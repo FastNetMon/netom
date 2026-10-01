@@ -254,6 +254,15 @@ pub fn render_neighbors<W: Write>(
         if let Some(err) = n["lastError"].as_str() {
             writeln!(out, "  Last error: {err}")?;
         }
+        // BMP peers: when the router reported the session down (Peer Down
+        // Notification); lastError above says why.
+        if let Some(when) = n["lastDownTime"].as_str() {
+            writeln!(
+                out,
+                "  Last down: {when} ({} ago)",
+                super::bmp::uptime_from(&n["lastDownTime"]),
+            )?;
+        }
     }
     Ok(())
 }
@@ -1233,7 +1242,7 @@ mod tests {
         let out = render(NEIGHBORS, None);
         assert!(out.contains("10.1.0.1"));
         assert!(out.contains("192.0.2.7"));
-        assert!(out.contains("Total neighbors 4 (bgp 3, bmp 1)"), "{out}");
+        assert!(out.contains("Total neighbors 5 (bgp 3, bmp 2)"), "{out}");
     }
 
     /// The whole point of the FSM work: a configured peer that never came
@@ -1306,6 +1315,29 @@ mod tests {
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("Current:    84,211"), "{out}");
         assert!(out.contains("Duplicates: 2,410,338"), "{out}");
+    }
+
+    /// A BMP-monitored peer that went down says why and when, from the
+    /// router's Peer Down Notification.
+    #[test]
+    fn neighbor_detail_shows_why_a_bmp_peer_went_down() {
+        let mut buf = Vec::new();
+        render_neighbors(&mut buf, NEIGHBORS).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        let down = out
+            .split("\n\n")
+            .find(|block| block.contains("BGP neighbor is 192.0.2.8"))
+            .expect("the down BMP peer must be rendered");
+        assert!(down.contains("BGP state = Idle"), "{down}");
+        assert!(
+            down.contains(
+                "Last error: remote NOTIFICATION: \
+                 Cease(AdministrativeShutdown) \"maintenance\""
+            ),
+            "{down}"
+        );
+        assert!(down.contains("Last down: 2026-08-12T05:58:10Z ("), "{down}");
+        assert!(down.contains(" ago)"), "{down}");
     }
 
     #[test]

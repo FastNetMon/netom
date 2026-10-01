@@ -230,6 +230,15 @@ The hold time reported by
 is the configured one, not the negotiated one, which the BGP library keeps
 private.
 
+For a peer observed through BMP,
+.B show ip bgp neighbors
+also shows why its session last went down and when
+.RB ( "Last error" ", " "Last down" ),
+from the monitored router's Peer Down Notification: the BGP NOTIFICATION the
+router sent (local) or received (remote), or the FSM event that closed the
+session. Routers report only sessions that came up, so a peer that never
+established is not shown.
+
 .SH PAGING
 Output is not paged. Piping a whole-table dump into a pager is inadvisable:
 the daemon aborts a dump whose reader stops draining, so a pager that stops

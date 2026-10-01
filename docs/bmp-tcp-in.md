@@ -71,6 +71,48 @@ Point a `clickhouse-out` target at the input unit names to record received
 observations before RIB mutation. See [ClickHouse export](clickhouse.md).
 Exporter-generated snapshots and EOR completeness tracking remain later work.
 
+## Why a peer's session went down
+
+When one of a monitored router's own BGP sessions goes down, the router sends
+a Peer Down Notification (RFC 7854 §4.9). netom records the reason on that
+peer and keeps it after the session comes back up, so you can still see why
+it last dropped:
+
+* `GET /api/v1/bgp/neighbors` gives the peer's row a `lastError` with a
+  one-line summary and a `lastDownTime`.
+* `GET /api/v1/ingresses` gives each view of the peer (pre-policy,
+  post-policy) a structured `last_down`.
+
+| Reason | `reason` | Carries |
+|---|---|---|
+| 1 | `localNotification` | the NOTIFICATION the router sent, e.g. `Cease(MaximumPrefixesReached)` |
+| 2 | `localFsm` | the FSM event code that made the router close the session |
+| 3 | `remoteNotification` | the NOTIFICATION the peer sent, e.g. `Cease(AdministrativeShutdown)` |
+| 4 | `remoteNoData` | nothing: the peer closed the session without a NOTIFICATION |
+| 5 | `peerDeconfigured` | nothing: the peer was removed from the router's configuration |
+| 6 | `localTlv` | (RFC 9069) the router closed the session; TLV data follows |
+
+For a Cease Administrative Shutdown or Administrative Reset NOTIFICATION, the
+shutdown communication (RFC 8203, RFC 9003) is decoded too, so a summary reads
+like `remote NOTIFICATION: Cease(AdministrativeShutdown) "maintenance"`. The
+time is the Peer Down's per-peer header timestamp, or the time netom received
+it when the router sends 0.
+
+Each Peer Down Notification is also counted, per router and reason, in the
+`bmp_state_num_peer_down_notifications` counter on `/metrics`, for example
+`{router="edge1",reason="localNotification"}`. Every reason has a series, so
+an alert on a rising `localNotification` rate catches a router tearing
+sessions down, typically for exceeded prefix limits.
+
+Two limits:
+
+* A router only reports sessions that reached Established. It sends Peer
+  Down only for a peer it sent Peer Up for, so a session that never comes up,
+  for example an OPEN rejected for a bad peer AS, never appears here. Look on
+  the router itself for those.
+* The record lives on the peer's ingress. If a peer stays down until the rib's
+  garbage collection reaps it, its record goes with it.
+
 ## Integration tests
 
 The ClickHouse test driver can act as a BMP exporter:

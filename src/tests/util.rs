@@ -923,6 +923,18 @@ pub mod bgp {
         pub fn mk_peer_down_notification_msg(
             per_peer_header: &PerPeerHeader,
         ) -> Bytes {
+            mk_peer_down_notification_msg_with(per_peer_header, 5, &[])
+        }
+
+        /// A Peer Down Notification with the given reason code and data:
+        /// a BGP NOTIFICATION for reasons 1 and 3 (see
+        /// [`mk_bgp_notification_msg`]), a 2-byte FSM event code for
+        /// reason 2, nothing for the others.
+        pub fn mk_peer_down_notification_msg_with(
+            per_peer_header: &PerPeerHeader,
+            reason: u8,
+            data: &[u8],
+        ) -> Bytes {
             let mut buf = BytesMut::new();
             push_bmp_common_header(
                 &mut buf,
@@ -943,9 +955,26 @@ pub mod bgp {
             //
             // From: https://www.rfc-editor.org/rfc/rfc7854.html#section-4.9
 
-            buf.extend_from_slice(&5u8.to_be_bytes()); // reason code 5
+            buf.extend_from_slice(&[reason]);
+            buf.extend_from_slice(data);
 
             finalize_bmp_msg_len(&mut buf);
+            buf.freeze()
+        }
+
+        /// A BGP NOTIFICATION message (RFC 4271 §4.5) with the given error
+        /// code, subcode and data.
+        pub fn mk_bgp_notification_msg(
+            code: u8,
+            subcode: u8,
+            data: &[u8],
+        ) -> Bytes {
+            let mut buf = BytesMut::new();
+            buf.extend_from_slice(&[0xFFu8; 16]); // marker
+            buf.extend_from_slice(&[0, 0]); // length, finalized below
+            buf.extend_from_slice(&[3, code, subcode]); // type 3: NOTIFICATION
+            buf.extend_from_slice(data);
+            finalize_bgp_msg_len(&mut buf);
             buf.freeze()
         }
 

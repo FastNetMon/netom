@@ -115,6 +115,22 @@ Released yyyy-mm-dd.
   entry and so appeared nowhere. Peers observed through BMP are included in
   the same response, carrying the monitored router they were seen through.
 
+* Why a monitored router's BGP session went down. When a router reports a
+  session down with a BMP Peer Down Notification (RFC 7854 §4.9), netom now
+  records the reason instead of discarding it: the reason code, the BGP
+  NOTIFICATION the router sent or received (e.g. `Cease(MaximumPrefixesReached)`
+  or `Cease(AdministrativeShutdown)`, with its RFC 8203 shutdown
+  communication), or the FSM event that closed the session. BMP-monitored
+  peers in `/api/v1/bgp/neighbors` gain `lastError` and `lastDownTime`, and
+  their ingresses in `/api/v1/ingresses` gain a structured `last_down`. Both
+  are kept after the session comes back up. Previously a BMP peer's row only
+  said `Idle`. See `docs/bmp-tcp-in.md`.
+* `netom-cli show ip bgp neighbors` shows a BMP peer's last Peer Down as
+  `Last error` (why) and `Last down` (when, and how long ago).
+* New `bmp_state_num_peer_down_notifications` counter: Peer Down
+  Notifications per monitored router and reason (RFC 7854 §4.9), i.e. the
+  router's BGP sessions going down. See `docs/bmp-tcp-in.md`.
+
 * Native BGP sessions now record `session_up_time` in the ingress register.
   Besides giving those peers an uptime, this fixes the per-peer header of
   the Peer Up that `bmp-tcp-out` synthesizes for restreamed native

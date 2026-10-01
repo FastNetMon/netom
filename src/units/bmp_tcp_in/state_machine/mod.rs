@@ -1,5 +1,6 @@
 mod machine;
 mod metrics;
+mod peer_down;
 mod processing;
 mod states;
 mod status_reporter;

@@ -371,6 +371,11 @@ store walk, so it does not help a response fit under those caps.
 * `GET /api/v1/ingresses` — the peers and sessions the ids above refer to.
   Accepts `filter[type]`, `filter[state]`, `filter[ribType]`,
   `filter[peerAddress]`, `filter[peerAsn]` and `format`.
+  A BMP-monitored peer whose session has gone down carries `last_down`: why
+  and when, from the router's Peer Down Notification. See
+  [BMP input](bmp-tcp-in.md#why-a-peers-session-went-down).
 * `GET /api/v1/ingresses/{id}` — one ingress.
 * `GET /api/v1/bgp/neighbors[/{peer}]` — session state and per-peer counters,
-  merging natively terminated and BMP-monitored peers.
+  merging natively terminated and BMP-monitored peers. For BMP-monitored
+  peers, `lastError` and `lastDownTime` give the reason and time of the
+  session's last Peer Down.

@@ -12,6 +12,8 @@
 
 use std::net::IpAddr;
 
+use chrono::{DateTime, Utc};
+
 use axum::{
     extract::{Path, State},
     response::IntoResponse,
@@ -116,8 +118,22 @@ pub struct Neighbor {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub peer_rib_type: Option<String>,
 
+    /// Why the session last failed or went down. For native sessions, the
+    /// last NOTIFICATION or connection error. For BMP-monitored peers, the
+    /// reason from the router's last Peer Down Notification (RFC 7854
+    /// §4.9), e.g. `remote NOTIFICATION: Cease(AdministrativeShutdown)`;
+    /// the structured form is `last_down` in `/api/v1/ingresses`. Kept
+    /// after the session comes back up.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+
+    /// When a BMP-monitored peer's session last went down, from the same
+    /// Peer Down Notification as `lastError`.
+    ///
+    /// Like the rest of a BMP peer's row, it goes away when the rib's GC
+    /// reaps a peer that never comes back.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_down_time: Option<DateTime<Utc>>,
 }
 
 /// Collect every neighbor netom knows about, from both sources.
@@ -206,6 +222,11 @@ fn bmp_neighbors(state: &ApiState) -> Vec<Neighbor> {
                 via_router: via.as_ref().and_then(|v| v.remote_addr),
                 via_ingress_id: info.parent_ingress,
                 peer_rib_type: info.peer_rib_type.map(|t| format!("{t:?}")),
+                last_error: info
+                    .last_down
+                    .as_ref()
+                    .map(|down| down.description.clone()),
+                last_down_time: info.last_down.as_ref().map(|down| down.time),
                 ..Default::default()
             }
         })

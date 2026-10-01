@@ -203,7 +203,7 @@ pub fn render_ingresses<W: Write>(
 //------------ helpers -------------------------------------------------------
 
 /// Render an RFC 3339 timestamp as an elapsed time.
-fn uptime_from(value: &serde_json::Value) -> String {
+pub(super) fn uptime_from(value: &serde_json::Value) -> String {
     let Some(text) = value.as_str() else {
         return "never".to_string();
     };
