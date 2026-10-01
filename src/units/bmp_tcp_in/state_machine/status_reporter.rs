@@ -10,6 +10,7 @@ use crate::{
     common::status_reporter::{
         AnyStatusReporter, Chainable, Named, UnitStatusReporter,
     },
+    ingress::register::PeerDownReason,
     payload::RouterId,
 };
 
@@ -62,6 +63,20 @@ impl BmpStateMachineStatusReporter {
         if Some(true) == eor_capable {
             metrics.num_peers_up_eor_capable.fetch_sub(1, SeqCst);
         }
+    }
+
+    /// Count a Peer Down Notification: one of the router's BGP sessions
+    /// went down, for `reason`. Once per message, however many views of
+    /// the peer it takes down.
+    pub fn peer_down_notification(
+        &self,
+        router_id: Arc<RouterId>,
+        reason: PeerDownReason,
+    ) {
+        self.metrics
+            .router_metrics(router_id)
+            .num_peer_down_notifications[reason.index()]
+        .fetch_add(1, SeqCst);
     }
 
     pub fn peer_unknown(&self, router_id: Arc<RouterId>) {

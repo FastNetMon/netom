@@ -98,6 +98,12 @@ like `remote NOTIFICATION: Cease(AdministrativeShutdown) "maintenance"`. The
 time is the Peer Down's per-peer header timestamp, or the time netom received
 it when the router sends 0.
 
+Each Peer Down Notification is also counted, per router and reason, in the
+`bmp_state_num_peer_down_notifications` counter on `/metrics`, for example
+`{router="edge1",reason="localNotification"}`. Every reason has a series, so
+an alert on a rising `localNotification` rate catches a router tearing
+sessions down, typically for exceeded prefix limits.
+
 Two limits:
 
 * A router only reports sessions that reached Established. It sends Peer

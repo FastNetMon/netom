@@ -723,6 +723,10 @@ where
             // of the peer so /bgp/neighbors and /ingresses can report it.
             let last_down =
                 super::peer_down::peer_down_info(&msg, Utc::now());
+            self.status_reporter.peer_down_notification(
+                self.router_id.clone(),
+                last_down.reason,
+            );
 
             // Reap every PeerState that shares this peer's identity. The
             // rib_type/policy-flag workaround in route_monitoring() can

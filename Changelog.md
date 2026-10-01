@@ -127,6 +127,9 @@ Released yyyy-mm-dd.
   said `Idle`. See `docs/bmp-tcp-in.md`.
 * `netom-cli show ip bgp neighbors` shows a BMP peer's last Peer Down as
   `Last error` (why) and `Last down` (when, and how long ago).
+* New `bmp_state_num_peer_down_notifications` counter: Peer Down
+  Notifications per monitored router and reason (RFC 7854 §4.9), i.e. the
+  router's BGP sessions going down. See `docs/bmp-tcp-in.md`.
 
 * Native BGP sessions now record `session_up_time` in the ingress register.
   Besides giving those peers an uptime, this fixes the per-peer header of

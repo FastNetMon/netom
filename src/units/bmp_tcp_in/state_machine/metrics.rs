@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 
 use crate::{
     common::frim::FrimMap,
+    ingress::register::PeerDownReason,
     metrics::{
         self, util::append_per_router_metric, Metric, MetricType, MetricUnit,
     },
@@ -148,6 +149,11 @@ pub struct RouterBmpMetrics {
     /// ADD-PATH withdrawals dropped because their path id was never seen
     /// announced on the session.
     pub num_addpath_unknown_path_id_withdrawals: Arc<AtomicUsize>,
+    /// Peer Down Notifications received from this router, indexed by
+    /// [`PeerDownReason::index`]: one per BGP session of the monitored
+    /// router going down.
+    pub num_peer_down_notifications:
+        Arc<[AtomicUsize; PeerDownReason::ALL.len()]>,
     pub parse_errors: Arc<ParseErrorsRingBuffer>,
 }
 
@@ -216,6 +222,12 @@ impl BmpStateMachineMetrics {
         "bmp_state_num_up_peers_with_pending_eors",
         "the number of up peers with at least one pending End-of-RIB signal",
         MetricType::Gauge,
+        MetricUnit::Total,
+    );
+    const NUM_PEER_DOWN_NOTIFICATIONS_METRIC: Metric = Metric::new(
+        "bmp_state_num_peer_down_notifications",
+        "the number of BMP Peer Down Notifications from this router, i.e. its BGP sessions going down, by reason (RFC 7854 section 4.9)",
+        MetricType::Counter,
         MetricUnit::Total,
     );
     const NUM_ADDPATH_PATH_CHILDREN_MINTED_METRIC: Metric = Metric::new(
@@ -335,6 +347,25 @@ impl metrics::Source for BmpStateMachineMetrics {
                 router_id,
                 Self::NUM_PEERS_UP_WITH_PENDING_EORS_METRIC,
                 metrics.num_peers_up_dumping.load(SeqCst),
+            );
+            // One series per reason, so a jump in e.g. localNotification
+            // (the router tearing sessions down on max-prefix) stands out.
+            target.append(
+                &Self::NUM_PEER_DOWN_NOTIFICATIONS_METRIC,
+                Some(unit_name),
+                |records| {
+                    for reason in PeerDownReason::ALL {
+                        records.label_value(
+                            &[
+                                ("router", router_id),
+                                ("reason", reason.as_str()),
+                            ],
+                            metrics.num_peer_down_notifications
+                                [reason.index()]
+                            .load(SeqCst),
+                        );
+                    }
+                },
             );
         }
     }

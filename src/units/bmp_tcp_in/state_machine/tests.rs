@@ -2719,3 +2719,58 @@ fn synthesized_views_do_not_inherit_a_stale_peer_down() {
     assert_eq!(synthesized.len(), 1);
     assert_eq!(synthesized[0].1.last_down, None);
 }
+
+#[test]
+fn peer_down_notifications_are_counted_by_reason() {
+    let (pph, peer_up_msg_buf, _) =
+        mk_peer_up_notification_msg_without_rfc4724_support(
+            "127.0.0.1",
+            12345,
+        );
+    let processor = mk_test_processor()
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(Instant::now(), peer_up_msg_buf, None)
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_remote_shutdown_peer_down_msg(&pph, "maintenance"),
+            None,
+        )
+        .next_state;
+
+    let metrics = processor.status_reporter().unwrap().metrics().unwrap();
+    let metrics = get_testable_metrics_snapshot(&metrics);
+    let count = |reason: &str| {
+        metrics.with_labels::<usize>(
+            "bmp_state_num_peer_down_notifications",
+            &[("router", "1"), ("reason", reason)],
+        )
+    };
+    assert_eq!(count("remoteNotification"), 1);
+    // Every reason has a series, so a rate() has something to start from.
+    assert_eq!(count("localNotification"), 0);
+    assert_eq!(count("peerDeconfigured"), 0);
+
+    // A Peer Down for a peer that was never up is rejected, not counted.
+    let unknown = mk_per_peer_header("127.0.0.2", 12345);
+    let processor = processor
+        .process_msg(
+            Instant::now(),
+            mk_remote_shutdown_peer_down_msg(&unknown, "x"),
+            None,
+        )
+        .next_state;
+    let metrics = processor.status_reporter().unwrap().metrics().unwrap();
+    assert_eq!(
+        get_testable_metrics_snapshot(&metrics).with_labels::<usize>(
+            "bmp_state_num_peer_down_notifications",
+            &[("router", "1"), ("reason", "remoteNotification")],
+        ),
+        1
+    );
+}
