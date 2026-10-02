@@ -89,3 +89,60 @@ bytes per object and owned heap, allocations/copies, query latency, lock hold
 time, ingestion throughput, and peak serialization memory. Show how costs grow
 with table size and concurrency. Follow the whole operation so a later stage
 does not recreate costs eliminated earlier.
+
+## Implementation references
+
+### Storage and buffer accounting (`src/payload.rs`)
+
+- Keep `RotondaRoute` and `Payload` at their tested 64-bit sizes: 64 and 96 bytes.
+  EVPN NLRI is boxed because storing it inline added 176 bytes to every route
+  and payload, including non-EVPN traffic. Measure and justify layout changes.
+- When adding owned data, update `Update::shallow_bytes()` accounting for both
+  `Single` and `Bulk`. Despite its name, it includes EVPN heap storage through
+  `evpn_heap_bytes()`; counting only `size_of` underestimates buffer usage.
+- Extend `route_and_payload_sizes` and
+  `evpn_buffer_accounting_includes_owned_heap` when changing these representations.
+
+### RIB reads and HTTP responses (`src/units/rib_unit/`)
+
+- Use `Rib::evpn_records_matching()` to capture only matching `Arc<EvpnRecord>`s.
+  Its predicate runs under the writer mutex: put cheap filters there, then decode
+  attributes, sort, and build response rows outside it. Do not restore a
+  full-table `Vec<EvpnRecord>` clone.
+- Records shared with snapshots must remain unchanged by later RIB mutations.
+  Follow the existing replacement/`Arc::make_mut` pattern; preserve the snapshot
+  checks in `evpn_tenants_paths_and_peer_lifecycle`.
+- Follow `http_ng.rs::search_evpn`: move the `DumpGuard` permit into
+  `spawn_blocking` and keep it through `serde_json::to_vec`. Serialize typed rows
+  directly; returning rows for later encoding or building `json!` trees restores
+  unguarded CPU work and extra response-sized allocations.
+
+### Withdrawals and teardown (`src/units/rib_unit/rib.rs`)
+
+- EVPN insertion results feed downstream metrics. Preserve the current contract:
+  `mui_count = usize::from(active || existed)` and
+  `prefix_new`/`mui_new = !existed && active`. Capture `existed` before mutation;
+  using only resulting `active` misclassifies known withdrawals as unannounced.
+  See `evpn_withdrawal_reports_prior_existence` for both retention modes.
+- Use `withdraw_for_ingresses` for withdrawal semantics and
+  `remove_for_ingresses` for physical session cleanup. Synthesized BMP peers can
+  receive fresh ingress IDs each session; marking old records withdrawn leaves
+  retained slots behind. Include new stores in family-scoped and session cleanup.
+- In `remove_for_ingresses`, keep the empty-input return before locking and build
+  ingress membership outside the EVPN mutex. Do not replace the set lookup with
+  `ids.contains()` per record: that changes cleanup from O(R + I) to O(R × I).
+- ADD-PATH uses child ingresses. Follow existing parent/path provenance when
+  querying or cleaning up; session cleanup must include its children.
+
+### EVPN configuration (`src/config.rs`)
+
+- `enable_evpn` defaults to false and is process-wide after startup. Keep gating
+  in `CombinedConfig::protocols`/`addpath`, `convert_nlri`, and `search_evpn` aligned.
+  Disabled ingestion uses unsupported-NLRI accounting.
+- Changing enablement requires restart because sessions and retained state are
+  already established. Keep reload rejection; conversion tests should pass an
+  explicit setting through `convert_nlri_with_evpn`, not mutate the global setting.
+
+For changes to these paths, extend the named regression tests and report relevant
+layout, allocation, or lock/query cost changes at realistic table sizes. Include
+snapshot retention and serialization when estimating concurrent-query memory.
