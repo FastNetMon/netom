@@ -80,3 +80,67 @@ validity states.
 
 The `e2e-flowspec` GitHub workflow runs both scripts on demand
 (workflow_dispatch).
+
+## BMP reconciliation simulations
+
+`python3 scripts/bmp-peer-churn.py` builds and runs isolated real daemons, then
+acts as a BMP exporter over loopback TCP. No FRR, containers, external data, or
+third-party Python packages are required. It exercises the automatic recovery
+for [issue #11](https://github.com/FastNetMon/netom/issues/11).
+
+```sh
+python3 scripts/bmp-peer-churn.py --binary target/debug/netom
+python3 scripts/bmp-peer-churn.py --binary target/debug/netom --cycles 20
+```
+
+The exporter keeps an independent list of actually established peers. After a
+collector-initiated disconnect, it reconnects and replays only those peers and
+their routes, including End-of-RIB. Retired identities are not replayed.
+
+Seven scenarios run by default; select one with `--scenario NAME`:
+
+- `matching`: correctly addressed Peer Down, ordinary cleanup control.
+- `mismatched`: Peer Down with `::`, then a new link-local peer address.
+- `missing`: a new peer address with no preceding Peer Down.
+- `parallel`: legitimate parallel peers coexist in startup; adding another
+  later causes one reconciliation, and all three survive the new snapshot
+  beyond its startup window without another anomaly reset.
+- `silent`: a peer vanishes without any further BMP message; periodic renewal
+  removes it after the authoritative empty replay.
+- `partial`: the same disappearance with a stalled, incomplete BMP frame.
+- `limit`: startup churn reaches the peer-state cap; reconnect restores the
+  sole actually established peer.
+
+The script shortens reconciliation timings in the test configuration and GC
+intervals in the test daemon's environment. It verifies current peer addresses,
+retained peer entries and route records after GC, then checks complete cleanup
+when the exporter closes. The table is constant-size during churn. A timeout,
+missing metric, failed replay, unexpected parallel-session reset, or retained
+state makes the script exit 1; success exits 0. These are object-count checks,
+not RSS thresholds: allocator caching can retain pages after objects are freed.
+
+Rust regressions are part of the normal suite:
+
+```sh
+cargo test --lib units::bmp_tcp_in
+```
+
+They cover deadline coalescing, startup replay, periodic jitter, capacity,
+configuration validation, peer identity scopes, policy/ADD-PATH teardown,
+idle/partial transport cancellation, and active-connector redial. Live network
+tests require permission to bind loopback sockets.
+
+See [automatic reconciliation](docs/bmp-tcp-in.md#automatic-reconciliation-and-stale-peer-retention)
+for the RFC 7854 references, defaults, and monitoring-gap/replay caveat.
+
+Validation on 2026-10-02 (implementation `0ec9bd6`, regressions `a816a12`):
+
+- `cargo test --lib --offline`: 354 passed, 31 ignored, no failures.
+- `cargo build --bin netom --offline`: passed (existing unused `set_rib` warning).
+- `python3 scripts/bmp-peer-churn.py --binary target/debug/netom --cycles 20`:
+  all seven scenarios passed. Each churn scenario ended with one peer and one
+  record after GC; the parallel replay retained all three peers/records; silent
+  and partial-frame recovery reclaimed all obsolete peers/records; capacity
+  recovery restored the one current peer. Every final disconnect cleaned up.
+- Changed Rust files passed rustfmt checks; the Python driver passed syntax
+  compilation; `git diff --check` passed.

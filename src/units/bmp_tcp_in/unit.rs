@@ -164,6 +164,10 @@ pub struct BmpTcpIn {
     /// connections accepted after a (re)configure.
     #[serde(default = "BmpTcpIn::default_forward_raw_updates")]
     pub forward_raw_updates: bool,
+
+    /// Always-on snapshot reconciliation; timing and capacity bounds.
+    #[serde(default)]
+    pub reconciliation: super::reconciliation::Config,
 }
 
 impl BmpTcpIn {
@@ -243,6 +247,7 @@ impl BmpTcpIn {
             ingress_register,
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.reconciliation,
         )
         .run::<_, _, StandardTcpStream, BmpTcpInRunner>(Arc::new(
             StandardTcpListenerFactory,
@@ -309,6 +314,7 @@ struct BmpTcpInRunner {
     ingress_register: Arc<ingress::Register>,
     ignore_post_policy_routes: bool,
     forward_raw_updates: bool,
+    reconciliation: super::reconciliation::Config,
 }
 
 impl BmpTcpInRunner {
@@ -337,6 +343,7 @@ impl BmpTcpInRunner {
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
         forward_raw_updates: bool,
+        reconciliation: super::reconciliation::Config,
     ) -> Self {
         Self {
             component,
@@ -357,6 +364,7 @@ impl BmpTcpInRunner {
             ingress_register,
             ignore_post_policy_routes,
             forward_raw_updates,
+            reconciliation,
         }
     }
 
@@ -388,6 +396,7 @@ impl BmpTcpInRunner {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
 
         (runner, gate_agent)
@@ -660,6 +669,7 @@ impl BmpTcpInRunner {
             self.ingress_register.clone(),
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.reconciliation,
         );
 
         (child_name, router_handler, router_ingress_id)
@@ -694,6 +704,7 @@ impl BmpTcpInRunner {
                                         new_ignore_post_policy_routes,
                                     forward_raw_updates:
                                         new_forward_raw_updates,
+                                    reconciliation: new_reconciliation,
                                 }),
                         } => {
                             // Runtime reconfiguration of this unit has
@@ -717,6 +728,7 @@ impl BmpTcpInRunner {
                                 new_ignore_post_policy_routes;
                             self.forward_raw_updates =
                                 new_forward_raw_updates;
+                            self.reconciliation = new_reconciliation;
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -940,9 +952,43 @@ mod tests {
     ) {
         let (mut runner, agent) = BmpTcpInRunner::_mock();
         runner.connection = config.connection;
+        runner.reconciliation = config.reconciliation;
         let states = runner.router_states.clone();
         let task = tokio::spawn(runner.run::<_, _, crate::common::net::StandardTcpStream, BmpTcpInRunner>(Arc::new(crate::common::net::StandardTcpListenerFactory)));
         (agent, task, states)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_reconciliation_redials_after_partial_snapshot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = mk_config_from_toml(&format!("connect = '{}'\nreconciliation = {{ interval_secs = 3, min_session_secs = 1, replay_grace_secs = 1 }}", listener.local_addr().unwrap())).unwrap();
+        let (agent, task, states) = start_active(config);
+        let (mut first, _) =
+            timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        first.write_all(&[3, 0, 0]).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), first.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let (_second, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(states.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1127,6 +1173,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1197,6 +1244,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1271,6 +1319,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1434,6 +1483,7 @@ mod tests {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
 
         (runner, gate_agent, status_reporter)
