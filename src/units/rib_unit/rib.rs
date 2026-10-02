@@ -1502,13 +1502,17 @@ impl Rib {
     /// that mint a fresh ingress id every session must take this path so
     /// mark-withdraw does not leak one record slot per announced prefix.
     pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
-        self.evpn
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .retain(|(_, ingress), _| !ids.contains(ingress));
         if ids.is_empty() {
             return;
         }
+
+        // Build membership outside the EVPN lock: O(I) setup, then O(R)
+        // expected scan cost rather than searching all I ids for each record.
+        let ingress_ids: HashSet<IngressId> = ids.iter().copied().collect();
+        self.evpn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(_, ingress), _| !ingress_ids.contains(ingress));
 
         // `remove_mui` clears the per-store `withdrawn_muis_bmin` bitmap (via
         // mark_mui_as_active), the same CAS that livelocks under concurrent
@@ -4261,6 +4265,8 @@ mod tests {
             .unwrap();
         }
         assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
+        rib.remove_for_ingresses(&[]);
+        assert_eq!(rib.evpn_records_matching(|_| true).len(), 3);
         let snapshot = rib.evpn_records_matching(|r| {
             r.ingress_id == 1 && r.nlri.rd == "1:1"
         });
@@ -4302,7 +4308,7 @@ mod tests {
         rib.insert(&route(2, 30), RouteStatus::Active, 3, 1, false, false)
             .unwrap();
         assert_eq!(rib.evpn_records_matching(|_| true).len(), 2);
-        rib.remove_for_ingresses(&[2]);
+        rib.remove_for_ingresses(&[2, 999, 2]);
         assert_eq!(rib.evpn_records_matching(|_| true).len(), 1);
         rib.withdraw_for_ingress(1, None, false);
         assert!(rib.evpn_records_matching(|_| true).is_empty());
