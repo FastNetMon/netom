@@ -1,6 +1,28 @@
 # EVPN monitoring
 
-Netom collects L2VPN EVPN (AFI 25, SAFI 70) from BGP and BMP, including
+EVPN monitoring is **disabled by default**. Enable it explicitly in the
+TOML global settings, above all `[units.*]` and `[targets.*]` tables:
+
+```toml
+enable_evpn = true
+```
+
+Restart Netom after changing this flag; a reload that changes it is rejected.
+This keeps negotiated BGP capabilities and retained routing state consistent.
+When disabled, Netom omits EVPN from BGP MP and ADD-PATH capabilities, drops
+EVPN announcements and withdrawals from BGP/BMP route conversion through the
+unsupported-NLRI accounting path, and returns HTTP 503 with an enablement
+message for EVPN queries. Other families continue to work. Verbatim BMP
+forwarding is independent of monitoring and can still carry EVPN updates.
+
+EVPN retains a separate collection of routes and attributes, and queries incur
+additional copying, allocation, and serialization costs. These costs grow with
+routes, paths, tenants, and concurrent queries. Requiring an explicit opt-in
+keeps deployments that only monitor other families from accidentally taking
+on this state and query load. Enabling EVPN is not a memory or query-cost limit;
+size the deployment for its routing state and workload.
+
+With the flag enabled, Netom collects L2VPN EVPN (AFI 25, SAFI 70) from BGP and BMP, including
 ADD-PATH sessions. Configure `L2VpnEvpn` in a BGP peer's `protocols` list;
 BMP peers use the capabilities in their exported Peer Up messages.
 

@@ -1477,10 +1477,9 @@ mod tests {
                 )
                 .unwrap();
                 let routes =
-                    crate::roto_runtime::types::explode_announcements(
-                        &update,
-                    )
-                    .unwrap();
+                    crate::roto_runtime::types::decode_evpn_test_update(
+                        &update, false,
+                    );
                 assert_eq!(routes.len(), 1);
                 assert_eq!(routes[0].1.unwrap().0, 11);
             }

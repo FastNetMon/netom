@@ -3183,9 +3183,6 @@ mod tests {
 
     #[test]
     fn evpn_bmp_roundtrip_plain_and_addpath() {
-        use crate::roto_runtime::types::{
-            explode_announcements, explode_withdrawals,
-        };
         use routecore::bgp::message::{SessionConfig, UpdateMessage};
         let peer = agg_test_peer();
         let mut raw = vec![5, 34];
@@ -3214,12 +3211,10 @@ mod tests {
                     &bmp[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..],
                 );
                 let update = UpdateMessage::from_octets(bgp, &sc).unwrap();
-                let routes = if withdrawn {
-                    explode_withdrawals(&update)
-                } else {
-                    explode_announcements(&update)
-                }
-                .unwrap();
+                let routes =
+                    crate::roto_runtime::types::decode_evpn_test_update(
+                        &update, withdrawn,
+                    );
                 assert_eq!(routes.len(), 1);
                 assert_eq!(routes[0].1.map(|p| p.0), pid);
                 match &routes[0].0 {

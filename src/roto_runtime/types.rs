@@ -487,13 +487,11 @@ impl OutputStreamMessage {
 
 //--- Unsupported NLRI drop accounting ---------------------------------------
 
-/// How often to emit a rolled-up summary of NLRI dropped because their type has
-/// no [`RotondaRoute`] representation.
+/// How often to emit a rolled-up summary of unsupported or disabled NLRI.
 const UNSUPPORTED_NLRI_SUMMARY_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Process-global accounting for NLRI dropped because their [`NlriType`] has no
-/// [`RotondaRoute`] representation: genuinely unsupported families (MPLS-VPN,
-/// EVPN, RouteTarget, ...). ADD-PATH NLRI of the stored families
+/// Process-global accounting for unsupported families (MPLS-VPN, RouteTarget,
+/// ...) and EVPN when disabled by configuration. ADD-PATH NLRI of enabled families
 /// (unicast/multicast/flowspec) are *not* counted here — [`convert_nlri`]
 /// strips their path id into a per-path child ingress and stores them. Such
 /// NLRI parse fine in routecore but are dropped before any RIB in the
@@ -676,14 +674,27 @@ fn note_unsupported_nlri(nlri_type: NlriType) {
 /// the stripped [`PathId`] is returned alongside so the caller can resolve a
 /// per-(session, path_id) child ingress to store the route under. Plain
 /// variants return `None`. NLRI types with no `RotondaRoute` representation
-/// (MPLS/VPN/EVPN/VPLS/RouteTarget) are counted and dropped as before.
+/// (MPLS/VPN/VPLS/RouteTarget) are counted and dropped as before. EVPN
+/// requires the global `enable_evpn` opt-in.
 pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
     nlri: Nlri<O>,
     pamap: RotondaPaMap,
 ) -> Result<(RotondaRoute, Option<PathId>), ()> {
+    convert_nlri_with_evpn(nlri, pamap, crate::config::evpn_enabled())
+}
+
+fn convert_nlri_with_evpn<O: AsRef<[u8]>>(
+    nlri: Nlri<O>,
+    pamap: RotondaPaMap,
+    enable_evpn: bool,
+) -> Result<(RotondaRoute, Option<PathId>), ()> {
     use routecore::bgp::nlri::afisafi::Addpath;
 
     let res = match nlri {
+        Nlri::L2VpnEvpn(..) | Nlri::L2VpnEvpnAddpath(..) if !enable_evpn => {
+            note_unsupported_nlri(nlri.nlri_type());
+            return Err(());
+        }
         Nlri::Ipv4Unicast(n) => (RotondaRoute::Ipv4Unicast(n, pamap), None),
         Nlri::Ipv4Multicast(n) => {
             (RotondaRoute::Ipv4Multicast(n, pamap), None)
@@ -824,6 +835,26 @@ pub(crate) fn explode_announcements(
     Ok(res)
 }
 
+// Exporter round-trip tests explicitly decode EVPN without changing the
+// process-wide setting (which would race with default-off ingestion tests).
+#[cfg(test)]
+pub(crate) fn decode_evpn_test_update(
+    update: &UpdateMessage<impl routecore::Octets>,
+    withdrawn: bool,
+) -> Vec<(RotondaRoute, Option<PathId>)> {
+    let attributes =
+        RotondaPaMap::new(update.path_attributes().unwrap().into());
+    let decode = |nlri: Result<Nlri<_>, _>| {
+        convert_nlri_with_evpn(nlri.unwrap(), attributes.clone(), true)
+            .unwrap()
+    };
+    if withdrawn {
+        update.withdrawals().unwrap().map(decode).collect()
+    } else {
+        update.announcements().unwrap().map(decode).collect()
+    }
+}
+
 /// Explode a BGP UPDATE's withdrawals into storable routes; see
 /// [`explode_announcements`] for the path-id component.
 pub(crate) fn explode_withdrawals(
@@ -869,6 +900,44 @@ impl PeerId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evpn_conversion_requires_opt_in_including_addpath() {
+        use octseq::Parser;
+        use routecore::bgp::nlri::afisafi::{
+            L2VpnEvpnAddpathNlri, L2VpnEvpnNlri, NlriParse,
+        };
+
+        // Opaque route type with an RD: valid, and independent of forwarding fields.
+        let raw = [99, 8, 0, 0, 0, 1, 0, 0, 0, 2];
+        let mut addpath_raw = vec![0, 0, 0, 7];
+        addpath_raw.extend_from_slice(&raw);
+        for enabled in [false, true] {
+            let plain = L2VpnEvpnNlri::<&[u8]>::parse(&mut Parser::from_ref(
+                &raw.as_slice(),
+            ))
+            .unwrap();
+            let addpath = L2VpnEvpnAddpathNlri::<&[u8]>::parse(
+                &mut Parser::from_ref(&addpath_raw.as_slice()),
+            )
+            .unwrap();
+            let result = convert_nlri_with_evpn(
+                Nlri::L2VpnEvpn(plain),
+                RotondaPaMap::default(),
+                enabled,
+            );
+            assert_eq!(result.is_ok(), enabled);
+            let result = convert_nlri_with_evpn(
+                Nlri::L2VpnEvpnAddpath(addpath),
+                RotondaPaMap::default(),
+                enabled,
+            );
+            assert_eq!(result.is_ok(), enabled);
+            if enabled {
+                assert_eq!(result.unwrap().1, Some(PathId(7)));
+            }
+        }
+    }
 
     #[test]
     fn unsupported_nlri_counter_increments_and_renders() {

@@ -992,6 +992,11 @@ async fn search_evpn(
     Query(filter): Query<EvpnFilter>,
     state: State<ApiState>,
 ) -> Result<impl IntoResponse, ApiError> {
+    if !crate::config::evpn_enabled() {
+        return Err(ApiError::ServiceUnavailable(
+            "EVPN support is disabled; set enable_evpn = true and restart Netom".into(),
+        ));
+    }
     let rib = load_rib(&state)?;
     let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
         ApiError::ServiceUnavailable("too many concurrent RIB queries".into())
