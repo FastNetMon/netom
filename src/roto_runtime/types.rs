@@ -752,7 +752,9 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
             n.compose(&mut raw).map_err(|_| ())?;
             (
                 RotondaRoute::L2VpnEvpn(
-                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw)?,
+                    Box::new(crate::units::rib_unit::evpn::EvpnNlri::parse(
+                        &raw,
+                    )?),
                     pamap,
                 ),
                 None,
@@ -764,7 +766,9 @@ pub(crate) fn convert_nlri<O: AsRef<[u8]>>(
             n.compose(&mut raw).map_err(|_| ())?;
             (
                 RotondaRoute::L2VpnEvpn(
-                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw[4..])?,
+                    Box::new(crate::units::rib_unit::evpn::EvpnNlri::parse(
+                        &raw[4..],
+                    )?),
                     pamap,
                 ),
                 Some(n.path_id()),

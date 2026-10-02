@@ -579,7 +579,7 @@ impl Rib {
                             ingress_id,
                             ltime,
                             active,
-                            nlri: n.clone(),
+                            nlri: n.as_ref().clone(),
                             attributes: if deduplicate_path_attributes {
                                 attributes
                                     .dedup_with(&self.path_attribute_interner)
@@ -4230,7 +4230,7 @@ mod tests {
             raw.extend_from_slice(&[0; 14]);
             raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, vni]);
             RotondaRoute::L2VpnEvpn(
-                EvpnNlri::parse(&raw).unwrap(),
+                Box::new(EvpnNlri::parse(&raw).unwrap()),
                 RotondaPaMap::empty_path_attributes(),
             )
         }

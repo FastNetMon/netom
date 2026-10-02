@@ -1420,7 +1420,10 @@ mod tests {
                 ),
             );
             let route = RotondaRoute::L2VpnEvpn(
-                crate::units::rib_unit::evpn::EvpnNlri::parse(&raw).unwrap(),
+                Box::new(
+                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw)
+                        .unwrap(),
+                ),
                 attrs,
             );
             rib.insert(&route, RouteStatus::Active, 0, child, true, false)

@@ -60,8 +60,28 @@ pub enum RotondaRoute {
         routecore::bgp::nlri::afisafi::Ipv6FlowSpecNlri<Bytes>,
         RotondaPaMap,
     ),
-    L2VpnEvpn(crate::units::rib_unit::evpn::EvpnNlri, RotondaPaMap),
+    // Keep the large EVPN representation out of every route and queue slot.
+    // Boxing adds one allocation only for EVPN; other families stay compact.
+    L2VpnEvpn(Box<crate::units::rib_unit::evpn::EvpnNlri>, RotondaPaMap),
     // TODO support all routecore AfiSafiTypes
+}
+
+impl RotondaRoute {
+    /// Owned EVPN heap storage, excluding shared path attributes.
+    fn evpn_heap_bytes(&self) -> usize {
+        match self {
+            Self::L2VpnEvpn(n, _) => {
+                std::mem::size_of_val(n.as_ref())
+                    + n.rd.capacity()
+                    + n.esi.as_ref().map_or(0, String::capacity)
+                    + n.mac.as_ref().map_or(0, String::capacity)
+                    + n.labels.capacity() * std::mem::size_of::<u32>()
+                    + n.raw.capacity()
+                    + n.key.capacity()
+            }
+            _ => 0,
+        }
+    }
 }
 
 impl Serialize for RotondaRoute {
@@ -695,9 +715,15 @@ impl Update {
         use std::mem::size_of;
         let base = size_of::<Self>();
         match self {
-            Update::Single(_) => base,
+            Update::Single(payload) => {
+                base + payload.rx_value.evpn_heap_bytes()
+            }
             Update::Bulk(payloads) => {
                 base + payloads.len() * size_of::<Payload>()
+                    + payloads
+                        .iter()
+                        .map(|p| p.rx_value.evpn_heap_bytes())
+                        .sum::<usize>()
             }
             Update::Withdraw(..) => base,
             Update::WithdrawBulk(items) => {
@@ -827,5 +853,60 @@ mod interner_tests {
         let shards = interner.num_shards();
         assert_eq!(interner.sweep_shard(shards), (0, 0));
         assert_eq!(interner.sweep_shard(usize::MAX), (0, 0));
+    }
+}
+
+#[cfg(all(test, target_pointer_width = "64"))]
+mod layout_tests {
+    #[test]
+    fn evpn_buffer_accounting_includes_owned_heap() {
+        use super::*;
+        let mut raw = vec![5, 34];
+        raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0; 14]);
+        raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]);
+        let nlri =
+            crate::units::rib_unit::evpn::EvpnNlri::parse(&raw).unwrap();
+        let heap = std::mem::size_of_val(&nlri)
+            + nlri.rd.capacity()
+            + nlri.esi.as_ref().map_or(0, String::capacity)
+            + nlri.mac.as_ref().map_or(0, String::capacity)
+            + nlri.labels.capacity() * 4
+            + nlri.raw.capacity()
+            + nlri.key.capacity();
+        let payload = Payload::new(
+            RotondaRoute::L2VpnEvpn(
+                Box::new(nlri),
+                RotondaPaMap::empty_path_attributes(),
+            ),
+            None,
+            1,
+            RouteStatus::Active,
+        );
+        let single_payload = payload.clone();
+        let single_heap = single_payload.rx_value.evpn_heap_bytes();
+        let single = Update::Single(single_payload);
+        assert_eq!(
+            single.shallow_bytes(),
+            std::mem::size_of::<Update>() + single_heap
+        );
+        let cloned = payload.clone();
+        let bulk_heap = cloned.rx_value.evpn_heap_bytes() + heap;
+        let bulk = Update::Bulk(Box::new(smallvec![cloned, payload]));
+        assert_eq!(
+            bulk.shallow_bytes(),
+            std::mem::size_of::<Update>()
+                + 2 * std::mem::size_of::<Payload>()
+                + bulk_heap
+        );
+    }
+
+    #[test]
+    fn route_and_payload_sizes() {
+        let route = std::mem::size_of::<super::RotondaRoute>();
+        let payload = std::mem::size_of::<super::Payload>();
+        eprintln!("RotondaRoute: {route} bytes; Payload: {payload} bytes");
+        assert_eq!(route, 64, "EVPN must not inflate common route storage");
+        assert_eq!(payload, 96, "EVPN must not inflate payload storage");
     }
 }
