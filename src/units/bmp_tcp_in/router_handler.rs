@@ -72,6 +72,7 @@ pub struct RouterHandler {
     /// (see the unit's `forward_raw_updates` config). Captured at connection
     /// accept.
     forward_raw_updates: bool,
+    reconciliation: std::sync::Mutex<super::reconciliation::Reconciliation>,
 }
 
 impl RouterHandler {
@@ -90,6 +91,7 @@ impl RouterHandler {
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
         forward_raw_updates: bool,
+        reconciliation: super::reconciliation::Config,
     ) -> Self {
         Self {
             gate,
@@ -106,6 +108,13 @@ impl RouterHandler {
             ingress_register,
             ignore_post_policy_routes,
             forward_raw_updates,
+            reconciliation: std::sync::Mutex::new(
+                super::reconciliation::Reconciliation::new(
+                    reconciliation,
+                    tokio::time::Instant::now(),
+                    uuid::Uuid::new_v4().as_u128() as u64,
+                ),
+            ),
         }
     }
 
@@ -153,6 +162,13 @@ impl RouterHandler {
             ingress_register: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: std::sync::Mutex::new(
+                super::reconciliation::Reconciliation::new(
+                    Default::default(),
+                    tokio::time::Instant::now(),
+                    0,
+                ),
+            ),
         };
 
         (mock, gate_agent, parent_gate)
@@ -213,7 +229,26 @@ impl RouterHandler {
 
         loop {
             // Read the incoming TCP stream, extracting BMP messages.
-            match stream.next().await {
+            let (deadline, reason) = {
+                let policy = self.reconciliation.lock().unwrap();
+                (policy.deadline(), policy.reason())
+            };
+            if tokio::time::Instant::now() >= deadline {
+                log::warn!("Reconciling BMP speaker {router_addr}: {reason}; closing transport for a fresh snapshot");
+                break;
+            }
+            // Cancelling a partial read is safe here: the transport is dropped,
+            // never reused. The timer also renews completely silent sessions.
+            let next = match tokio::time::timeout_at(deadline, stream.next())
+                .await
+            {
+                Ok(next) => next,
+                Err(_) => {
+                    log::warn!("Reconciling BMP speaker {router_addr}: {reason}; closing transport for a fresh snapshot");
+                    break;
+                }
+            };
+            match next {
                 Err(err) => {
                     // There was a problem reading from the BMP stream.
                     let bmp_state_lock = self.state_machine.lock().await;
@@ -364,6 +399,9 @@ impl RouterHandler {
             }
         }
 
+        // Close TCP/TLS even if downstream withdrawal processing stalls.
+        // A timed-out partial read already dropped its owned transport.
+        drop(stream);
         let bmp_state_lock = self.state_machine.lock().await;
 
         self.status_reporter.router_connection_lost(
@@ -615,7 +653,13 @@ impl RouterHandler {
                 self.status_reporter
                     .message_processed(bmp_state.router_id());
 
+                let reason = bmp_state.reconciliation_reason(&msg);
                 let mut res = bmp_state.process_msg(received, msg, trace_id);
+                self.reconciliation.lock().unwrap().observe(
+                    tokio::time::Instant::now(),
+                    reason,
+                    res.next_state.peer_state_count(),
+                );
 
                 match res.message_type {
                     MessageType::InvalidMessage { .. } => {

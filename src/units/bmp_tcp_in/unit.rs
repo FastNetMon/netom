@@ -164,6 +164,10 @@ pub struct BmpTcpIn {
     /// connections accepted after a (re)configure.
     #[serde(default = "BmpTcpIn::default_forward_raw_updates")]
     pub forward_raw_updates: bool,
+
+    /// Always-on snapshot reconciliation; timing and capacity bounds.
+    #[serde(default)]
+    pub reconciliation: super::reconciliation::Config,
 }
 
 impl BmpTcpIn {
@@ -243,6 +247,7 @@ impl BmpTcpIn {
             ingress_register,
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.reconciliation,
         )
         .run::<_, _, StandardTcpStream, BmpTcpInRunner>(Arc::new(
             StandardTcpListenerFactory,
@@ -309,6 +314,7 @@ struct BmpTcpInRunner {
     ingress_register: Arc<ingress::Register>,
     ignore_post_policy_routes: bool,
     forward_raw_updates: bool,
+    reconciliation: super::reconciliation::Config,
 }
 
 impl BmpTcpInRunner {
@@ -337,6 +343,7 @@ impl BmpTcpInRunner {
         ingress_register: Arc<ingress::Register>,
         ignore_post_policy_routes: bool,
         forward_raw_updates: bool,
+        reconciliation: super::reconciliation::Config,
     ) -> Self {
         Self {
             component,
@@ -357,6 +364,7 @@ impl BmpTcpInRunner {
             ingress_register,
             ignore_post_policy_routes,
             forward_raw_updates,
+            reconciliation,
         }
     }
 
@@ -388,6 +396,7 @@ impl BmpTcpInRunner {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
 
         (runner, gate_agent)
@@ -660,6 +669,7 @@ impl BmpTcpInRunner {
             self.ingress_register.clone(),
             self.ignore_post_policy_routes,
             self.forward_raw_updates,
+            self.reconciliation,
         );
 
         (child_name, router_handler, router_ingress_id)
@@ -694,6 +704,7 @@ impl BmpTcpInRunner {
                                         new_ignore_post_policy_routes,
                                     forward_raw_updates:
                                         new_forward_raw_updates,
+                                    reconciliation: new_reconciliation,
                                 }),
                         } => {
                             // Runtime reconfiguration of this unit has
@@ -717,6 +728,7 @@ impl BmpTcpInRunner {
                                 new_ignore_post_policy_routes;
                             self.forward_raw_updates =
                                 new_forward_raw_updates;
+                            self.reconciliation = new_reconciliation;
 
                             if rebind {
                                 // Trigger re-binding to the new listen port.
@@ -1127,6 +1139,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1197,6 +1210,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1271,6 +1285,7 @@ mod tests {
             tracing_mode: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
         let new_config = Unit::BmpTcpIn(new_config);
         agent.reconfigure(new_config, new_gate).await.unwrap();
@@ -1434,6 +1449,7 @@ mod tests {
             roto_metrics: Default::default(),
             ignore_post_policy_routes: false,
             forward_raw_updates: false,
+            reconciliation: Default::default(),
         };
 
         (runner, gate_agent, status_reporter)
