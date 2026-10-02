@@ -603,7 +603,9 @@ impl Rib {
                     cas_count: 0,
                     prefix_new: !existed && active,
                     mui_new: !existed && active,
-                    mui_count: usize::from(active),
+                    // Withdrawals report prior existence so downstream
+                    // metrics can distinguish known and unannounced routes.
+                    mui_count: usize::from(active || existed),
                 })
             }
 
@@ -4315,6 +4317,53 @@ mod tests {
         assert!(!withdrawn_snapshot[0].active);
         assert_eq!(withdrawn_snapshot[0].nlri.labels, vec![20]);
         assert!(snapshot[0].active);
+    }
+
+    #[test]
+    fn evpn_withdrawal_reports_prior_existence() {
+        use super::super::evpn::EvpnNlri;
+
+        let mut raw = vec![5, 34];
+        raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
+        raw.extend_from_slice(&[0; 14]);
+        raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10]);
+        let route = RotondaRoute::L2VpnEvpn(
+            Box::new(EvpnNlri::parse(&raw).unwrap()),
+            RotondaPaMap::empty_path_attributes(),
+        );
+
+        for retain in [false, true] {
+            let rib = test_rib();
+            let insert = |status, ingress| {
+                rib.insert(&route, status, 0, ingress, retain, false)
+                    .unwrap()
+            };
+            let unknown = insert(RouteStatus::Withdrawn, 1);
+            assert_eq!(unknown.mui_count, 0);
+            assert!(!unknown.prefix_new && !unknown.mui_new);
+
+            let announced = insert(RouteStatus::Active, 1);
+            assert_eq!(announced.mui_count, 1);
+            assert!(announced.prefix_new && announced.mui_new);
+
+            // The same NLRI from another ingress is not a matching record.
+            assert_eq!(insert(RouteStatus::Withdrawn, 2).mui_count, 0);
+            let withdrawn = insert(RouteStatus::Withdrawn, 1);
+            assert_eq!(withdrawn.mui_count, 1);
+            assert!(!withdrawn.prefix_new && !withdrawn.mui_new);
+            assert!(rib.evpn_records_matching(|r| r.active).is_empty());
+
+            // Retained withdrawn records still count as previously known.
+            assert_eq!(
+                insert(RouteStatus::Withdrawn, 1).mui_count,
+                usize::from(retain)
+            );
+            let reannounced = insert(RouteStatus::Active, 1);
+            assert_eq!(reannounced.mui_count, 1);
+            assert_eq!(reannounced.prefix_new, !retain);
+            assert_eq!(reannounced.mui_new, !retain);
+            assert_eq!(rib.evpn_records_matching(|r| r.active).len(), 1);
+        }
     }
 
     #[test]
