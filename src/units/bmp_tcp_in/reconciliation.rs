@@ -147,3 +147,107 @@ impl Reconciliation {
         self.reason
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config {
+            interval_secs: 100,
+            min_session_secs: 5,
+            replay_grace_secs: 10,
+            max_peer_states: 8,
+        }
+    }
+
+    #[test]
+    fn startup_parallel_peers_do_not_cause_a_reconnect_loop() {
+        let now = Instant::now();
+        // Repeat the same authoritative replay over successive connections.
+        for generation in 0..3 {
+            let start = now + Duration::from_secs(generation * 100);
+            let mut p = Reconciliation::new(config(), start, 0);
+            p.observe(
+                start + Duration::from_secs(1),
+                Some(Reason::PossibleReplacement),
+                2,
+            );
+            p.observe(
+                start + Duration::from_secs(9),
+                Some(Reason::PossibleReplacement),
+                3,
+            );
+            assert_eq!(p.deadline(), start + Duration::from_secs(100));
+            assert_eq!(p.reason(), Reason::Periodic);
+        }
+    }
+
+    #[test]
+    fn anomalies_coalesce_without_postponing_recovery() {
+        let now = Instant::now();
+        let mut p = Reconciliation::new(config(), now, 0);
+        p.observe(now, Some(Reason::UnmatchedPeerDown), 1);
+        assert_eq!(p.deadline(), now + Duration::from_secs(5));
+        for second in 1..5 {
+            p.observe(
+                now + Duration::from_secs(second),
+                Some(Reason::UnmatchedPeerDown),
+                1,
+            );
+            assert_eq!(p.deadline(), now + Duration::from_secs(5));
+        }
+        assert_eq!(p.reason(), Reason::UnmatchedPeerDown);
+    }
+
+    #[test]
+    fn incremental_replacement_refreshes_without_guessing_a_victim() {
+        let now = Instant::now();
+        let mut p = Reconciliation::new(config(), now, 0);
+        let after_replay = now + Duration::from_secs(10);
+        p.observe(after_replay, Some(Reason::PossibleReplacement), 2);
+        assert_eq!(p.deadline(), after_replay);
+        assert_eq!(p.reason(), Reason::PossibleReplacement);
+    }
+
+    #[test]
+    fn capacity_overrides_cooldown_and_periodic_jitter_is_bounded() {
+        let now = Instant::now();
+        for seed in [0, 1, 9, 10, 11, u64::MAX] {
+            let mut p = Reconciliation::new(config(), now, seed);
+            assert!(p.deadline() >= now + Duration::from_secs(100));
+            assert!(p.deadline() <= now + Duration::from_secs(110));
+            p.observe(now, None, 8);
+            assert_eq!(p.deadline(), now);
+            assert_eq!(p.reason(), Reason::PeerStateLimit);
+        }
+    }
+
+    #[test]
+    fn configuration_cannot_disable_reconciliation() {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            reconciliation: Config,
+        }
+        let defaults: Wrapper = toml::from_str("[reconciliation]").unwrap();
+        assert_eq!(defaults.reconciliation.interval_secs, 21600);
+        for fields in [
+            "interval_secs = 0",
+            "interval_secs = 604801",
+            "min_session_secs = 0",
+            "replay_grace_secs = 0",
+            "max_peer_states = 0",
+            "enabled = false",
+            "min_session_secs = 301",
+            "replay_grace_secs = 21600",
+        ] {
+            assert!(
+                toml::from_str::<Wrapper>(&format!(
+                    "[reconciliation]\n{fields}"
+                ))
+                .is_err(),
+                "{fields}"
+            );
+        }
+    }
+}

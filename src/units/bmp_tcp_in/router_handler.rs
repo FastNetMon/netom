@@ -808,6 +808,50 @@ mod tests {
     const SYS_DESCR: &str = "some-sys-desc";
     const OTHER_SYS_NAME: &str = "other-sys-name";
 
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_closes_idle_and_partial_transports() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for partial in [false, true] {
+            let (runner, _agent, _parent) = RouterHandler::mock();
+            *runner.reconciliation.lock().unwrap() =
+                super::super::reconciliation::Reconciliation::new(
+                    super::super::reconciliation::Config {
+                        interval_secs: 3,
+                        min_session_secs: 1,
+                        replay_grace_secs: 1,
+                        max_peer_states: 8,
+                    },
+                    tokio::time::Instant::now(),
+                    0,
+                );
+            let (mut writer, reader) = tokio::io::duplex(128);
+            if partial {
+                writer.write_all(&[3, 0, 0]).await.unwrap();
+            }
+            let register = Arc::new(ingress::Register::default());
+            let id = register.register();
+            runner
+                .read_from_router(
+                    reader,
+                    "127.0.0.1:12345".parse().unwrap(),
+                    id,
+                    register.clone(),
+                    Arc::default(),
+                    Arc::default(),
+                )
+                .await;
+            assert_eq!(
+                writer.read(&mut [0]).await.unwrap(),
+                0,
+                "transport must close on timer"
+            );
+            assert_eq!(
+                register.get(id).unwrap().state,
+                Some(IngressState::Disconnected)
+            );
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn terminate_on_loss_of_parent_gate() {
         let (runner, _gate_agent, parent_gate) = RouterHandler::mock();

@@ -952,9 +952,43 @@ mod tests {
     ) {
         let (mut runner, agent) = BmpTcpInRunner::_mock();
         runner.connection = config.connection;
+        runner.reconciliation = config.reconciliation;
         let states = runner.router_states.clone();
         let task = tokio::spawn(runner.run::<_, _, crate::common::net::StandardTcpStream, BmpTcpInRunner>(Arc::new(crate::common::net::StandardTcpListenerFactory)));
         (agent, task, states)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_reconciliation_redials_after_partial_snapshot() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener =
+            tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = mk_config_from_toml(&format!("connect = '{}'\nreconciliation = {{ interval_secs = 3, min_session_secs = 1, replay_grace_secs = 1 }}", listener.local_addr().unwrap())).unwrap();
+        let (agent, task, states) = start_active(config);
+        let (mut first, _) =
+            timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+        first.write_all(&[3, 0, 0]).await.unwrap();
+        assert_eq!(
+            timeout(Duration::from_secs(5), first.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        let (_second, _) = timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        agent.terminate().await;
+        timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(states.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
