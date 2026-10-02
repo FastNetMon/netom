@@ -1001,40 +1001,48 @@ async fn search_evpn(
     let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
         ApiError::ServiceUnavailable("too many concurrent RIB queries".into())
     })?;
-    let data = tokio::task::spawn_blocking(move || {
+    let body = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        evpn_rows(&rib, &filter)
+        #[derive(serde::Serialize)]
+        struct Response {
+            data: Vec<EvpnRow>,
+        }
+        serde_json::to_vec(&Response {
+            data: evpn_rows(&rib, &filter),
+        })
     })
     .await
+    .map_err(|e| ApiError::InternalServerError(e.to_string()))?
     .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
-    let body = serde_json::to_vec(&serde_json::json!({"data": data}))
-        .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
     Ok(
         ([("content-type", OutputFormat::Json.content_type())], body)
             .into_response(),
     )
 }
 
-fn evpn_rows(
-    rib: &super::rib::Rib,
-    filter: &EvpnFilter,
-) -> Vec<serde_json::Value> {
-    let mut records = rib.evpn_records();
+#[derive(serde::Serialize)]
+struct EvpnRow {
+    route: std::sync::Arc<super::evpn::EvpnRecord>,
+    overlay: super::evpn::EvpnAttributes,
+    source_ingress_id: IngressId,
+    path_id: Option<u32>,
+}
+
+fn evpn_rows(rib: &super::rib::Rib, filter: &EvpnFilter) -> Vec<EvpnRow> {
+    let mut records = rib.evpn_records_matching(|record| {
+        let n = &record.nlri;
+        (record.active || filter.include_withdrawn)
+            && filter.rd.as_ref().is_none_or(|v| v == &n.rd)
+            && filter.route_type.is_none_or(|v| v == n.route_type)
+            && filter.vni.is_none_or(|v| n.labels.contains(&v))
+            && filter.prefix.is_none_or(|v| Some(v) == n.prefix)
+            && filter.ingress_id.is_none_or(|v| v == record.ingress_id)
+    });
     records.sort_by(|a, b| {
         (&a.nlri.key, a.ingress_id).cmp(&(&b.nlri.key, b.ingress_id))
     });
     let mut rows = Vec::new();
     for record in records {
-        let n = &record.nlri;
-        if (!record.active && !filter.include_withdrawn)
-            || filter.rd.as_ref().is_some_and(|v| v != &n.rd)
-            || filter.route_type.is_some_and(|v| v != n.route_type)
-            || filter.vni.is_some_and(|v| !n.labels.contains(&v))
-            || filter.prefix.is_some_and(|v| Some(v) != n.prefix)
-            || filter.ingress_id.is_some_and(|v| v != record.ingress_id)
-        {
-            continue;
-        }
         let overlay = super::evpn::EvpnAttributes::decode(&record.attributes);
         if filter
             .route_target
@@ -1047,12 +1055,14 @@ fn evpn_rows(
         let path_source = source
             .as_ref()
             .filter(|s| s.ingress_type == Some(IngressType::BgpPath));
-        rows.push(serde_json::json!({
-            "route": record,
-            "overlay": overlay,
-            "source_ingress_id": path_source.and_then(|s| s.parent_ingress).unwrap_or(record.ingress_id),
-            "path_id": path_source.and_then(|s| s.path_id),
-        }));
+        rows.push(EvpnRow {
+            source_ingress_id: path_source
+                .and_then(|s| s.parent_ingress)
+                .unwrap_or(record.ingress_id),
+            path_id: path_source.and_then(|s| s.path_id),
+            route: record,
+            overlay,
+        });
     }
     rows
 }
@@ -1101,8 +1111,8 @@ mod evpn_tests {
         })).unwrap();
         let rows = evpn_rows(&rib, &filter);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0]["route"]["nlri"]["rd"], "1:1");
-        assert_eq!(rows[0]["source_ingress_id"], 10);
+        assert_eq!(rows[0].route.nlri.rd, "1:1");
+        assert_eq!(rows[0].source_ingress_id, 10);
         let filter = EvpnFilter {
             vni: Some(2),
             ..filter

@@ -479,9 +479,7 @@ pub async fn perform_initial_dump(
         };
         // EVPN uses RD-scoped keys instead of the IP prefix tree.
         if !client_gone {
-            for record in
-                rib_for_walk.evpn_records().into_iter().filter(|r| r.active)
-            {
+            for record in rib_for_walk.evpn_records_matching(|r| r.active) {
                 let source = ingress_register_for_walk.get(record.ingress_id);
                 let (ingress_id, path_id) = match source {
                     Some(ref info)
