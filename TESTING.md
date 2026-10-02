@@ -132,3 +132,15 @@ tests require permission to bind loopback sockets.
 
 See [automatic reconciliation](docs/bmp-tcp-in.md#automatic-reconciliation-and-stale-peer-retention)
 for the RFC 7854 references, defaults, and monitoring-gap/replay caveat.
+
+Validation on 2026-10-02 (implementation `0ec9bd6`, regressions `a816a12`):
+
+- `cargo test --lib --offline`: 354 passed, 31 ignored, no failures.
+- `cargo build --bin netom --offline`: passed (existing unused `set_rib` warning).
+- `python3 scripts/bmp-peer-churn.py --binary target/debug/netom --cycles 20`:
+  all seven scenarios passed. Each churn scenario ended with one peer and one
+  record after GC; the parallel replay retained all three peers/records; silent
+  and partial-frame recovery reclaimed all obsolete peers/records; capacity
+  recovery restored the one current peer. Every final disconnect cleaned up.
+- Changed Rust files passed rustfmt checks; the Python driver passed syntax
+  compilation; `git diff --check` passed.
