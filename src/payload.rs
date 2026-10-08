@@ -411,19 +411,21 @@ fn hash_bytes(raw: &[u8]) -> u64 {
 // These from/to byte functions should ideally live in routecore, but as we
 // will refactor many routecore types to zerocopy structs soon(tm), we define
 // these here for now.
+// Bit 0 retains the original ASN encoding; old 0/1 values remain valid.
 fn ppi_to_byte(ppi: PduParseInfo) -> u8 {
-    match ppi.four_octet_enabled() {
-        true => 1,
-        false => 0,
-    }
+    u8::from(ppi.four_octet_enabled())
+        | (u8::from(ppi.conventional_addpath()) << 1)
+        | (u8::from(ppi.mp_reach_addpath()) << 2)
+        | (u8::from(ppi.mp_unreach_addpath()) << 3)
 }
 
 fn byte_to_ppi(byte: u8) -> PduParseInfo {
-    if byte == 0x01 {
-        PduParseInfo::modern()
-    } else {
-        PduParseInfo::legacy()
-    }
+    PduParseInfo::from_flags(
+        byte & 1 != 0,
+        byte & 2 != 0,
+        byte & 4 != 0,
+        byte & 8 != 0,
+    )
 }
 
 impl RotondaPaMap {
@@ -899,6 +901,47 @@ mod layout_tests {
                 + 2 * std::mem::size_of::<Payload>()
                 + bulk_heap
         );
+    }
+
+    #[test]
+    fn stored_extended_next_hop_json() {
+        for addpath in [false, true] {
+            let ppi = super::byte_to_ppi(if addpath { 5 } else { 1 });
+            let mut value = vec![0, 1, 1, 16];
+            value.extend_from_slice(&"2001:db8::3".parse::<std::net::Ipv6Addr>().unwrap().octets());
+            value.push(0);
+            if addpath {
+                value.extend_from_slice(&[255, 0, 0, 1]);
+            }
+            value.extend_from_slice(&[24, 192, 0, 2]);
+            // Include conventional NEXT_HOP for local Loc-RIB paths.
+            let mut raw = vec![0x40, 3, 4, 0, 0, 0, 0, 0x80, 14, value.len() as u8];
+            raw.extend_from_slice(&value);
+            let map = super::RotondaPaMap::new(
+                routecore::bgp::path_attributes::OwnedPathAttributes::new(ppi, raw),
+            );
+            let json = serde_json::to_value(&map).unwrap();
+            assert_eq!(json["pathAttributes"], serde_json::json!([
+                {"conventionalNextHop": "0.0.0.0"},
+                {"mpReachNlri": {"nextHop": {"ipv6Unicast": "2001:db8::3"}}}
+            ]));
+        }
+    }
+
+    #[test]
+    fn stored_ppi_preserves_all_flags() {
+        for byte in 0..16 {
+            let ppi = super::byte_to_ppi(byte);
+            assert_eq!(ppi.four_octet_enabled(), byte & 1 != 0);
+            assert_eq!(ppi.conventional_addpath(), byte & 2 != 0);
+            assert_eq!(ppi.mp_reach_addpath(), byte & 4 != 0);
+            assert_eq!(ppi.mp_unreach_addpath(), byte & 8 != 0);
+            let map = super::RotondaPaMap::new(
+                routecore::bgp::path_attributes::OwnedPathAttributes::new(ppi, vec![]),
+            );
+            assert_eq!(map.path_attributes().pdu_parse_info(), ppi);
+            assert_eq!(super::ppi_to_byte(ppi), byte);
+        }
     }
 
     #[test]

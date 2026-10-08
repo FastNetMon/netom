@@ -204,3 +204,7 @@ systemd-units = { unit-name = "netom", unit-scripts = "pkg/common", enable = fal
 
 
 [package.metadata.deb.variants.minimal]
+
+# Keep Netom and its store on the extended-next-hop serialization fix.
+[patch."https://github.com/FastNetMon/routecore.git"]
+routecore = { git = "https://github.com/jbemmel/routecore.git", rev = "25e68ba65ec3abec22965ccef9f5349edba17da4" }
