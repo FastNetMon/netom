@@ -477,6 +477,61 @@ pub async fn perform_initial_dump(
                 true
             })
         };
+        // EVPN uses RD-scoped keys instead of the IP prefix tree.
+        if !client_gone {
+            for record in rib_for_walk.evpn_records_matching(|r| r.active) {
+                let source = ingress_register_for_walk.get(record.ingress_id);
+                let (ingress_id, path_id) = match source {
+                    Some(ref info)
+                        if info.ingress_type
+                            == Some(IngressType::BgpPath) =>
+                    {
+                        (
+                            info.parent_ingress.unwrap_or(record.ingress_id),
+                            info.path_id,
+                        )
+                    }
+                    _ => (record.ingress_id, None),
+                };
+                let Some(info) = ingress_register_for_walk.get(ingress_id)
+                else {
+                    continue;
+                };
+                let pi = build_peer_info_for_emit(
+                    &info,
+                    &ingress_register_for_walk,
+                    forward_router_info,
+                    fan_in_peer_distinguisher,
+                );
+                if !aggregator.has_peer(ingress_id) {
+                    if msg_tx
+                        .blocking_send((
+                            bmp_builder::build_peer_up(&pi, false),
+                            0,
+                        ))
+                        .is_err()
+                    {
+                        client_gone = true;
+                        break;
+                    }
+                    aggregator.insert_peer(ingress_id, pi.clone());
+                    discovered.push((ingress_id, pi.clone()));
+                }
+                if let Some(msg) = bmp_builder::build_evpn_route_monitoring(
+                    &pi,
+                    &record.nlri.raw,
+                    &record.attributes,
+                    false,
+                    path_id,
+                ) {
+                    if msg_tx.blocking_send((msg, 1)).is_err() {
+                        client_gone = true;
+                        break;
+                    }
+                    *routes_per_ingress.entry(ingress_id).or_insert(0) += 1;
+                }
+            }
+        }
         let walk_result = match (walk_result, fs_walk_result) {
             (Ok(unicast), Ok(flowspec)) => Ok(unicast + flowspec),
             (Err(e), _) | (_, Err(e)) => Err(e),
@@ -1306,6 +1361,152 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "never emit a fabricated peer header"
+        );
+    }
+
+    #[tokio::test]
+    async fn evpn_dump_replays_active_addpath_and_eor() {
+        use crate::{
+            payload::{RotondaPaMap, RotondaRoute},
+            roto_runtime::Ctx,
+        };
+        use rotonda_store::prefix_record::RouteStatus;
+        use std::sync::Mutex;
+        let register: Arc<register::Register> = Default::default();
+        let rib = Arc::new(
+            Rib::new(
+                register.clone(),
+                None,
+                Arc::new(Mutex::new(Ctx::empty())),
+            )
+            .unwrap(),
+        );
+        let session = register.register();
+        register.update_info(
+            session,
+            IngressInfo::new()
+                .with_ingress_type(IngressType::BgpViaBmp)
+                .with_state(IngressState::Connected)
+                .with_remote_addr("192.0.2.1".parse::<IpAddr>().unwrap())
+                .with_remote_asn(Asn::from_u32(65000))
+                .with_remote_capabilities(vec![1, 4, 0, 25, 0, 70])
+                .with_addpath_families(vec![0, 25, 70, 3]),
+        );
+        let mut children = Vec::new();
+        for pid in [11u32, 22] {
+            let child = register.register();
+            register.update_info(
+                child,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpPath)
+                    .with_state(IngressState::Connected)
+                    .with_parent_ingress(session)
+                    .with_path_id(pid),
+            );
+            children.push(child);
+            let mut raw = vec![5, 34];
+            raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 7]);
+            raw.extend_from_slice(&[0; 14]);
+            raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42]);
+            let attrs = RotondaPaMap::new(
+                routecore::bgp::path_attributes::OwnedPathAttributes::new(
+                    routecore::bgp::message::update::PduParseInfo::modern(),
+                    vec![
+                        0x40, 1, 1, 0, 0x80, 14, 9, 0, 25, 70, 4, 192, 0, 2,
+                        1, 0,
+                    ],
+                ),
+            );
+            let route = RotondaRoute::L2VpnEvpn(
+                Box::new(
+                    crate::units::rib_unit::evpn::EvpnNlri::parse(&raw)
+                        .unwrap(),
+                ),
+                attrs,
+            );
+            rib.insert(&route, RouteStatus::Active, 0, child, true, false)
+                .unwrap();
+        }
+        assert!(rib.reap_idle_path_children(Default::default()).is_empty());
+        rib.withdraw_for_ingress(
+            children[1],
+            Some(routecore::bgp::types::AfiSafiType::L2VpnEvpn),
+            true,
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1024);
+        let client = Arc::new(ClientState::new(
+            "127.0.0.1:0".parse().unwrap(),
+            tx,
+            10000,
+            10 * 1024 * 1024,
+        ));
+        let gate = crate::comms::Gate::default();
+        let metrics = Arc::new(BmpTcpOutMetrics::new(&gate));
+        let reporter = Arc::new(BmpTcpOutStatusReporter::new(
+            "evpn-test",
+            metrics.clone(),
+        ));
+        assert!(
+            perform_initial_dump(
+                &client,
+                &rib,
+                &register,
+                "test",
+                "test",
+                false,
+                FanInPeerDistinguisher::Off,
+                &metrics,
+                &reporter
+            )
+            .await
+        );
+        let mut kinds = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            let kind = classify(&msg);
+            if kind == MsgKind::Route(25, 70) {
+                use routecore::bgp::message::{SessionConfig, UpdateMessage};
+                let mut sc = SessionConfig::modern();
+                sc.add_addpath_rxtx(
+                    routecore::bgp::types::AfiSafiType::L2VpnEvpn,
+                );
+                let update = UpdateMessage::from_octets(
+                    bytes::Bytes::copy_from_slice(&msg[48..]),
+                    &sc,
+                )
+                .unwrap();
+                let routes =
+                    crate::roto_runtime::types::decode_evpn_test_update(
+                        &update, false,
+                    );
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].1.unwrap().0, 11);
+            }
+            kinds.push(kind);
+        }
+        assert_eq!(
+            kinds.iter().filter(|k| **k == MsgKind::PeerUp).count(),
+            1
+        );
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|k| **k == MsgKind::Route(25, 70))
+                .count(),
+            1
+        );
+        assert_eq!(
+            kinds.iter().filter(|k| **k == MsgKind::Eor(25, 70)).count(),
+            1
+        );
+        assert!(
+            kinds
+                .iter()
+                .position(|k| *k == MsgKind::Route(25, 70))
+                .unwrap()
+                < kinds
+                    .iter()
+                    .position(|k| *k == MsgKind::Eor(25, 70))
+                    .unwrap()
         );
     }
 

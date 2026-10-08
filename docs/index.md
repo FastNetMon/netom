@@ -38,6 +38,7 @@ clickhouse
 
 rib-query-api
 addpath-flowspec-api
+evpn
 best-path-selection
 ```
 

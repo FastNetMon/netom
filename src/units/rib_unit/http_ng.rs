@@ -39,6 +39,7 @@ use crate::{
 
 /// Add ingress register specific endpoints to a HTTP API
 pub fn register_routes(router: &mut Api) {
+    router.add_get("/ribs/l2vpnevpn/routes", search_evpn);
     router.add_get(
         "/ribs/ipv4unicast/routes/{prefix}/{prefix_len}",
         search_ipv4unicast,
@@ -889,7 +890,9 @@ async fn run_best_path(
     Ok((
         [("content-type", OutputFormat::Json.content_type())],
         serde_json::to_string(&body).map_err(|e| {
-            ApiError::InternalServerError(format!("serialization failed: {e}"))
+            ApiError::InternalServerError(format!(
+                "serialization failed: {e}"
+            ))
         })?,
     ))
 }
@@ -970,4 +973,167 @@ async fn best_path_ipv6_addr(
         state,
     )
     .await
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EvpnFilter {
+    rd: Option<String>,
+    route_target: Option<String>,
+    route_type: Option<u8>,
+    vni: Option<u32>,
+    prefix: Option<Prefix>,
+    ingress_id: Option<IngressId>,
+    #[serde(default)]
+    include_withdrawn: bool,
+}
+
+async fn search_evpn(
+    Query(filter): Query<EvpnFilter>,
+    state: State<ApiState>,
+) -> Result<impl IntoResponse, ApiError> {
+    if !crate::config::evpn_enabled() {
+        return Err(ApiError::ServiceUnavailable(
+            "EVPN support is disabled; set enable_evpn = true and restart Netom".into(),
+        ));
+    }
+    let rib = load_rib(&state)?;
+    let permit = super::rib::DumpGuard::try_enter().ok_or_else(|| {
+        ApiError::ServiceUnavailable("too many concurrent RIB queries".into())
+    })?;
+    let body = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        #[derive(serde::Serialize)]
+        struct Response {
+            data: Vec<EvpnRow>,
+        }
+        serde_json::to_vec(&Response {
+            data: evpn_rows(&rib, &filter),
+        })
+    })
+    .await
+    .map_err(|e| ApiError::InternalServerError(e.to_string()))?
+    .map_err(|e| ApiError::InternalServerError(e.to_string()))?;
+    Ok(
+        ([("content-type", OutputFormat::Json.content_type())], body)
+            .into_response(),
+    )
+}
+
+#[derive(serde::Serialize)]
+struct EvpnRow {
+    route: std::sync::Arc<super::evpn::EvpnRecord>,
+    overlay: super::evpn::EvpnAttributes,
+    source_ingress_id: IngressId,
+    path_id: Option<u32>,
+}
+
+fn evpn_rows(rib: &super::rib::Rib, filter: &EvpnFilter) -> Vec<EvpnRow> {
+    let mut records = rib.evpn_records_matching(|record| {
+        let n = &record.nlri;
+        (record.active || filter.include_withdrawn)
+            && filter.rd.as_ref().is_none_or(|v| v == &n.rd)
+            && filter.route_type.is_none_or(|v| v == n.route_type)
+            && filter.vni.is_none_or(|v| n.labels.contains(&v))
+            && filter.prefix.is_none_or(|v| Some(v) == n.prefix)
+            && filter.ingress_id.is_none_or(|v| v == record.ingress_id)
+    });
+    records.sort_by(|a, b| {
+        (&a.nlri.key, a.ingress_id).cmp(&(&b.nlri.key, b.ingress_id))
+    });
+    let mut rows = Vec::new();
+    for record in records {
+        let overlay = super::evpn::EvpnAttributes::decode(&record.attributes);
+        if filter
+            .route_target
+            .as_ref()
+            .is_some_and(|v| !overlay.route_targets.contains(v))
+        {
+            continue;
+        }
+        let source = rib.ingress_register.get(record.ingress_id);
+        let path_source = source
+            .as_ref()
+            .filter(|s| s.ingress_type == Some(IngressType::BgpPath));
+        rows.push(EvpnRow {
+            source_ingress_id: path_source
+                .and_then(|s| s.parent_ingress)
+                .unwrap_or(record.ingress_id),
+            path_id: path_source.and_then(|s| s.path_id),
+            route: record,
+            overlay,
+        });
+    }
+    rows
+}
+
+#[cfg(test)]
+mod evpn_tests {
+    use super::*;
+    use crate::{
+        payload::{RotondaPaMap, RotondaRoute},
+        roto_runtime::Ctx,
+    };
+    use rotonda_store::prefix_record::RouteStatus;
+    use std::sync::{Arc, Mutex};
+    #[test]
+    fn evpn_api_filters_overlapping_tenants() {
+        let rib = super::super::rib::Rib::new(
+            Default::default(),
+            None,
+            Arc::new(Mutex::new(Ctx::empty())),
+        )
+        .unwrap();
+        for tenant in [1u8, 2] {
+            let mut raw = vec![5, 34];
+            raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, tenant]);
+            raw.extend_from_slice(&[0; 14]);
+            raw.extend_from_slice(&[
+                24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, tenant,
+            ]);
+            let attributes = RotondaPaMap::new(
+                routecore::bgp::path_attributes::OwnedPathAttributes::new(
+                    routecore::bgp::message::update::PduParseInfo::modern(),
+                    vec![0xc0, 16, 8, 0, 2, 0xfd, 0xe8, 0, 0, 0, tenant],
+                ),
+            );
+            let route = RotondaRoute::L2VpnEvpn(
+                Box::new(super::super::evpn::EvpnNlri::parse(&raw).unwrap()),
+                attributes,
+            );
+            rib.insert(&route, RouteStatus::Active, 0, 10, true, false)
+                .unwrap();
+        }
+        assert_eq!(evpn_rows(&rib, &EvpnFilter::default()).len(), 2);
+        let filter: EvpnFilter = serde_json::from_value(serde_json::json!({
+            "route_target": "65000:1", "prefix": "10.0.0.0/24", "route_type": 5,
+            "vni": 1, "rd": "1:1", "ingress_id": 10
+        })).unwrap();
+        let rows = evpn_rows(&rib, &filter);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].route.nlri.rd, "1:1");
+        assert_eq!(rows[0].source_ingress_id, 10);
+        let filter = EvpnFilter {
+            vni: Some(2),
+            ..filter
+        };
+        assert!(evpn_rows(&rib, &filter).is_empty());
+        rib.withdraw_for_ingress(10, Some(AfiSafiType::L2VpnEvpn), true);
+        assert!(evpn_rows(&rib, &EvpnFilter::default()).is_empty());
+        assert_eq!(
+            evpn_rows(
+                &rib,
+                &EvpnFilter {
+                    include_withdrawn: true,
+                    ..Default::default()
+                }
+            )
+            .len(),
+            2
+        );
+        assert!(serde_json::from_value::<EvpnFilter>(
+            serde_json::json!({"best_path": true})
+        )
+        .is_err());
+    }
 }

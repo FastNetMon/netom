@@ -1,0 +1,5 @@
+{"data":[
+  {"route":{"ingress_id":101,"active":true,"ltime":1,"nlri":{"route_type":2,"rd":"65000:10","ethernet_tag":0,"esi":"00000000000000000000","mac":"00:11:22:33:44:55","prefix":"10.0.0.1/32","gateway":null,"labels":[10010,50000],"raw":[]},"attributes":{}},"overlay":{"route_targets":["65000:10","65000:50000"],"router_mac":"aa:bb:cc:dd:ee:ff","next_hop":"192.0.2.1"},"source_ingress_id":7,"path_id":11},
+  {"route":{"ingress_id":102,"active":false,"ltime":2,"nlri":{"route_type":5,"rd":"192.0.2.2:20","ethernet_tag":0,"esi":"00000000000000000000","mac":null,"prefix":"2001:db8::/64","gateway":"::","labels":[50020],"raw":[]},"attributes":{}},"overlay":{"route_targets":["65000:20"],"router_mac":null,"next_hop":"2001:db8::2"},"source_ingress_id":8,"path_id":null},
+  {"route":{"ingress_id":103,"active":true,"ltime":3,"nlri":{"route_type":3,"rd":"65000:30","mac":null,"prefix":null,"labels":[],"raw":[]},"attributes":{}},"overlay":{"route_targets":[],"router_mac":null,"next_hop":null},"source_ingress_id":9,"path_id":null}
+]}

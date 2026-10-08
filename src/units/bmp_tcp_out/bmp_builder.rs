@@ -267,6 +267,7 @@ impl PeerInfo {
             AfiSafiType::Ipv6Unicast => (2u16, 1u8),
             AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
             AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+            AfiSafiType::L2VpnEvpn => (25u16, 70u8),
             _ => return false,
         };
         Capabilities(&self.peer_capabilities).iter().any(|cap| {
@@ -285,6 +286,7 @@ impl PeerInfo {
             AfiSafiType::Ipv6Unicast,
             AfiSafiType::Ipv4FlowSpec,
             AfiSafiType::Ipv6FlowSpec,
+            AfiSafiType::L2VpnEvpn,
         ]
         .into_iter()
         .filter(|afisafi| self.supports_afisafi(*afisafi))
@@ -458,6 +460,7 @@ fn build_bgp_open(
             AfiSafiType::Ipv6Unicast => (2u16, 1u8),
             AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
             AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+            AfiSafiType::L2VpnEvpn => (25u16, 70u8),
             _ => continue,
         };
         caps.push(1);
@@ -491,6 +494,7 @@ fn build_bgp_open(
                 AfiSafiType::Ipv6Unicast => (2u16, 1u8),
                 AfiSafiType::Ipv4FlowSpec => (1u16, 133u8),
                 AfiSafiType::Ipv6FlowSpec => (2u16, 133u8),
+                AfiSafiType::L2VpnEvpn => (25u16, 70u8),
                 _ => continue,
             };
             caps.extend_from_slice(&afi.to_be_bytes());
@@ -820,6 +824,15 @@ pub fn build_route_monitoring_from_route(
                 path_id,
             );
         }
+        RotondaRoute::L2VpnEvpn(nlri, pamap) => {
+            return build_evpn_route_monitoring(
+                peer,
+                &nlri.raw,
+                pamap,
+                is_withdrawal,
+                path_id,
+            );
+        }
         RotondaRoute::Ipv6FlowSpec(nlri, pamap) => {
             return build_flowspec_route_monitoring(
                 peer,
@@ -833,6 +846,48 @@ pub fn build_route_monitoring_from_route(
     };
 
     build_route_monitoring(peer, prefix, pamap, is_withdrawal, path_id)
+}
+
+/// Rebuild MP-BGP framing while retaining EVPN next hop and communities.
+pub fn build_evpn_route_monitoring(
+    peer: &PeerInfo,
+    raw: &[u8],
+    pamap: &RotondaPaMap,
+    withdrawn: bool,
+    path_id: Option<u32>,
+) -> Option<Vec<u8>> {
+    let (mut attrs, next_hop) = filter_raw_path_attributes(pamap);
+    let mut value = vec![0, 25, 70];
+    if withdrawn {
+        attrs.clear();
+    } else {
+        let nh = next_hop?;
+        value.push(u8::try_from(nh.len()).ok()?);
+        value.extend_from_slice(&nh);
+        value.push(0);
+    }
+    if let Some(pid) = path_id {
+        value.extend_from_slice(&pid.to_be_bytes());
+    }
+    value.extend_from_slice(raw);
+    attrs.extend_from_slice(&[0x90, if withdrawn { 15 } else { 14 }]);
+    attrs.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    attrs.extend_from_slice(&value);
+    let len = 23 + attrs.len();
+    if len > MAX_BGP_UPDATE_LEN {
+        return None;
+    }
+    let total = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + len;
+    let mut out = Vec::with_capacity(total);
+    write_common_header(&mut out, BMP_MSG_ROUTE_MONITORING, total as u32);
+    write_per_peer_header(&mut out, peer, None);
+    out.extend_from_slice(&BGP_MARKER);
+    out.extend_from_slice(&(len as u16).to_be_bytes());
+    out.push(BGP_MSG_UPDATE);
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+    out.extend_from_slice(&attrs);
+    Some(out)
 }
 
 /// Append raw FlowSpec NLRI bytes with their RFC 8955 §4.1 length header:
@@ -1725,6 +1780,7 @@ pub fn build_end_of_rib_marker(
     afisafi: AfiSafiType,
 ) -> Option<Vec<u8>> {
     match afisafi {
+        AfiSafiType::L2VpnEvpn => Some(build_eor_mp_unreach(peer, afisafi)),
         AfiSafiType::Ipv4Unicast => Some(build_eor_ipv4(peer)),
         AfiSafiType::Ipv6Unicast
         | AfiSafiType::Ipv4FlowSpec
@@ -3123,6 +3179,57 @@ mod tests {
         assert_eq!(peer.peer_distinguisher, real_rd);
         assert_eq!(pd_from_msg(&build_peer_up(&peer, false)), real_rd);
         assert_eq!(pd_from_msg(&build_peer_down(&peer)), real_rd);
+    }
+
+    #[test]
+    fn evpn_bmp_roundtrip_plain_and_addpath() {
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        let peer = agg_test_peer();
+        let mut raw = vec![5, 34];
+        raw.extend_from_slice(&[0, 0, 0, 1, 0, 0, 0, 7]);
+        raw.extend_from_slice(&[0; 14]);
+        raw.extend_from_slice(&[24, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 42]);
+        let pamap = RotondaPaMap::new(
+            routecore::bgp::path_attributes::OwnedPathAttributes::new(
+                routecore::bgp::message::update::PduParseInfo::modern(),
+                vec![
+                    0x40, 1, 1, 0, 0x80, 14, 9, 0, 25, 70, 4, 192, 0, 2, 1, 0,
+                ],
+            ),
+        );
+        for pid in [None, Some(17)] {
+            let mut sc = SessionConfig::modern();
+            if pid.is_some() {
+                sc.add_addpath_rxtx(AfiSafiType::L2VpnEvpn);
+            }
+            for withdrawn in [false, true] {
+                let bmp = build_evpn_route_monitoring(
+                    &peer, &raw, &pamap, withdrawn, pid,
+                )
+                .unwrap();
+                let bgp = bytes::Bytes::copy_from_slice(
+                    &bmp[BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN..],
+                );
+                let update = UpdateMessage::from_octets(bgp, &sc).unwrap();
+                let routes =
+                    crate::roto_runtime::types::decode_evpn_test_update(
+                        &update, withdrawn,
+                    );
+                assert_eq!(routes.len(), 1);
+                assert_eq!(routes[0].1.map(|p| p.0), pid);
+                match &routes[0].0 {
+                    RotondaRoute::L2VpnEvpn(n, attrs) => {
+                        assert_eq!(n.raw, raw);
+                        assert_eq!(n.rd, "1:7");
+                        if !withdrawn {
+                            assert_eq!(crate::units::rib_unit::evpn::EvpnAttributes::decode(attrs).next_hop,
+                                Some("192.0.2.1".parse().unwrap()));
+                        }
+                    }
+                    other => panic!("unexpected route {other:?}"),
+                }
+            }
+        }
     }
 
     fn agg_test_peer() -> PeerInfo {
