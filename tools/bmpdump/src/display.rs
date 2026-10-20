@@ -276,6 +276,24 @@ impl Block {
 fn community(b: &mut Block, entry: &Value) {
     let name = strv(&entry["name"]);
     match name {
+        "arp-nd" => b.field_text(
+            "ARP/ND",
+            &format!(
+                "Router={}, Override={}, Immutable={}",
+                if entry["router"] == true { "yes" } else { "no" },
+                if entry["override"] == true {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if entry["immutable"] == true {
+                    "yes"
+                } else {
+                    "no"
+                },
+            ),
+            4,
+        ),
         "unknown" => b.field_text(
             "Unknown community",
             &format!(

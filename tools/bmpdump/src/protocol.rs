@@ -316,6 +316,15 @@ fn extended_community(raw: &[u8]) -> Result<Value> {
                 result["name"] = json!("router-mac");
                 result["value"] = json!(colon_hex(&raw[2..]));
             }
+            (6, 8) => {
+                // RFC 9047: R, O and I occupy bits 7, 6 and 4
+                // respectively, numbered from the most significant bit.
+                result["name"] = json!("arp-nd");
+                result["flags"] = json!(raw[2]);
+                result["router"] = json!(raw[2] & 0x01 != 0);
+                result["override"] = json!(raw[2] & 0x02 != 0);
+                result["immutable"] = json!(raw[2] & 0x08 != 0);
+            }
             _ => {
                 result["name"] = json!("unknown");
             }

@@ -465,6 +465,43 @@ fn evpn_vni_and_withdrawal_raw_labels() {
     assert_eq!(m["routes"][0]["label_raw"], json!([101000]));
 }
 #[test]
+fn arp_nd_community_flags() {
+    for (flags, router, override_flag, immutable) in [
+        (0, false, false, false),
+        (1, true, false, false),
+        (2, false, true, false),
+        (8, false, false, true),
+        (11, true, true, true),
+        (0xf4, false, false, false),
+    ] {
+        let bgp = parse(&update(
+            &attr(16, &[6, 8, flags, 0, 0, 0, 0, 0]),
+            &[],
+            &[],
+        ));
+        let c = &bgp["attributes"][0]["values"][0];
+        assert_eq!(c["name"], "arp-nd");
+        assert_eq!(c["router"], router);
+        assert_eq!(c["override"], override_flag);
+        assert_eq!(c["immutable"], immutable);
+        assert_eq!(c["flags"], flags);
+        assert_eq!(c["raw"], format!("0608{flags:02x}0000000000"));
+        let rendered = bmpdump::display::display_message(
+            &json!({"bgp":[bgp]}),
+            1,
+            Default::default(),
+        );
+        assert!(rendered.contains(&format!(
+            "Router={}, Override={}, Immutable={}",
+            if router { "yes" } else { "no" },
+            if override_flag { "yes" } else { "no" },
+            if immutable { "yes" } else { "no" },
+        )));
+        assert!(!rendered.contains("Unknown community"));
+    }
+}
+
+#[test]
 fn add_path_negotiation() {
     let mut decoder = BmpDecoder::new(false);
     decoder
