@@ -62,10 +62,9 @@ connection. Listening address changes preserve existing accepted connections.
 ## Automatic reconciliation and stale-peer retention
 
 Anomaly and capacity recovery are enabled for every BMP input, for both `listen`
-and `connect`. Periodic renewal is disabled by default. The former experimental
-`recover_unnumbered_peers` heuristic
-has been replaced: Netom does not infer that a shared BGP identifier authorizes
-it to delete another peer.
+and `connect`. Periodic renewal is disabled by default. Netom does not delete
+an existing peer solely because a new peer shares its BGP identifier; legitimate
+parallel sessions can share that identifier.
 
 An exporter can omit Peer Down or send it with an address that no longer matches
 Peer Up. [Issue #11](https://github.com/FastNetMon/netom/issues/11) describes FRR
