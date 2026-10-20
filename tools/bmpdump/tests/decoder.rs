@@ -629,6 +629,56 @@ fn cli_stdin_json_and_count() {
     assert_eq!(m["name"], "initiation");
 }
 #[test]
+fn frame_message_ordinals_survive_filtering_and_reassembly() {
+    let initiation = bmp(4, &[]);
+    let monitoring = bmp(0, &[peer(0, 0), update(&[], &[], &[])].concat());
+    let first = [&initiation[..], &monitoring[..5]].concat();
+    let second = [&monitoring[5..], &initiation[..]].concat();
+    let packets: Vec<_> = [(1, first), (12, second)]
+        .into_iter()
+        .map(|(seq, payload)| {
+            [
+                vec![0; 12],
+                vec![8, 0],
+                ip_packet(&payload, false, seq, 0x18),
+            ]
+            .concat()
+        })
+        .collect();
+    let raw = pcap(&packets, true, false);
+    let out = invoke(&["-r", "-", "-j"], &raw);
+    assert!(out.status.success(), "{out:?}");
+    let messages: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(messages.len(), 3);
+    for (m, (frame, ordinal)) in messages.iter().zip([(1, 1), (2, 1), (2, 2)])
+    {
+        assert_eq!(m["frame"], frame);
+        assert_eq!(m["frame_message"], ordinal);
+    }
+    let out =
+        invoke(&["-r", "-", "-j", "--type", "initiation", "-c", "2"], &raw);
+    assert!(out.status.success());
+    let filtered: Vec<Value> = String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(filtered, vec![messages[0].clone(), messages[2].clone()]);
+    for (args, expected) in [
+        (vec!["-r", "-", "--type", "initiation", "-v"], "Frame 2.2"),
+        (vec!["-r", "-", "--type", "initiation"], "#2.2"),
+    ] {
+        let out = invoke(&args, &raw);
+        assert!(out.status.success());
+        assert!(String::from_utf8(out.stdout).unwrap().contains(expected));
+    }
+}
+
+#[test]
 fn cli_filters_and_invalid_input() {
     let raw = pcap(
         &[ethernet(

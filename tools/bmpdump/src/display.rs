@@ -123,6 +123,13 @@ fn endpoint(v: &Value) -> String {
         format!("{addr}:{}", v["port"])
     }
 }
+fn frame_reference(message: &Value) -> String {
+    if let Some(ordinal) = message.get("frame_message") {
+        format!("{}.{}", message["frame"], ordinal)
+    } else {
+        text(&message["frame"])
+    }
+}
 fn family(afi: &Value, safi: &Value) -> String {
     match (afi.as_u64(), safi.as_u64()) {
         (Some(1), Some(1)) => "IPv4 unicast".into(),
@@ -563,7 +570,7 @@ fn verbose(message: &Value, colors: Palette) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     b.line(
-        &format!("Frame {}  BMP {title}", message["frame"]),
+        &format!("Frame {}  BMP {title}", frame_reference(message)),
         0,
         if message["type"] == 2 {
             "withdraw"
@@ -736,7 +743,7 @@ pub fn display_message(
     let name = strv(&message["name"]);
     let mut parts = vec![
         timestamp(&message["timestamp_ns"], false),
-        format!("#{}", message["frame"]),
+        format!("#{}", frame_reference(message)),
         endpoint(&message["source"]),
         ">".into(),
         endpoint(&message["destination"]),

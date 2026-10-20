@@ -247,7 +247,7 @@ pub fn run(args: &Args) -> Result<i32> {
         {
             bail!("global TCP buffer limit exceeded");
         }
-        for raw in messages {
+        for (frame_message, raw) in messages.into_iter().enumerate() {
             bmp_messages += 1;
             let mut message = match connections
                 .get_mut(&key)
@@ -280,6 +280,7 @@ pub fn run(args: &Args) -> Result<i32> {
                 }
             };
             message["frame"] = json!(packet.number);
+            message["frame_message"] = json!(frame_message + 1);
             message["timestamp_ns"] = json!(packet.timestamp_ns);
             message["source"] =
                 json!({"address":key.src.to_string(),"port":key.sport});

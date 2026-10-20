@@ -61,6 +61,12 @@ reassembles split messages and separates coalesced messages. `-c` counts
 messages after filtering. Filters select complete messages, including any
 other routes in the same matching message.
 
+Frame references include a message ordinal: `Frame 20.3` (or `#20.3` in
+compact output) means the third BMP message completed in capture frame 20.
+The ordinal starts at one in each frame and is assigned before filtering,
+so references remain consistent across filters. JSON exposes the components
+as `frame` and `frame_message`.
+
 Times are UTC. Verbose output labels the full date and time as `Capture time`;
 compact output shows the time of day. The frame number and capture timestamp
 identify the packet that completed reassembly; the BMP peer timestamp remains
