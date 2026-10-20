@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "netom"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "allocator-api2",
  "anyhow",
@@ -2200,7 +2200,7 @@ dependencies = [
 
 [[package]]
 name = "netom-bmpdump"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "clap",
