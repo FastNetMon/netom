@@ -80,3 +80,19 @@ validity states.
 
 The `e2e-flowspec` GitHub workflow runs both scripts on demand
 (workflow_dispatch).
+
+## Offline BMP decoder
+
+```sh
+cargo test --locked -p netom-bmpdump
+cargo clippy --locked -p netom-bmpdump --all-targets -- -D warnings
+```
+
+Tests construct their own packet fixtures and do not require a running Netom
+daemon. For the optional `netom-bmp-evpn.pcapng` reference-capture regression
+(the capture is not distributed in this repository), set:
+
+```sh
+NETOM_BMPDUMP_TEST_CAPTURE=/path/to/netom-bmp-evpn.pcapng \
+  cargo test --locked -p netom-bmpdump supplied_capture_regression
+```

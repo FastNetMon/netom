@@ -57,6 +57,20 @@ see [Releases](docs/releases.md).
 For issues with this fork, use the FastNetMon repository and support channels.
 Upstream NLnet Labs community resources may not apply to this fork.
 
+## Offline BMP capture decoder
+
+The additional `netom-bmpdump` tool decodes BMP/BGP/EVPN from PCAP and PCAPNG
+files, with TCP reassembly, readable/colorized output, filters, and JSON.
+It runs without the daemon, Python, TShark, or root privileges.
+
+```sh
+cargo build --locked --release -p netom-bmpdump
+./target/release/netom-bmpdump -r capture.pcapng --evpn -v
+```
+
+It is included in the Netom DEB/RPM packages and runtime images. See the
+[decoder guide](docs/bmpdump.md) for usage and limitations.
+
 ## GOALS
 
 #### Modularity

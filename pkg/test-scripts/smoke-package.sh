@@ -18,8 +18,10 @@ esac
 
 test "$(netom --version)" = "netom $NETOM_VERSION"
 test "$(netom-cli --version)" = "netom-cli $NETOM_VERSION"
+test "$(netom-bmpdump --version)" = "netom-bmpdump $NETOM_VERSION"
 netom --help > /dev/null
 netom-cli --help > /dev/null
+netom-bmpdump --help > /dev/null
 user_id=$(id -u netom)
 test -f /etc/netom/netom.conf.example
 test -f /lib/systemd/system/netom.service || test -f /usr/lib/systemd/system/netom.service
@@ -37,7 +39,7 @@ case "$PACKAGE_FORMAT" in
     rpm) dnf remove -y netom ;;
 esac
 hash -r
-if command -v netom || command -v netom-cli; then
+if command -v netom || command -v netom-cli || command -v netom-bmpdump; then
     echo 'Package binaries remain after removal' >&2
     exit 1
 fi

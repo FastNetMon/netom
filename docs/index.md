@@ -20,6 +20,7 @@ configuration and API details can change between 0.x versions. See
 quickstart
 configuration
 cli
+bmpdump
 ```
 
 ```{toctree}
