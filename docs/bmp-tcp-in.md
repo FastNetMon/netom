@@ -161,7 +161,8 @@ memory. Physical reclamation also waits for the normal RIB GC sweeps.
 
 Each refresh logs its reason and speaker address. `scripts/bmp-peer-churn.py`
 exercises current-state replay, disappearance, parallel peers, partial frames,
-and capacity protection; see [TESTING.md](../TESTING.md).
+and capacity protection; see
+[TESTING.md](https://github.com/FastNetMon/netom/blob/main/TESTING.md#bmp-reconciliation-simulations).
 
 ## History and initial data
 
