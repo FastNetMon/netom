@@ -502,6 +502,61 @@ fn arp_nd_community_flags() {
 }
 
 #[test]
+fn pmsi_tunnel_endpoints_and_labels() {
+    for (kind, id, endpoint) in [
+        (6, vec![10, 0, 0, 8], Some("10.0.0.8")),
+        (
+            6,
+            "2001:db8::8".parse::<Ipv6Addr>().unwrap().octets().to_vec(),
+            Some("2001:db8::8"),
+        ),
+        (6, vec![10, 0, 0], None),
+        (240, vec![10, 0, 0, 8], None),
+    ] {
+        for overlay in [false, true] {
+            let mut attrs = attr(
+                22,
+                &[vec![1, kind, 1, 0x8a, 0x88], id.clone()].concat(),
+            );
+            if overlay {
+                attrs.extend(attr(16, &[3, 12, 0, 0, 0, 0, 0, 8]));
+            }
+            let bgp = parse(&update(&attrs, &[], &[]));
+            let pmsi = &bgp["attributes"][0];
+            assert_eq!(pmsi["endpoint"].as_str(), endpoint);
+            assert_eq!(pmsi["label_raw"], 101000);
+            assert_eq!(pmsi["tunnel_id"], bmpdump::protocol::hex(&id));
+            assert_eq!(
+                pmsi[if overlay { "vni" } else { "mpls_label" }],
+                if overlay { 101000 } else { 6312 }
+            );
+            let rendered = bmpdump::display::display_message(
+                &json!({"bgp":[bgp]}),
+                1,
+                Default::default(),
+            );
+            assert!(rendered.contains("PMSI tunnel:"));
+            assert!(rendered.contains("0x01"));
+            assert!(!rendered.contains("Label raw"));
+            assert!(rendered.contains(if overlay {
+                "VNI:"
+            } else {
+                "MPLS label:"
+            }));
+            if kind == 6 {
+                assert!(rendered.contains("Ingress Replication (6)"));
+            }
+            if let Some(endpoint) = endpoint {
+                assert!(rendered.contains(endpoint));
+                assert!(!rendered.contains("Tunnel ID (hex)"));
+            } else {
+                assert!(rendered.contains("Tunnel ID (hex)"));
+            }
+        }
+    }
+}
+
+#[test]
 fn add_path_negotiation() {
     let mut decoder = BmpDecoder::new(false);
     decoder

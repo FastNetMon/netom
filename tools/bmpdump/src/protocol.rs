@@ -551,7 +551,15 @@ pub fn parse_bgp(
                         item["tunnel_flags"] = json!(a.u8()?);
                         item["tunnel_type"] = json!(a.u8()?);
                         item["label_raw"] = json!(a.uint(3)?);
-                        item["tunnel_id"] = json!(hex(a.rest()));
+                        let tunnel_id = a.rest();
+                        item["tunnel_id"] = json!(hex(tunnel_id));
+                        // RFC 6514 section 5: ingress replication uses
+                        // a unicast IPv4 or IPv6 endpoint identifier.
+                        if item["tunnel_type"] == 6
+                            && matches!(tunnel_id.len(), 4 | 16)
+                        {
+                            item["endpoint"] = json!(address(tunnel_id)?);
+                        }
                     }
                     32 => {
                         item["name"] = json!("large-communities");

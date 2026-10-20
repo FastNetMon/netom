@@ -377,6 +377,34 @@ fn attribute(b: &mut Block, entry: &Value) {
                 b.field("Next hop (hex)", raw, 4);
             }
         }
+        "pmsi-tunnel" => {
+            b.line("PMSI tunnel:", 4, "");
+            if entry["tunnel_type"] == 6 {
+                b.field_text("Type", "Ingress Replication (6)", 6);
+            } else {
+                b.field("Type", &entry["tunnel_type"], 6);
+            }
+            if let Some(endpoint) = entry.get("endpoint") {
+                b.field("Endpoint", endpoint, 6);
+            } else {
+                b.field("Tunnel ID (hex)", &entry["tunnel_id"], 6);
+            }
+            if let Some(vni) = entry.get("vni") {
+                b.field("VNI", vni, 6);
+            } else if let Some(label) = entry.get("mpls_label") {
+                b.field("MPLS label", label, 6);
+            } else {
+                b.field("Raw label field", &entry["label_raw"], 6);
+            }
+            b.field_text(
+                "Flags",
+                &format!(
+                    "0x{:02x}",
+                    entry["tunnel_flags"].as_u64().unwrap_or(0)
+                ),
+                6,
+            );
+        }
         _ => {
             if let Some(value) = entry.get("value") {
                 let title = match name {
