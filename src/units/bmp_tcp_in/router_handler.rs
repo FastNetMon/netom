@@ -233,20 +233,22 @@ impl RouterHandler {
                 let policy = self.reconciliation.lock().unwrap();
                 (policy.deadline(), policy.reason())
             };
-            if tokio::time::Instant::now() >= deadline {
-                log::warn!("Reconciling BMP speaker {router_addr}: {reason}; closing transport for a fresh snapshot");
-                break;
-            }
-            // Cancelling a partial read is safe here: the transport is dropped,
-            // never reused. The timer also renews completely silent sessions.
-            let next = match tokio::time::timeout_at(deadline, stream.next())
-                .await
-            {
-                Ok(next) => next,
-                Err(_) => {
+            let next = if let Some(deadline) = deadline {
+                if tokio::time::Instant::now() >= deadline {
                     log::warn!("Reconciling BMP speaker {router_addr}: {reason}; closing transport for a fresh snapshot");
                     break;
                 }
+                // Cancelling a partial read is safe: its transport is dropped,
+                // never reused. Anomaly deadlines also interrupt idle reads.
+                match tokio::time::timeout_at(deadline, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        log::warn!("Reconciling BMP speaker {router_addr}: {reason}; closing transport for a fresh snapshot");
+                        break;
+                    }
+                }
+            } else {
+                stream.next().await
             };
             match next {
                 Err(err) => {
@@ -807,6 +809,40 @@ mod tests {
     const SYS_NAME: &str = "some-sys-name";
     const SYS_DESCR: &str = "some-sys-desc";
     const OTHER_SYS_NAME: &str = "other-sys-name";
+
+    #[tokio::test(start_paused = true)]
+    async fn reconciliation_default_keeps_idle_and_partial_transports_open() {
+        use tokio::io::AsyncWriteExt;
+        for partial in [false, true] {
+            let (runner, _agent, _parent) = RouterHandler::mock();
+            let (mut writer, reader) = tokio::io::duplex(128);
+            if partial {
+                writer.write_all(&[3, 0, 0]).await.unwrap();
+            }
+            let register = Arc::new(ingress::Register::default());
+            let id = register.register();
+            let read = runner.read_from_router(
+                reader,
+                "127.0.0.1:12345".parse().unwrap(),
+                id,
+                register.clone(),
+                Arc::default(),
+                Arc::default(),
+            );
+            tokio::pin!(read);
+            tokio::select! {
+                _ = &mut read => panic!("default must not renew a quiet transport"),
+                _ = tokio::time::sleep(Duration::from_secs(8 * 86400)) => {}
+            }
+            // Ordinary disconnect still ends monitoring with no timer configured.
+            drop(writer);
+            timeout(Duration::from_secs(1), read).await.unwrap();
+            assert_eq!(
+                register.get(id).unwrap().state,
+                Some(IngressState::Disconnected)
+            );
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn reconciliation_closes_idle_and_partial_transports() {

@@ -27,6 +27,17 @@ Released yyyy-mm-dd.
 
 ### New
 
+* `bmp-tcp-in` recovers inconsistent peer state after an unmatched Peer Down,
+  a possible unnumbered-peer replacement, or the peer-state capacity limit by
+  renewing the affected speaker's BMP connection and replaying its snapshot.
+  This addresses stale peer retention described in issue #11 without guessing
+  which same-router-ID peer to delete. The `reconciliation` configuration
+  controls cooldown, startup grace, capacity, and optional periodic renewal.
+  Periodic renewal is disabled by default (`interval_secs = 0`).
+  Recovery temporarily withdraws the speaker's monitored routes and incurs a
+  full-table replay; it does not reset the router's BGP sessions. Exporters
+  must reconnect and provide current state. See [BMP input](docs/bmp-tcp-in.md).
+
 * `netom-cli show ip bgp detail` (and `show ipv6 bgp detail`) prints every
   attribute of each path: peer and AS, how it was learned (ingress, BMP,
   pre/post-policy, ADD-PATH path id), status and RPKI, origin, AS path,

@@ -115,6 +115,7 @@ class Exporter:
             if data:
                 raise RuntimeError("collector unexpectedly sent BMP data")
         except ConnectionResetError:
+            # A TCP reset is an expected successful reconciliation outcome.
             pass
         except socket.timeout as error:
             raise RuntimeError("collector failed to reconcile") from error
@@ -128,6 +129,7 @@ class Exporter:
         except socket.timeout:
             return
         except ConnectionResetError:
+            # Report resets through the common unexpected-reconnect error below.
             pass
         raise RuntimeError("unexpected reconnect: parallel replay/control must remain connected")
 
@@ -141,8 +143,9 @@ def simulate(binary, scenario, cycles, grace):
     http_port, bmp_port = free_port(), free_port()
     while bmp_port == http_port:
         bmp_port = free_port()
-    # Production defaults stay enabled. Shorten only deadlines for the test.
-    interval = 6 if scenario in {"silent", "partial"} else 120
+    # Only silent/partial recovery opts into periodic renewal. Other scenarios
+    # exercise the production default: anomalies/capacity only.
+    periodic = "interval_secs = 6, " if scenario in {"silent", "partial"} else ""
     limit = 3 if scenario == "limit" else 65536
     with tempfile.TemporaryDirectory(prefix="netom-peer-churn-") as directory:
         directory = Path(directory)
@@ -151,7 +154,7 @@ def simulate(binary, scenario, cycles, grace):
 [units.bmp-in]
 type = "bmp-tcp-in"
 listen = "127.0.0.1:{bmp_port}"
-reconciliation = {{ interval_secs = {interval}, min_session_secs = 1, replay_grace_secs = 1, max_peer_states = {limit} }}
+reconciliation = {{ {periodic}min_session_secs = 1, replay_grace_secs = 1, max_peer_states = {limit} }}
 [units.rib]
 type = "rib"
 sources = ["bmp-in"]
@@ -200,7 +203,9 @@ sources = ["rib"]
                 exporter.connect()
                 wait_until(snapshot, lambda s: s["records"] >= len(exporter.current),
                            5, "initial routes")
-                if scenario in {"matching", "mismatched", "missing"}:
+                if scenario == "healthy":
+                    exporter.expect_open(7)
+                elif scenario in {"matching", "mismatched", "missing"}:
                     for i in range(1, cycles + 1):
                         # Move beyond the replay grace before introducing a new
                         # address. During replay it is deliberately not guessed
@@ -278,7 +283,7 @@ def main():
     parser.add_argument("--binary", type=Path, help="existing netom binary; otherwise build release")
     parser.add_argument("--cycles", type=int, default=5, help="peer replacements (default: 5)")
     parser.add_argument("--grace", type=float, default=10, help="GC wait deadline in seconds (minimum: 4)")
-    scenarios = ["matching", "mismatched", "missing", "parallel", "silent", "partial", "limit"]
+    scenarios = ["healthy", "matching", "mismatched", "missing", "parallel", "silent", "partial", "limit"]
     parser.add_argument("--scenario", choices=["all"] + scenarios, default="all")
     args = parser.parse_args()
     if args.cycles < 1 or not 4 <= args.grace < float("inf"):

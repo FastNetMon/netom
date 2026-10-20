@@ -97,20 +97,23 @@ The exporter keeps an independent list of actually established peers. After a
 collector-initiated disconnect, it reconnects and replays only those peers and
 their routes, including End-of-RIB. Retired identities are not replayed.
 
-Seven scenarios run by default; select one with `--scenario NAME`:
+Eight scenarios run by default; select one with `--scenario NAME`:
 
+- `healthy`: an idle established peer stays connected with periodic renewal off.
 - `matching`: correctly addressed Peer Down, ordinary cleanup control.
 - `mismatched`: Peer Down with `::`, then a new link-local peer address.
 - `missing`: a new peer address with no preceding Peer Down.
 - `parallel`: legitimate parallel peers coexist in startup; adding another
   later causes one reconciliation, and all three survive the new snapshot
   beyond its startup window without another anomaly reset.
-- `silent`: a peer vanishes without any further BMP message; periodic renewal
+- `silent`: a peer vanishes without any further BMP message; opt-in periodic renewal
   removes it after the authoritative empty replay.
 - `partial`: the same disappearance with a stalled, incomplete BMP frame.
 - `limit`: startup churn reaches the peer-state cap; reconnect restores the
   sole actually established peer.
 
+Only `silent` and `partial` enable a periodic timer. Other scenarios leave
+`interval_secs` unspecified to exercise the production default of no timer.
 The script shortens reconciliation timings in the test configuration and GC
 intervals in the test daemon's environment. It verifies current peer addresses,
 retained peer entries and route records after GC, then checks complete cleanup
@@ -125,13 +128,27 @@ Rust regressions are part of the normal suite:
 cargo test --lib units::bmp_tcp_in
 ```
 
-They cover deadline coalescing, startup replay, periodic jitter, capacity,
+They cover default transports staying open past eight simulated days,
+deadline coalescing, startup replay, opt-in periodic jitter, capacity,
 configuration validation, peer identity scopes, policy/ADD-PATH teardown,
 idle/partial transport cancellation, and active-connector redial. Live network
 tests require permission to bind loopback sockets.
 
 See [automatic reconciliation](docs/bmp-tcp-in.md#automatic-reconciliation-and-stale-peer-retention)
 for the RFC 7854 references, defaults, and monitoring-gap/replay caveat.
+
+Validation on 2026-10-20 (periodic renewal opt-in):
+
+- `cargo test --locked --lib units::bmp_tcp_in`: 65 passed, 16 ignored.
+- `cargo build --locked --bin netom`: passed with existing deprecation and
+  unused `set_rib` warnings.
+- `python3 scripts/bmp-peer-churn.py --binary target/debug/netom --cycles 20`:
+  all eight scenarios passed. The healthy and matching-Peer-Down scenarios
+  required only their initial snapshot; matching cleanup reclaimed all retired
+  identities without a BMP reconnect. Anomaly and capacity cases recovered with
+  periodic renewal off. Silent and partial cases recovered with it opted in.
+- Changed Rust files passed rustfmt checks; Python syntax and
+  `git diff --check` passed.
 
 Validation on 2026-10-02 (implementation `0ec9bd6`, regressions `a816a12`):
 

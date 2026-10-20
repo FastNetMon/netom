@@ -18,7 +18,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            interval_secs: 6 * 60 * 60,
+            // Zero disables periodic renewal; anomaly/capacity recovery stays active.
+            interval_secs: 0,
             min_session_secs: 60,
             replay_grace_secs: 5 * 60,
             max_peer_states: 65_536,
@@ -52,11 +53,13 @@ impl TryFrom<ConfigValues> for Config {
     fn try_from(c: ConfigValues) -> Result<Self, Self::Error> {
         if c.min_session_secs == 0
             || c.min_session_secs > c.replay_grace_secs
-            || c.replay_grace_secs >= c.interval_secs
+            || c.replay_grace_secs >= 7 * 24 * 60 * 60
+            || (c.interval_secs != 0
+                && c.replay_grace_secs >= c.interval_secs)
             || c.interval_secs > 7 * 24 * 60 * 60
             || c.max_peer_states == 0
         {
-            return Err("BMP reconciliation requires 0 < min_session_secs <= replay_grace_secs < interval_secs <= 604800 and max_peer_states > 0");
+            return Err("BMP reconciliation requires 0 < min_session_secs <= replay_grace_secs < 604800, max_peer_states > 0, and interval_secs = 0 (periodic renewal disabled) or replay_grace_secs < interval_secs <= 604800");
         }
         Ok(Self {
             interval_secs: c.interval_secs,
@@ -91,7 +94,7 @@ impl std::fmt::Display for Reason {
 pub struct Reconciliation {
     config: Config,
     started: Instant,
-    deadline: Instant,
+    deadline: Option<Instant>,
     reason: Reason,
 }
 
@@ -102,8 +105,9 @@ impl Reconciliation {
         Self {
             config,
             started: now,
-            deadline: now
-                + Duration::from_secs(config.interval_secs + jitter),
+            deadline: (config.interval_secs != 0).then(|| {
+                now + Duration::from_secs(config.interval_secs + jitter)
+            }),
             reason: Reason::Periodic,
         }
     }
@@ -116,7 +120,7 @@ impl Reconciliation {
     ) {
         if peer_states >= self.config.max_peer_states {
             // Capacity takes precedence over the minimum session lifetime.
-            self.deadline = now;
+            self.deadline = Some(now);
             self.reason = Reason::PeerStateLimit;
             return;
         }
@@ -134,13 +138,13 @@ impl Reconciliation {
         let deadline = now.max(
             self.started + Duration::from_secs(self.config.min_session_secs),
         );
-        if deadline < self.deadline {
-            self.deadline = deadline;
+        if self.deadline.is_none_or(|pending| deadline < pending) {
+            self.deadline = Some(deadline);
             self.reason = reason;
         }
     }
 
-    pub fn deadline(&self) -> Instant {
+    pub fn deadline(&self) -> Option<Instant> {
         self.deadline
     }
     pub fn reason(&self) -> Reason {
@@ -162,6 +166,40 @@ mod tests {
     }
 
     #[test]
+    fn default_has_no_timer_but_anomalies_and_capacity_still_recover() {
+        let now = Instant::now();
+        let mut p = Reconciliation::new(Config::default(), now, u64::MAX);
+        p.observe(now + Duration::from_secs(30 * 86400), None, 1);
+        assert_eq!(p.deadline(), None);
+
+        for reason in [Reason::UnmatchedPeerDown, Reason::PossibleReplacement]
+        {
+            let mut p = Reconciliation::new(Config::default(), now, 0);
+            if reason == Reason::PossibleReplacement {
+                p.observe(now, Some(reason), 2);
+                assert_eq!(p.deadline(), None, "startup peers must coexist");
+            }
+            let observed = now + Duration::from_secs(300);
+            p.observe(observed, Some(reason), 2);
+            assert_eq!(p.deadline(), Some(observed));
+            assert_eq!(p.reason(), reason);
+        }
+
+        let mut p = Reconciliation::new(Config::default(), now, 0);
+        p.observe(now, Some(Reason::UnmatchedPeerDown), 1);
+        assert_eq!(p.deadline(), Some(now + Duration::from_secs(60)));
+        p.observe(
+            now + Duration::from_secs(1),
+            Some(Reason::UnmatchedPeerDown),
+            1,
+        );
+        assert_eq!(p.deadline(), Some(now + Duration::from_secs(60)));
+        p.observe(now, None, 65_536);
+        assert_eq!(p.deadline(), Some(now), "capacity overrides cooldown");
+        assert_eq!(p.reason(), Reason::PeerStateLimit);
+    }
+
+    #[test]
     fn startup_parallel_peers_do_not_cause_a_reconnect_loop() {
         let now = Instant::now();
         // Repeat the same authoritative replay over successive connections.
@@ -178,7 +216,7 @@ mod tests {
                 Some(Reason::PossibleReplacement),
                 3,
             );
-            assert_eq!(p.deadline(), start + Duration::from_secs(100));
+            assert_eq!(p.deadline(), Some(start + Duration::from_secs(100)));
             assert_eq!(p.reason(), Reason::Periodic);
         }
     }
@@ -188,14 +226,14 @@ mod tests {
         let now = Instant::now();
         let mut p = Reconciliation::new(config(), now, 0);
         p.observe(now, Some(Reason::UnmatchedPeerDown), 1);
-        assert_eq!(p.deadline(), now + Duration::from_secs(5));
+        assert_eq!(p.deadline(), Some(now + Duration::from_secs(5)));
         for second in 1..5 {
             p.observe(
                 now + Duration::from_secs(second),
                 Some(Reason::UnmatchedPeerDown),
                 1,
             );
-            assert_eq!(p.deadline(), now + Duration::from_secs(5));
+            assert_eq!(p.deadline(), Some(now + Duration::from_secs(5)));
         }
         assert_eq!(p.reason(), Reason::UnmatchedPeerDown);
     }
@@ -206,7 +244,7 @@ mod tests {
         let mut p = Reconciliation::new(config(), now, 0);
         let after_replay = now + Duration::from_secs(10);
         p.observe(after_replay, Some(Reason::PossibleReplacement), 2);
-        assert_eq!(p.deadline(), after_replay);
+        assert_eq!(p.deadline(), Some(after_replay));
         assert_eq!(p.reason(), Reason::PossibleReplacement);
     }
 
@@ -215,31 +253,41 @@ mod tests {
         let now = Instant::now();
         for seed in [0, 1, 9, 10, 11, u64::MAX] {
             let mut p = Reconciliation::new(config(), now, seed);
-            assert!(p.deadline() >= now + Duration::from_secs(100));
-            assert!(p.deadline() <= now + Duration::from_secs(110));
+            assert!(p.deadline().unwrap() >= now + Duration::from_secs(100));
+            assert!(p.deadline().unwrap() <= now + Duration::from_secs(110));
             p.observe(now, None, 8);
-            assert_eq!(p.deadline(), now);
+            assert_eq!(p.deadline(), Some(now));
             assert_eq!(p.reason(), Reason::PeerStateLimit);
         }
     }
 
     #[test]
-    fn configuration_cannot_disable_reconciliation() {
+    fn configuration_allows_optional_periodic_renewal() {
         #[derive(Deserialize)]
         struct Wrapper {
             reconciliation: Config,
         }
         let defaults: Wrapper = toml::from_str("[reconciliation]").unwrap();
-        assert_eq!(defaults.reconciliation.interval_secs, 21600);
+        assert_eq!(defaults.reconciliation.interval_secs, 0);
         for fields in [
             "interval_secs = 0",
+            "interval_secs = 21600",
+            "interval_secs = 604800",
+        ] {
+            assert!(toml::from_str::<Wrapper>(&format!(
+                "[reconciliation]\n{fields}"
+            ))
+            .is_ok());
+        }
+        for fields in [
             "interval_secs = 604801",
             "min_session_secs = 0",
             "replay_grace_secs = 0",
             "max_peer_states = 0",
             "enabled = false",
             "min_session_secs = 301",
-            "replay_grace_secs = 21600",
+            "replay_grace_secs = 604800",
+            "interval_secs = 300",
         ] {
             assert!(
                 toml::from_str::<Wrapper>(&format!(

@@ -61,8 +61,9 @@ connection. Listening address changes preserve existing accepted connections.
 
 ## Automatic reconciliation and stale-peer retention
 
-Reconciliation is enabled for every BMP input, for both `listen` and `connect`.
-No opt-in is needed. The former experimental `recover_unnumbered_peers` heuristic
+Anomaly and capacity recovery are enabled for every BMP input, for both `listen`
+and `connect`. Periodic renewal is disabled by default. The former experimental
+`recover_unnumbered_peers` heuristic
 has been replaced: Netom does not infer that a shared BGP identifier authorizes
 it to delete another peer.
 
@@ -71,6 +72,11 @@ Peer Up. [Issue #11](https://github.com/FastNetMon/netom/issues/11) describes FR
 reporting `::` after losing an unnumbered peer's old link-local address. The
 collector otherwise retains that peer as connected, including all of its routes.
 GC cannot reclaim state that still appears live.
+
+The exporter should preserve the established session's identity through teardown
+and send Peer Down with the same peer address used for Peer Up. Correctly addressed
+Peer Down notifications use ordinary per-peer cleanup without restarting BMP.
+Reconciliation is a fallback for inconsistent observations, not an exporter fix.
 
 Netom repairs the observation by closing **that speaker's BMP transport** and
 rebuilding from a fresh snapshot on reconnection. It uses normal disconnect
@@ -94,7 +100,7 @@ Refresh triggers and default bounds:
 | Accepted Peer Down cannot match a logical peer (ignoring policy flags) | Schedule reconciliation, no earlier than 60 seconds after connection start. Repeated anomalies do not postpone it. |
 | A new link-local address has the same ASN, BGP identifier, peer type and distinguisher as an existing link-local peer | After the startup window, reconcile the whole speaker; do not guess which session is obsolete. |
 | Peer Ups arrive within the first 300 seconds | Accept parallel identities as part of startup/replay. Possible-replacement detection is suppressed; unmatched Peer Down and capacity protection still apply. |
-| No detectable anomaly, including a completely silent connection | Renew every 6 hours, plus independently selected 0–10% jitter. This bounds the age of an unreconciled observation. |
+| No detectable anomaly, including a completely silent connection | Keep the connection open by default. If `interval_secs` is nonzero, renew after that interval plus independently selected 0–10% jitter. |
 | The connection reaches 65,536 FSM peer states, including policy views | Close immediately, even within the minimum session lifetime. This is a per-connection peer-state limit, **not a total process-memory or route-count limit**. |
 
 The first anomaly after the minimum lifetime can close the connection immediately.
@@ -104,20 +110,23 @@ parallel sessions in an ordinary fresh snapshot survive. A timer also interrupts
 an idle transport or a partial BMP frame; a cancelled partial read is discarded
 with its transport and is never resumed.
 
-The defaults can be tuned without disabling reconciliation:
+Default settings (anomaly/capacity recovery without periodic renewal):
 
 ```toml
 [units.bmp-in]
 type = "bmp-tcp-in"
 listen = "0.0.0.0:11019"
-reconciliation = { interval_secs = 21600, min_session_secs = 60, replay_grace_secs = 300, max_peer_states = 65536 }
+reconciliation = { interval_secs = 0, min_session_secs = 60, replay_grace_secs = 300, max_peer_states = 65536 }
 ```
 
-Validation requires `0 < min_session_secs <= replay_grace_secs < interval_secs
-<= 604800` and `max_peer_states > 0`. The maximum interval is seven days before
-jitter. Changes take effect on the next BMP connection. Unmatched messages
-rejected by a Roto filter do not trigger anomaly reconciliation; periodic and
-capacity guards remain active.
+To opt into a periodic snapshot every six hours plus jitter, set
+`interval_secs = 21600`. Setting it to `0` disables only periodic renewal.
+Validation requires `0 < min_session_secs <= replay_grace_secs < 604800` and
+`max_peer_states > 0`. A nonzero interval must satisfy
+`replay_grace_secs < interval_secs <= 604800` (seven days before jitter).
+Changes take effect on the next BMP connection. Unmatched messages rejected by
+a Roto filter do not trigger anomaly reconciliation; capacity protection and
+any configured periodic timer remain active.
 
 ### Operational caveat
 
@@ -132,9 +141,14 @@ For passive inputs, the exporter must reconnect. For active inputs, Netom's
 normal retry/backoff reconnects. Replay depends on the exporter supplying a
 current snapshot; an incremental-only exporter cannot restore missing routes,
 and an exporter that replays obsolete peers cannot be corrected by reconciliation.
-No timeout can distinguish an idle live peer from a dead peer whose Peer Down
-was never sent, so Netom never deletes a peer merely for having no updates.
-A missed disappearance during startup may remain visible until periodic renewal.
+Without an independently configured liveness expectation, silence cannot
+distinguish an idle live peer from a dead peer whose Peer Down was never sent.
+Netom never deletes a peer merely for having no updates. BMP statistics reports
+can provide per-peer activity evidence, but are optional and have no negotiated
+heartbeat interval. This implementation does not infer peer expiry from missing
+statistics. A silent disappearance, including one missed during startup, may
+remain visible until a later anomaly, disconnect, or explicitly enabled periodic
+renewal obtains a new snapshot.
 
 The startup window is a conservative time allowance, not proof that replay has
 finished. Size it for exporters with slow or very large initial dumps; parallel
