@@ -663,6 +663,35 @@ fn cli_filters_and_invalid_input() {
     assert!(!String::from_utf8_lossy(&out.stderr).contains("panicked"));
 }
 #[test]
+fn verbose_capture_dates() {
+    for (ns, expected) in [
+        (
+            json!(1791177729333856618i64),
+            "2026-10-05T05:22:09.333856618Z",
+        ),
+        (json!(0), "1970-01-01T00:00:00.000000000Z"),
+        (json!(-1), "1969-12-31T23:59:59.999999999Z"),
+        (
+            json!(951782400000000000i64),
+            "2000-02-29T00:00:00.000000000Z",
+        ),
+        (Value::Null, "unknown-time"),
+        (
+            json!(253402300800000000000i128),
+            "epoch:253402300800.000000000",
+        ),
+    ] {
+        let rendered = bmpdump::display::display_message(
+            &json!({"name":"initiation","frame":1,"timestamp_ns":ns}),
+            1,
+            Default::default(),
+        );
+        assert!(rendered.contains("Capture time:"));
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+}
+
+#[test]
 fn cli_colors_pipes_and_json() {
     let raw = pcap(&[ethernet(&bmp(4, &[]))], true, false);
     for args in [

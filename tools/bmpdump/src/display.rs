@@ -92,7 +92,7 @@ fn strv(v: &Value) -> &str {
 fn join(v: &Value, sep: &str) -> String {
     array(v).iter().map(text).collect::<Vec<_>>().join(sep)
 }
-fn timestamp(ns: &Value) -> String {
+fn timestamp(ns: &Value, full: bool) -> String {
     let Ok(ns) = ns.to_string().parse::<i128>() else {
         return "unknown-time".into();
     };
@@ -100,6 +100,12 @@ fn timestamp(ns: &Value) -> String {
         (ns.div_euclid(1_000_000_000), ns.rem_euclid(1_000_000_000));
     if !(-62_135_596_800..=253_402_300_799).contains(&seconds) {
         return format!("epoch:{seconds}.{nanos:09}");
+    }
+    if full {
+        let date =
+            chrono::DateTime::from_timestamp(seconds as i64, nanos as u32)
+                .expect("timestamp is within years 1 through 9999");
+        return date.format("%Y-%m-%dT%H:%M:%S%.9fZ").to_string();
     }
     let seconds = seconds.rem_euclid(86400);
     format!(
@@ -557,17 +563,18 @@ fn verbose(message: &Value, colors: Palette) -> String {
         .collect::<Vec<_>>()
         .join(" ");
     b.line(
-        &format!(
-            "{}  Frame {}  BMP {title}",
-            timestamp(&message["timestamp_ns"]),
-            message["frame"]
-        ),
+        &format!("Frame {}  BMP {title}", message["frame"]),
         0,
         if message["type"] == 2 {
             "withdraw"
         } else {
             "heading"
         },
+    );
+    b.field_text(
+        "Capture time",
+        &timestamp(&message["timestamp_ns"], true),
+        2,
     );
     b.field_text("Exporter", &endpoint(&message["source"]), 2);
     b.field_text("Collector", &endpoint(&message["destination"]), 2);
@@ -728,7 +735,7 @@ pub fn display_message(
     }
     let name = strv(&message["name"]);
     let mut parts = vec![
-        timestamp(&message["timestamp_ns"]),
+        timestamp(&message["timestamp_ns"], false),
         format!("#{}", message["frame"]),
         endpoint(&message["source"]),
         ">".into(),

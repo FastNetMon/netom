@@ -61,9 +61,11 @@ reassembles split messages and separates coalesced messages. `-c` counts
 messages after filtering. Filters select complete messages, including any
 other routes in the same matching message.
 
-Times are UTC. The frame number and timestamp identify the packet that
-completed reassembly; the BMP peer timestamp remains available separately
-in JSON. Untimestamped PCAPNG Simple Packet Blocks display `unknown-time`.
+Times are UTC. Verbose output labels the full date and time as `Capture time`;
+compact output shows the time of day. The frame number and capture timestamp
+identify the packet that completed reassembly; the BMP peer timestamp remains
+available separately in JSON. Untimestamped PCAPNG Simple Packet Blocks display
+`unknown-time`.
 
 ## Readable output and colors
 
