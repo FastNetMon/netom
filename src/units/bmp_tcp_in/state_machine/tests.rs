@@ -2144,6 +2144,148 @@ fn route_attribute_changes() {
     //    BGP protocol."
 }
 
+#[test]
+fn reconciliation_detects_inconsistency_without_retiring_parallel_peers() {
+    use crate::ingress::register::{IngressState, IngressType};
+    use crate::units::bmp_tcp_in::reconciliation::Reason;
+    let register = Arc::default();
+    let mut state = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state;
+    let mut first = mk_per_peer_header("fe80::1", 65001);
+    first.peer_flags = 0x80;
+    state = state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_peer_up_notification_msg(&first),
+            None,
+        )
+        .next_state;
+    state = state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&first, &[1, 2]),
+            None,
+        )
+        .next_state;
+    let mut post = mk_per_peer_header("fe80::1", 65001);
+    post.peer_flags = 0xc0;
+    let policy_up = mk_peer_up_notification_msg(&post, false).0;
+    assert_eq!(state.reconciliation_reason(&policy_up), None);
+    state = state
+        .process_msg(
+            Instant::now(),
+            mk_addpath_v4_route_monitoring_msg(&post, &[3]),
+            None,
+        )
+        .next_state;
+    let mut replacement = mk_per_peer_header("fe80::2", 65001);
+    replacement.peer_flags = 0x80;
+    let up = mk_peer_up_notification_msg(&replacement, false).0;
+    assert_eq!(
+        state.reconciliation_reason(&up),
+        Some(Reason::PossibleReplacement)
+    );
+    // Detection must not disconnect either identity or its policy/path children.
+    state = state
+        .process_msg(Instant::now(), up.clone(), None)
+        .next_state;
+    assert_eq!(state.peer_state_count(), 3);
+    assert_eq!(state.reconciliation_reason(&up), None);
+    let peers: Vec<_> = register
+        .cloned_info()
+        .into_iter()
+        .filter(|(_, i)| {
+            matches!(
+                i.ingress_type,
+                Some(IngressType::BgpViaBmp | IngressType::BgpPath)
+            )
+        })
+        .collect();
+    assert_eq!(peers.len(), 6);
+    assert!(peers
+        .iter()
+        .all(|(_, i)| i.state == Some(IngressState::Connected)));
+    let mut down = mk_per_peer_header("::", 65001);
+    down.peer_flags = 0x80;
+    assert_eq!(
+        state.reconciliation_reason(&mk_peer_down_notification_msg(&down)),
+        Some(Reason::UnmatchedPeerDown)
+    );
+    assert_eq!(
+        state.reconciliation_reason(&mk_peer_down_notification_msg(&post)),
+        None
+    );
+    let BmpState::Dumping(inner) = state else {
+        panic!("expected dumping")
+    };
+    let state = BmpState::Updating(inner.into());
+    assert_eq!(
+        state.reconciliation_reason(&mk_peer_down_notification_msg(&down)),
+        Some(Reason::UnmatchedPeerDown)
+    );
+    let withdrawn = state.disconnect_into_register(&register);
+    let ids: std::collections::HashSet<_> =
+        withdrawn.iter().map(|(id, _)| *id).collect();
+    assert_eq!(ids, peers.iter().map(|(id, _)| *id).collect());
+    assert!(peers.iter().all(|(id, _)| register.get(*id).unwrap().state
+        == Some(IngressState::Disconnected)));
+    // A new speaker/snapshot has no knowledge of the old peers, even with a shared register.
+    let fresh = mk_test_processor_with_register(&register)
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg("other", TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state;
+    assert_eq!(fresh.reconciliation_reason(&up), None);
+}
+
+#[test]
+fn reconciliation_does_not_conflate_peer_scopes() {
+    let mut first = mk_per_peer_header("fe80::1", 65001);
+    first.peer_flags = 0x80;
+    let state = mk_test_processor()
+        .process_msg(
+            Instant::now(),
+            mk_initiation_msg(TEST_ROUTER_SYS_NAME, TEST_ROUTER_SYS_DESC),
+            None,
+        )
+        .next_state
+        .process_msg(
+            Instant::now(),
+            mk_peer_up_notification_msg(&first, false).0,
+            None,
+        )
+        .next_state;
+    for case in 0..5 {
+        let mut next = mk_per_peer_header("fe80::2", 65001);
+        next.peer_flags = 0x80;
+        match case {
+            0 => next.peer_as = Asn::from_u32(65002),
+            1 => next.peer_bgp_id = [4, 3, 2, 1],
+            2 => next.peer_distinguisher = [1; 8],
+            3 => {
+                next.peer_type =
+                    routecore::bmp::message::PeerType::RdInstance.into()
+            }
+            4 => next.peer_address = "2001:db8::1".parse().unwrap(),
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            state.reconciliation_reason(
+                &mk_peer_up_notification_msg(&next, false).0
+            ),
+            None,
+            "case {case}"
+        );
+    }
+}
+
 // --- Test helpers -----------------------------------------------------------------------------------------------
 
 // RFC 4724 Graceful Restart Mechanism for BGP
@@ -2176,7 +2318,13 @@ fn mk_peer_up_notification_msg(
 ) -> (BmpMsg<Bytes>, PerPeerHeader<Bytes>) {
     let bytes = crate::bgp::encode::mk_peer_up_notification_msg(
         pph,
-        "10.0.0.1".parse().unwrap(),
+        (if pph.peer_flags & 0x80 != 0 {
+            "fe80::ffff"
+        } else {
+            "10.0.0.1"
+        })
+        .parse()
+        .unwrap(),
         11019,
         4567,
         111,
@@ -2332,7 +2480,13 @@ fn mk_addpath_peer_up_notification_msg(
     let bytes =
         crate::bgp::encode::mk_peer_up_notification_msg_with_capabilities(
             pph,
-            "10.0.0.1".parse().unwrap(),
+            (if pph.peer_flags & 0x80 != 0 {
+                "fe80::ffff"
+            } else {
+                "10.0.0.1"
+            })
+            .parse()
+            .unwrap(),
             11019,
             4567,
             111,

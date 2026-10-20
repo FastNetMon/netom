@@ -285,6 +285,55 @@ where
 }
 
 impl BmpState {
+    pub(in crate::units::bmp_tcp_in) fn peer_states(
+        &self,
+    ) -> Option<&PeerStates> {
+        match self {
+            Self::Dumping(s) => Some(&s.details.peer_states),
+            Self::Updating(s) => Some(&s.details.peer_states),
+            _ => None,
+        }
+    }
+
+    pub(in crate::units::bmp_tcp_in) fn peer_state_count(&self) -> usize {
+        self.peer_states().map_or(0, |p| p.0.len())
+    }
+
+    /// Evidence to refresh the speaker's snapshot, never authority to
+    /// delete a guessed peer. Policy siblings share a logical identity.
+    pub(in crate::units::bmp_tcp_in) fn reconciliation_reason(
+        &self,
+        msg: &BmpMsg<Bytes>,
+    ) -> Option<super::super::reconciliation::Reason> {
+        use super::super::reconciliation::Reason;
+        let peers = self.peer_states()?;
+        let pph = match msg {
+            BmpMsg::PeerDownNotification(m) => m.per_peer_header(),
+            BmpMsg::PeerUpNotification(m) => m.per_peer_header(),
+            _ => return None,
+        };
+        let identity = |k: &PerPeerHeader<Bytes>| {
+            k.peer_type() == pph.peer_type()
+                && k.distinguisher() == pph.distinguisher()
+                && k.asn() == pph.asn()
+                && k.bgp_id() == pph.bgp_id()
+        };
+        let exact = peers
+            .0
+            .keys()
+            .any(|k| identity(k) && k.address() == pph.address());
+        match msg {
+            BmpMsg::PeerDownNotification(_) if !exact => Some(Reason::UnmatchedPeerDown),
+            BmpMsg::PeerUpNotification(_) if !exact
+                && matches!(pph.address(), IpAddr::V6(a) if a.is_unicast_link_local())
+                && peers.0.keys().any(|k| identity(k)
+                    && matches!(k.address(), IpAddr::V6(a) if a.is_unicast_link_local())) => {
+                Some(Reason::PossibleReplacement)
+            }
+            _ => None,
+        }
+    }
+
     pub fn ingress_id(&self) -> ingress::IngressId {
         match self {
             BmpState::Initiating(v) => v.ingress_id,
