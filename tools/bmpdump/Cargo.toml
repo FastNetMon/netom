@@ -1,0 +1,20 @@
+[package]
+name = "netom-bmpdump"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+authors.workspace = true
+license = "MPL-2.0"
+description = "Offline BMP, BGP and EVPN capture decoder for Netom"
+repository = "https://github.com/FastNetMon/netom/"
+readme = "README.md"
+
+[lib]
+name = "bmpdump"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.6", features = ["derive"] }
+serde_json = { version = "1.0", features = ["arbitrary_precision", "preserve_order"] }
+terminal_size = "0.4"

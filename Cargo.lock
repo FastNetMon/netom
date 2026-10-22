@@ -1594,7 +1594,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tokio",
  "tower-service",
  "tracing",
@@ -2122,7 +2122,7 @@ dependencies = [
 
 [[package]]
 name = "netom"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "allocator-api2",
  "anyhow",
@@ -2196,6 +2196,17 @@ dependencies = [
  "tower-http 0.5.2",
  "uuid",
  "webpki-roots",
+]
+
+[[package]]
+name = "netom-bmpdump"
+version = "0.6.1"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde_json",
+ "terminal_size",
 ]
 
 [[package]]
@@ -2533,7 +2544,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -2573,7 +2584,7 @@ dependencies = [
  "once_cell",
  "socket2 0.6.3",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3089,7 +3100,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3517,6 +3528,16 @@ dependencies = [
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "terminal_size"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "45c6481c4829e4cc63825e62c49186a34538b7b2750b73b266581ffb612fb5ed"
+dependencies = [
+ "rustix",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -27,6 +27,11 @@ Released yyyy-mm-dd.
 
 ### New
 
+* Added `netom-bmpdump`, an offline BMP/BGP/EVPN decoder for PCAP and PCAPNG
+  captures, with TCP reassembly, readable/colorized output, filters, and
+  JSON export. The standalone workspace package is included in the
+  DEB/RPM packages and runtime images.
+
 * `netom-cli show ip bgp detail` (and `show ipv6 bgp detail`) prints every
   attribute of each path: peer and AS, how it was learned (ingress, BMP,
   pre/post-policy, ADD-PATH path id), status and RPKI, origin, AS path,

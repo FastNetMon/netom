@@ -1,0 +1,103 @@
+.TH "netom\-bmpdump" "1" "FastNetMon Inc"
+.SH NAME
+netom\-bmpdump \- offline BMP, BGP and EVPN capture decoder
+.SH SYNOPSIS
+.B netom\-bmpdump
+.BI \-r " FILE"
+[options]
+.SH DESCRIPTION
+Reads PCAP or PCAPNG captures, reassembles TCP streams, and displays BMP
+messages and their BGP/EVPN contents. It runs without a Netom daemon,
+TShark, Python, or root privileges.
+.PP
+Each output record represents one BMP message. Multiple messages in one
+packet are separated and split messages are reassembled.
+.SH OPTIONS
+.TP
+.BI \-r " FILE" "\fR, \fB\-\-read " FILE
+Read a capture. Use a dash for standard input.
+.TP
+.BI \-p " PORT" "\fR, \fB\-\-port " PORT
+Select a BMP TCP port. Repeat to select multiple ports.
+Replaces the default ports 11019 and 1790.
+.TP
+.BI \-c " COUNT" "\fR, \fB\-\-count " COUNT
+Stop after this many matching BMP messages.
+.TP
+.B \-v\fR, \fB\-\-verbose
+Print readable message blocks with every route.
+Use \fB\-vv\fR to also print the complete decoded JSON.
+.TP
+.B \-n
+Numeric addresses, which are always enabled.
+.TP
+.B \-j\fR, \fB\-\-json
+Print newline-delimited JSON. JSON output never contains ANSI colors.
+.TP
+.B \-\-summary
+Only print aggregate counts. Combine with \fB\-\-json\fR for a JSON summary.
+.TP
+.BI \-\-color " auto|always|never"
+Control ANSI colors. The default, auto, requires a recognized color terminal
+and honors NO_COLOR. Always explicitly overrides automatic detection.
+.TP
+.BI \-\-router " ADDRESS"
+Filter by the BMP exporter's source IP address.
+.TP
+.BI \-\-peer " ADDRESS"
+Filter by the monitored BGP peer's IP address.
+.TP
+.BI \-\-type " TYPE"
+Filter by route-monitoring, statistics, peer-down, peer-up, initiation,
+termination, or route-mirroring.
+.TP
+.B \-\-evpn
+Only messages containing EVPN NLRI.
+.TP
+.BI \-\-route-type " 1|2|3|4|5"
+Only messages containing this EVPN route type.
+.TP
+.B \-\-add-path
+Force ADD-PATH for supported families when Peer Up negotiation is missing.
+Use only when those families are known to use ADD-PATH.
+.TP
+.B \-h\fR, \fB\-\-help
+Show command help.
+.TP
+.B \-V\fR, \fB\-\-version
+Show the Netom release version.
+.SH EXAMPLES
+.nf
+netom-bmpdump -r capture.pcapng --evpn -v
+netom-bmpdump -r capture.pcapng --route-type 5 -j
+netom-bmpdump -r capture.pcapng --summary
+netom-bmpdump -r capture.pcapng -v --color always | less -R
+.fi
+.SH EXIT STATUS
+0: clean completion.
+.br
+2: read/decode errors or diagnostics; partial output may still be useful.
+.br
+130: interrupted.
+.SH LIMITATIONS
+IP fragment reassembly, encrypted transport, IPv6 jumbograms, and extended
+BGP OPEN optional-parameter encoding are not implemented. Checksums are not
+validated. Missing TCP data is reported. Unknown protocol fields are
+retained as raw hexadecimal data in JSON.
+.PP
+Capture timestamps use UTC and identify the packet completing reassembly.
+Filters select whole messages, including other routes in a matching message.
+.SH ENVIRONMENT
+.TP
+.B NO_COLOR
+Disable automatic coloring.
+.TP
+.B TERM
+Used for terminal color detection.
+.TP
+.B COLUMNS
+Override the output width, bounded to 60 through 120 columns.
+.SH SEE ALSO
+.BR netom (1),
+.BR netom-cli (1),
+.BR tcpdump (8)
