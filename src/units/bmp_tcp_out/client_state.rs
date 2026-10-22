@@ -13,7 +13,8 @@ use tokio::sync::{mpsc, Notify, RwLock};
 use uuid::Uuid;
 
 use super::bmp_builder::PeerInfo;
-use crate::ingress::IngressId;
+use super::replay::{BufferedUpdate, SnapshotCache};
+use crate::ingress::{register::Register, IngressId};
 use crate::mem_stats;
 use crate::payload::Update;
 
@@ -36,6 +37,7 @@ pub enum BufferUpdateResult {
     Buffered,
     NotDumping,
     Overflow,
+    IdentityUnavailable,
 }
 
 /// State for a single connected BMP consumer client.
@@ -53,7 +55,11 @@ pub struct ClientState {
     pub tx: mpsc::Sender<Vec<u8>>,
 
     /// Buffer for updates received during the initial dump phase.
-    pub dump_buffer: tokio::sync::Mutex<Vec<Update>>,
+    pub(super) dump_buffer: tokio::sync::Mutex<Vec<BufferedUpdate>>,
+    replay_cache: std::sync::Mutex<SnapshotCache>,
+    pub(super) output_order: tokio::sync::Mutex<()>,
+    // High-water marks survive Peer Down so delayed older generations cannot reopen a peer.
+    pub(super) peer_generations: RwLock<HashMap<IngressId, u64>>,
 
     /// Set of peer IngressIds that this client knows about (has received Peer Up for).
     pub known_peers: RwLock<HashSet<IngressId>>,
@@ -126,6 +132,9 @@ impl ClientState {
             phase: RwLock::new(ClientPhase::Dumping),
             tx,
             dump_buffer: tokio::sync::Mutex::new(Vec::new()),
+            replay_cache: Default::default(),
+            output_order: Default::default(),
+            peer_generations: Default::default(),
             known_peers: RwLock::new(HashSet::new()),
             peer_info_cache: RwLock::new(HashMap::new()),
             emit_target_cache: RwLock::new(HashMap::new()),
@@ -152,13 +161,22 @@ impl ClientState {
     pub async fn buffer_update_if_dumping(
         &self,
         update: Update,
+        registry: &Register,
     ) -> BufferUpdateResult {
         let phase = self.phase.read().await;
         if *phase != ClientPhase::Dumping {
             return BufferUpdateResult::NotDumping;
         }
 
-        let upd_bytes = update.shallow_bytes();
+        let Some(identities) =
+            self.replay_cache.lock().unwrap().capture(&update, registry)
+        else {
+            return BufferUpdateResult::IdentityUnavailable;
+        };
+        let upd_bytes = update
+            .shallow_bytes()
+            .saturating_add(identities.bytes())
+            .saturating_add(std::mem::size_of::<BufferedUpdate>());
         let mut buf = self.dump_buffer.lock().await;
         if buf.len() >= self.max_buffer_entries {
             return BufferUpdateResult::Overflow;
@@ -167,7 +185,7 @@ impl ClientState {
         if current_bytes.saturating_add(upd_bytes) > self.max_buffer_bytes {
             return BufferUpdateResult::Overflow;
         }
-        buf.push(update);
+        buf.push(BufferedUpdate { update, identities });
         self.buffered_bytes.fetch_add(upd_bytes, Ordering::Relaxed);
         // Mirror into the process-wide bmp-out accounting (see mem_stats).
         mem_stats::BMP_OUT_BUFFERED_BYTES
@@ -177,7 +195,7 @@ impl ClientState {
     }
 
     /// Take all buffered updates (drain the buffer).
-    pub async fn take_buffered_updates(&self) -> Vec<Update> {
+    pub(super) async fn take_buffered_updates(&self) -> Vec<BufferedUpdate> {
         let mut buf = self.dump_buffer.lock().await;
         let bytes = self.buffered_bytes.swap(0, Ordering::Relaxed);
         let entries = buf.len();

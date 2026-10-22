@@ -21,6 +21,7 @@ use super::{
     bmp_builder::{self, PeerInfo},
     client_state::{ClientPhase, ClientState},
     metrics::BmpTcpOutMetrics,
+    replay::IngressLookup,
     status_reporter::BmpTcpOutStatusReporter,
     unit::FanInPeerDistinguisher,
 };
@@ -41,7 +42,7 @@ const DUMP_AGGREGATOR_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// JSON Admin Label string from its sysName/sysDescr.
 fn resolve_admin_label(
     info: &IngressInfo,
-    ingress_register: &register::Register,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
 ) -> Option<String> {
     if !forward_router_info {
@@ -65,7 +66,7 @@ fn resolve_admin_label(
 /// the same tag regardless of which message type is being built.
 fn build_peer_info_for_emit(
     info: &IngressInfo,
-    ingress_register: &register::Register,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
 ) -> PeerInfo {
@@ -90,7 +91,7 @@ fn build_peer_info_for_emit(
 /// a fresh dump rather than encode a path under a made-up session header.
 async fn resolve_emit_target(
     client: &Arc<ClientState>,
-    ingress_register: &register::Register,
+    ingress_register: &dyn IngressLookup,
     ingress_id: IngressId,
 ) -> Option<(IngressId, Option<u32>)> {
     if let Some(target) = client.cached_emit_target(ingress_id).await {
@@ -215,6 +216,14 @@ pub async fn perform_initial_dump(
         }
 
         client.add_known_peer(ingress_id).await;
+        client
+            .cache_peer_info(ingress_id, Arc::new(peer_info.clone()))
+            .await;
+        client
+            .peer_generations
+            .write()
+            .await
+            .insert(ingress_id, info.history_generation);
         peer_info_map.insert(ingress_id, peer_info);
     }
 
@@ -590,18 +599,17 @@ pub async fn perform_initial_dump(
     ) = match walk_handle.await {
         Ok(tuple) => tuple,
         Err(join_err) => {
-            warn!(
-                "bmp-out dump for {}: RIB walker task failed: {}",
-                client.remote_addr, join_err
-            );
-            (HashMap::new(), HashMap::new(), Ok(0), (0, 0), Vec::new())
+            warn!("bmp-out dump worker failed: {join_err}");
+            client.request_disconnect();
+            client.discard_dump_buffer().await;
+            return false;
         }
     };
     if let Err(e) = walk_result {
-        warn!(
-            "bmp-out dump for {}: stream_prefix_records error: {}",
-            client.remote_addr, e
-        );
+        warn!("bmp-out dump failed: {e}");
+        client.request_disconnect();
+        client.discard_dump_buffer().await;
+        return false;
     }
 
     if client_disconnected {
@@ -752,8 +760,8 @@ pub async fn perform_initial_dump(
             // client's own task is back-pressured).
             if !send_update_to_client(
                 client,
-                &update,
-                ingress_register,
+                &update.update,
+                &update.identities,
                 forward_router_info,
                 fan_in_peer_distinguisher,
                 true,
@@ -780,11 +788,64 @@ pub async fn perform_initial_dump(
 pub async fn send_update_to_client(
     client: &Arc<ClientState>,
     update: &Update,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
 ) -> bool {
+    let _order = client.output_order.lock().await;
+    let mut ids = Vec::new();
+    match update {
+        Update::Single(p) => ids.push(p.ingress_id),
+        Update::Bulk(ps) => ids.extend(ps.iter().map(|p| p.ingress_id)),
+        Update::IngressReappeared(id)
+        | Update::PeerStats { ingress_id: id, .. }
+        | Update::RouteMonitoringRaw { ingress_id: id, .. } => ids.push(*id),
+        _ => {}
+    }
+    let mut checked = std::collections::HashSet::new();
+    for id in ids {
+        if let Some((emit_id, generation)) =
+            ingress_register.session_identity(id)
+        {
+            if !checked.insert(emit_id) {
+                continue;
+            }
+            let previous =
+                client.peer_generations.read().await.get(&emit_id).copied();
+            if previous.is_some_and(|old| old > generation) {
+                client.request_disconnect();
+                return false;
+            }
+            if previous.is_none()
+                && client.peer_generations.read().await.len()
+                    >= super::client_state::INGRESS_CACHE_CAPACITY
+            {
+                client.request_disconnect();
+                return false;
+            }
+            if previous.is_some_and(|old| old != generation) {
+                if !send_peer_down(
+                    client,
+                    emit_id,
+                    None,
+                    ingress_register,
+                    forward_router_info,
+                    fan_in_peer_distinguisher,
+                    blocking,
+                )
+                .await
+                {
+                    return false;
+                }
+            }
+            client
+                .peer_generations
+                .write()
+                .await
+                .insert(emit_id, generation);
+        }
+    }
     match update {
         Update::Single(payload) => {
             send_payload_to_client(
@@ -902,7 +963,7 @@ async fn send_raw_route_monitoring(
     client: &Arc<ClientState>,
     ingress_id: IngressId,
     body: &bytes::Bytes,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
@@ -964,7 +1025,7 @@ async fn send_peer_stats(
     client: &Arc<ClientState>,
     ingress_id: IngressId,
     body: &bytes::Bytes,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
@@ -1007,7 +1068,7 @@ async fn send_peer_stats(
 async fn send_payload_to_client(
     client: &Arc<ClientState>,
     payload: &Payload,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
@@ -1105,7 +1166,7 @@ async fn send_peer_down(
     client: &Arc<ClientState>,
     ingress_id: IngressId,
     snapshot_info: Option<&IngressInfo>,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
@@ -1114,31 +1175,24 @@ async fn send_peer_down(
         return true; // Client doesn't know about this peer, nothing to do
     }
 
-    let fetched = if snapshot_info.is_none() {
-        ingress_register.get(ingress_id)
-    } else {
-        None
-    };
-    let peer_info = match (snapshot_info, fetched.as_ref()) {
-        (Some(info), _) => build_peer_info_for_emit(
-            info,
-            ingress_register,
-            forward_router_info,
-            fan_in_peer_distinguisher,
-        ),
-        (None, Some(info)) => build_peer_info_for_emit(
-            info,
-            ingress_register,
-            forward_router_info,
-            fan_in_peer_distinguisher,
-        ),
-        (None, None) => build_peer_info_for_emit(
-            &IngressInfo::default(),
-            ingress_register,
-            forward_router_info,
-            fan_in_peer_distinguisher,
-        ),
-    };
+    let peer_info =
+        if let Some(cached) = client.cached_peer_info(ingress_id).await {
+            (*cached).clone()
+        } else {
+            let fetched = snapshot_info
+                .cloned()
+                .or_else(|| ingress_register.get(ingress_id));
+            let Some(info) = fetched else {
+                client.request_disconnect();
+                return false;
+            };
+            build_peer_info_for_emit(
+                &info,
+                ingress_register,
+                forward_router_info,
+                fan_in_peer_distinguisher,
+            )
+        };
 
     let msg = bmp_builder::build_peer_down(&peer_info);
     let sent = client.send_message_mode(msg, blocking).await;
@@ -1152,7 +1206,7 @@ async fn send_peer_down(
 async fn send_peer_reappeared(
     client: &Arc<ClientState>,
     ingress_id: IngressId,
-    ingress_register: &Arc<register::Register>,
+    ingress_register: &dyn IngressLookup,
     forward_router_info: bool,
     fan_in_peer_distinguisher: FanInPeerDistinguisher,
     blocking: bool,
