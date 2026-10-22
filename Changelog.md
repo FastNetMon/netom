@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased version
+## 0.6.1
 
-Released yyyy-mm-dd.
+Released 2026-10-22.
 
 
 ### Breaking changes
@@ -160,6 +160,15 @@ Released yyyy-mm-dd.
   `netom_ingress_register_addpath_path_children`.
 
 ### Bug fixes
+
+* Reclaim retired ingress records in batches rather than scanning the entire
+  RIB once per ID. Cleanup fences late writes, releases locks between prefix
+  operations, keeps failed work for retry, and exports progress metrics.
+* Preserve the original session identity in buffered BMP replay across GC and
+  reconnects. Reject older generations and missing identity instead of emitting
+  incorrect peer headers; release buffered metadata when consumers disconnect.
+* Fix concurrent prefix insertion/deletion, withdrawn-ID bitmap updates, and
+  route-count inflation on repeated announcements in the pinned store library.
 
 * `netom-cli show ipv6 bgp` showed `-` as the next hop of every IPv6
   route: the API tags an MP_REACH next hop with its family
