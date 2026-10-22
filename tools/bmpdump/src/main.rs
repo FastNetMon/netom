@@ -19,7 +19,7 @@ fn main() {
             } else {
                 eprintln!(
                     "netom-bmpdump: {}",
-                    bmpdump::display::safe(&error.to_string())
+                    bmpdump::display::safe(&format!("{error:#}"))
                 );
                 2
             }

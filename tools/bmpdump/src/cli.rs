@@ -2,7 +2,7 @@ use crate::capture::{Capture, Flow, tcp_segment};
 use crate::display::{Palette, display_message, safe};
 use crate::protocol::{BMP_NAMES, BmpDecoder, array, bmp_name, hex};
 use crate::stream::Stream;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{ArgAction, Parser, ValueEnum};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -155,7 +155,9 @@ pub fn run(args: &Args) -> Result<i32> {
     let source: Box<dyn Read> = if args.read.as_os_str() == "-" {
         Box::new(io::stdin())
     } else {
-        Box::new(File::open(&args.read)?)
+        Box::new(File::open(&args.read).with_context(|| {
+            format!("cannot open capture '{}'", args.read.display())
+        })?)
     };
     let mut capture = Capture::new(BufReader::new(source))?;
     let mut out = BufWriter::new(io::stdout().lock());
