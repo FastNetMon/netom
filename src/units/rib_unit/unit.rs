@@ -527,7 +527,7 @@ impl RibUnitRunner {
         }
         let rib = self.rib.load().clone();
         if let Err(e) = tokio::task::spawn_blocking(move || {
-            rib.remove_for_ingresses(&ids);
+            rib.retire_for_ingresses(&ids);
         })
         .await
         {
@@ -542,15 +542,16 @@ impl RibUnitRunner {
     /// roaring bitmap atomic and serialises through `withdraw_lock`, so
     /// running it inline on a tokio worker can stall the pipeline while
     /// waiting for the lock and/or while doing the bitmap walk itself.
-    async fn reset_ingress_blocking(&self, ingress_id: ingress::IngressId) {
+    async fn reset_ingress_blocking(
+        &self,
+        ingress_id: ingress::IngressId,
+    ) -> Result<(), String> {
         let rib = self.rib.load().clone();
-        if let Err(e) = tokio::task::spawn_blocking(move || {
-            rib.remove_for_ingresses(&[ingress_id]);
+        tokio::task::spawn_blocking(move || {
+            rib.remove_for_ingresses(&[ingress_id])
         })
         .await
-        {
-            error!("reset ingress blocking task failed: {}", e);
-        }
+        .map_err(|e| format!("reset ingress task failed: {e}"))?
     }
 
     pub async fn run(
@@ -911,7 +912,7 @@ impl RibUnitRunner {
 
             Update::IngressReappeared(ingress_id) => {
                 debug!("Got IngressReappeared for {ingress_id}");
-                self.reset_ingress_blocking(ingress_id).await;
+                self.reset_ingress_blocking(ingress_id).await?;
                 // The register may still carry the Disconnected state set on
                 // teardown. Restore it after dropping the previous session's
                 // retained RIB records.
@@ -1481,8 +1482,9 @@ impl RibUnitRunner {
                                 ingress_id,
                                 route_status,
                             };
-                            self.insert_payload(&p);
-                            res.push(p.clone());
+                            if self.insert_payload(&p) {
+                                res.push(p.clone());
+                            }
                         }
                         roto::Verdict::Reject(_) => {
                             //debug!("roto::Verdict Reject, dropping {p:#?}");
@@ -1500,8 +1502,9 @@ impl RibUnitRunner {
                     }
                 } else {
                     // default action accept
-                    self.insert_payload(&p);
-                    res.push(p.clone());
+                    if self.insert_payload(&p) {
+                        res.push(p.clone());
+                    }
                 }
 
                 let mut output_stream = ctx.output.borrow_mut();
@@ -1533,7 +1536,7 @@ impl RibUnitRunner {
         Ok(())
     }
 
-    pub fn insert_payload(&self, payload: &Payload) {
+    pub fn insert_payload(&self, payload: &Payload) -> bool {
         let rib = self.rib.load();
 
         let pre_insert = std::time::Instant::now();
@@ -1590,6 +1593,7 @@ impl RibUnitRunner {
                     change,
                 );
 
+                return true;
                 // XXX re-introduce sometime later
                 //if let Some(ref roto_function) = self.roto_function_post {
                 //    let mut insertion_info = report.into();
@@ -1606,6 +1610,7 @@ impl RibUnitRunner {
                 self.status_reporter.insert_failed(&payload.rx_value, err);
             }
         }
+        false
     }
 
     fn process_output_stream<const N: usize>(

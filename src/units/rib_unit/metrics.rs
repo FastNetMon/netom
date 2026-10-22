@@ -234,6 +234,47 @@ impl metrics::Source for RibUnitMetrics {
             self.last_update_duration_micros.load(SeqCst),
         );
 
+        if let Some(rib) = self.rib.get().and_then(Weak::upgrade) {
+            let values = rib.load().reclamation_stats();
+            for (metric, value) in [
+                Metric::new(
+                    "rib_gc_pending_ids",
+                    "retired IDs awaiting physical reclamation",
+                    MetricType::Gauge,
+                    MetricUnit::Total,
+                ),
+                Metric::new(
+                    "rib_gc_prefixes_scanned",
+                    "prefixes examined by physical reclamation",
+                    MetricType::Counter,
+                    MetricUnit::Total,
+                ),
+                Metric::new(
+                    "rib_gc_records_removed",
+                    "records physically reclaimed",
+                    MetricType::Counter,
+                    MetricUnit::Total,
+                ),
+                Metric::new(
+                    "rib_gc_completed_batches",
+                    "successfully completed reclamation batches",
+                    MetricType::Counter,
+                    MetricUnit::Total,
+                ),
+                Metric::new(
+                    "rib_gc_failed_batches",
+                    "reclamation batches retained for retry after failure",
+                    MetricType::Counter,
+                    MetricUnit::Total,
+                ),
+            ]
+            .iter()
+            .zip(values)
+            {
+                target.append_simple(metric, Some(unit_name), value);
+            }
+        }
+
         let max_age = Duration::from_secs(60);
         self.routers.retain(|_, metrics| {
             metrics.last_e2e_delay_at.load().elapsed() <= max_age

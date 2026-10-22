@@ -38,7 +38,7 @@ authors = ["NLnet Labs <routing-team@nlnetlabs.nl>", "FastNetMon Inc <support@fa
 [workspace.dependencies]
 routecore          = { git = "https://github.com/FastNetMon/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1-fnm1", features = ["arbitrary", "serde"] }
-rotonda-store      = { git = "https://github.com/FastNetMon/netom-store.git", branch = "fnm-gc" }   # fork: Layer A remove_mui
+rotonda-store      = { git = "https://github.com/FastNetMon/netom-store.git", rev = "2cbbbb628ce2609b6a4e28940b298cd07d342f07" } # batched, concurrent-safe reclamation
 log                = "0.4"
 
 
@@ -50,6 +50,7 @@ chrono             = { version = "0.4", default-features = false, features = ["s
 # always documented but that a features = ["cargo"]-only clap never generated.
 clap               = { version = "4.5", default-features = false, features = ["cargo", "help", "usage", "error-context", "std"] }
 crossbeam-utils    = "0.8"
+roaring            = "0.10"
 dashmap            = "6.1" # O(1) concurrent map for the per-router metrics hot path
 fern               = "0.7"
 futures            = "0.3"
