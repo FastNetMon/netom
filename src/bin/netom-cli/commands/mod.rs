@@ -6,4 +6,5 @@
 
 pub mod bgp;
 pub mod bmp;
+pub mod evpn;
 pub mod system;

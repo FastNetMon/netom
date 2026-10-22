@@ -979,6 +979,7 @@ fn route_afisafi(route: &RotondaRoute) -> AfiSafiType {
         RotondaRoute::Ipv6Multicast(..) => AfiSafiType::Ipv6Multicast,
         RotondaRoute::Ipv4FlowSpec(..) => AfiSafiType::Ipv4FlowSpec,
         RotondaRoute::Ipv6FlowSpec(..) => AfiSafiType::Ipv6FlowSpec,
+        RotondaRoute::L2VpnEvpn(..) => AfiSafiType::L2VpnEvpn,
     }
 }
 
@@ -993,6 +994,7 @@ fn is_supported_afisafi(afisafi: AfiSafiType) -> bool {
             | AfiSafiType::Ipv6Unicast
             | AfiSafiType::Ipv4FlowSpec
             | AfiSafiType::Ipv6FlowSpec
+            | AfiSafiType::L2VpnEvpn
     )
 }
 

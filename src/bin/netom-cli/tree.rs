@@ -33,6 +33,10 @@ pub enum ArgKind {
     Asn,
     /// A standard community: `65000:100`, `0x1a2b3c4d`, or a well-known name.
     Community,
+    Rd,
+    RouteTarget,
+    RouteType,
+    Vni,
 }
 
 impl ArgKind {
@@ -44,6 +48,9 @@ impl ArgKind {
             ArgKind::IngressId => "<0-4294967295>",
             ArgKind::Asn => "<1-4294967295>",
             ArgKind::Community => "<AA:NN>",
+            ArgKind::Rd | ArgKind::RouteTarget => "<ASN:NN|A.B.C.D:NN>",
+            ArgKind::RouteType => "<1-255>",
+            ArgKind::Vni => "<0-16777215>",
         }
     }
 
@@ -55,6 +62,38 @@ impl ArgKind {
                 let len: u8 = len.parse().ok()?;
                 let max = if addr.is_ipv4() { 32 } else { 128 };
                 (len <= max).then_some(Value::Prefix(addr, len))
+            }
+            ArgKind::Rd | ArgKind::RouteTarget => {
+                let (admin, assigned) = tok.split_once(':')?;
+                let assigned: u32 = assigned.parse().ok()?;
+                let admin = if let Ok(ip) =
+                    admin.parse::<std::net::Ipv4Addr>()
+                {
+                    if assigned > u16::MAX as u32 {
+                        return None;
+                    }
+                    ip.to_string()
+                } else {
+                    let asn: u32 = admin.parse().ok()?;
+                    if asn > u16::MAX as u32 && assigned > u16::MAX as u32 {
+                        return None;
+                    }
+                    asn.to_string()
+                };
+                let value = format!("{admin}:{assigned}");
+                Some(if self == ArgKind::Rd {
+                    Value::Rd(value)
+                } else {
+                    Value::RouteTarget(value)
+                })
+            }
+            ArgKind::RouteType => {
+                let n: u8 = tok.parse().ok()?;
+                (n > 0).then_some(Value::RouteType(n))
+            }
+            ArgKind::Vni => {
+                let n: u32 = tok.parse().ok()?;
+                (n <= 0xff_ffff).then_some(Value::Vni(n))
             }
             ArgKind::Ip => tok.parse().ok().map(Value::Ip),
             ArgKind::IngressId => tok.parse().ok().map(Value::IngressId),
@@ -102,6 +141,10 @@ pub enum Value {
     IngressId(u32),
     Asn(u32),
     Community(String),
+    Rd(String),
+    RouteTarget(String),
+    RouteType(u8),
+    Vni(u32),
 }
 
 /// Static context a node contributes when traversed, so that one subtree can
@@ -118,6 +161,7 @@ pub enum Flag {
     /// Print every attribute of each path rather than one table row. Set by
     /// the `detail` keyword; like `best` it rides the shared filter subtree.
     Detail,
+    IncludeWithdrawn,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -671,6 +715,13 @@ pub static ROOT: &[Node] = &[
 ];
 
 static SHOW: &[Node] = &[
+    Node {
+        kw: Kw::Lit("evpn"),
+        help: "EVPN routes and tenant overlays",
+        set: None,
+        run: Some(commands::evpn::routes),
+        children: EVPN_TENANT,
+    },
     lit!("ip", "IPv4 information", SHOW_IP),
     lit!("ipv6", "IPv6 information", SHOW_IPV6),
     lit!("bmp", "BMP monitoring information", SHOW_BMP),
@@ -825,8 +876,12 @@ static BGP_BEST_ADDR: &[Node] = &[Node {
 /// The filters narrow the candidate set: "what would win if only BGP-learned
 /// routes existed". `neighbors <ip> routes` is deliberately not among them --
 /// narrowing the candidates to one peer makes the decision process vacuous.
-static BGP_BEST_FILTERS: &[Node] =
-    &[FILTER_SOURCE, FILTER_INGRESS, FILTER_ORIGIN_AS, FILTER_COMMUNITY];
+static BGP_BEST_FILTERS: &[Node] = &[
+    FILTER_SOURCE,
+    FILTER_INGRESS,
+    FILTER_ORIGIN_AS,
+    FILTER_COMMUNITY,
+];
 
 static BGP_SUMMARY: &[Node] = &[
     Node {
@@ -873,6 +928,91 @@ static BGP_FLOWSPEC: &[Node] = &[
     },
     FILTER_SOURCE,
     FILTER_INGRESS,
+];
+
+// Acyclic filter stages keep command enumeration finite. Filters may be
+// omitted, but when combined follow tenant -> type -> scope -> output.
+macro_rules! evpn_arg {
+    ($word:expr, $help:expr, $kind:ident, $next:expr) => {
+        Node {
+            kw: Kw::Lit($word),
+            help: $help,
+            set: None,
+            run: None,
+            children: &[Node {
+                kw: Kw::Arg(ArgKind::$kind),
+                help: $help,
+                set: None,
+                run: Some(commands::evpn::routes),
+                children: $next,
+            }],
+        }
+    };
+}
+const EVPN_DETAIL: Node = Node {
+    kw: Kw::Lit("detail"),
+    help: "All EVPN fields and path attributes",
+    set: Some(Flag::Detail),
+    run: Some(commands::evpn::routes),
+    children: &[],
+};
+const EVPN_WITHDRAWN: Node = Node {
+    kw: Kw::Lit("include-withdrawn"),
+    help: "Include retained withdrawn routes",
+    set: Some(Flag::IncludeWithdrawn),
+    run: Some(commands::evpn::routes),
+    children: &[EVPN_DETAIL],
+};
+static EVPN_OUTPUT: &[Node] = &[EVPN_WITHDRAWN, EVPN_DETAIL];
+const EVPN_VNI: Node =
+    evpn_arg!("vni", "Match either VXLAN VNI field", Vni, EVPN_OUTPUT);
+const EVPN_PREFIX: Node = evpn_arg!(
+    "prefix",
+    "Exact MAC/IP host or IP prefix",
+    Prefix,
+    EVPN_OUTPUT
+);
+const EVPN_INGRESS: Node = evpn_arg!(
+    "ingress",
+    "Exact stored ingress or ADD-PATH child",
+    IngressId,
+    EVPN_OUTPUT
+);
+static EVPN_SCOPE: &[Node] = &[
+    EVPN_VNI,
+    EVPN_PREFIX,
+    EVPN_INGRESS,
+    EVPN_WITHDRAWN,
+    EVPN_DETAIL,
+];
+const EVPN_TYPE: Node = evpn_arg!(
+    "route-type",
+    "EVPN route type (2 MAC/IP, 5 IP prefix)",
+    RouteType,
+    EVPN_SCOPE
+);
+static EVPN_TYPE_SCOPE: &[Node] = &[
+    EVPN_TYPE,
+    EVPN_VNI,
+    EVPN_PREFIX,
+    EVPN_INGRESS,
+    EVPN_WITHDRAWN,
+    EVPN_DETAIL,
+];
+static EVPN_TENANT: &[Node] = &[
+    evpn_arg!("rd", "Route distinguisher", Rd, EVPN_TYPE_SCOPE),
+    evpn_arg!(
+        "route-target",
+        "Advertised tenant route target",
+        RouteTarget,
+        EVPN_TYPE_SCOPE
+    ),
+    EVPN_TYPE,
+    EVPN_VNI,
+    EVPN_PREFIX,
+    EVPN_INGRESS,
+    EVPN_WITHDRAWN,
+    EVPN_DETAIL,
 ];
 
 static SHOW_BMP: &[Node] = &[

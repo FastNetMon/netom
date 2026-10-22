@@ -1,3 +1,4 @@
+pub mod evpn;
 mod http_ng;
 pub use http_ng::{Include, QueryFilter};
 mod metrics;

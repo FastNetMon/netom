@@ -16,6 +16,7 @@ Rotonda version from which it was forked, Netom adds:
 
 - [active TCP/TLS BMP input](docs/bmp-tcp-in.md) for pulling exporter feeds;
 - BMP restreaming with an initial RIB dump followed by live updates;
+- [EVPN monitoring](docs/evpn.md) with tenant-aware route queries for symmetric IRB;
 - bounded buffers, streaming full-RIB exports, and slow-consumer protection;
 - stronger BMP peer lifecycle, reconnect, withdrawal, and memory handling;
 - TLS and access controls for BMP consumers;

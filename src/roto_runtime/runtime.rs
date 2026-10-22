@@ -368,6 +368,21 @@ pub fn create_runtime() -> Result<roto::Runtime, String> {
         rr.index_prefix().to_string().into()
     }
 
+    /// Whether this route belongs to the EVPN address family.
+    #[roto_method(rt, MutRotondaRoute, is_evpn)]
+    fn rr_is_evpn(rr: Val<MutRotondaRoute>) -> bool {
+        matches!(&*rr.borrow(), RotondaRoute::L2VpnEvpn(..))
+    }
+
+    /// EVPN route distinguisher, or an empty string for other families.
+    #[roto_method(rt, MutRotondaRoute, evpn_rd)]
+    fn rr_evpn_rd(rr: Val<MutRotondaRoute>) -> Arc<str> {
+        match &*rr.borrow() {
+            RotondaRoute::L2VpnEvpn(n, _) => n.rd.clone().into(),
+            _ => "".into(),
+        }
+    }
+
     /// Whether this `RotondaRoute` is a FlowSpec rule (SAFI 133)
     #[roto_method(rt, MutRotondaRoute, is_flowspec)]
     fn rr_is_flowspec(rr: Val<MutRotondaRoute>) -> bool {

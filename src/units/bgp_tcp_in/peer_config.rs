@@ -333,11 +333,27 @@ impl BgpConfig for CombinedConfig {
     }
 
     fn protocols(&self) -> Vec<AfiSafiType> {
-        self.peer_config.protocols.clone()
+        self.peer_config
+            .protocols
+            .iter()
+            .copied()
+            .filter(|family| {
+                *family != AfiSafiType::L2VpnEvpn
+                    || crate::config::evpn_enabled()
+            })
+            .collect()
     }
 
     fn addpath(&self) -> Vec<AfiSafiType> {
-        self.peer_config.addpath.clone()
+        self.peer_config
+            .addpath
+            .iter()
+            .copied()
+            .filter(|family| {
+                *family != AfiSafiType::L2VpnEvpn
+                    || crate::config::evpn_enabled()
+            })
+            .collect()
     }
 
     fn extended_messages(&self) -> bool {

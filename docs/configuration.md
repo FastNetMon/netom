@@ -43,6 +43,16 @@ Component-specific settings belong under that component's table, such as
 placing a global setting at the end of the file would put it inside the
 last component instead.
 
+## Enable EVPN monitoring
+
+The global runtime setting `enable_evpn` defaults to `false`. Set
+`enable_evpn = true` above the first component table and restart Netom to
+opt in to EVPN ingestion, BGP capabilities, and API queries. Reloads cannot
+change this setting. A peer's `protocols = ["L2VpnEvpn"]` alone does not enable
+EVPN. The opt-in avoids accidentally retaining additional EVPN routing state
+and incurring its query memory and CPU costs; see [EVPN monitoring](evpn.md)
+for behavior and configuration details.
+
 ## Example files
 
 The [annotated configuration](../etc/netom.conf) is maintained with the

@@ -14,13 +14,21 @@ use serde_with::serde_as;
 use std::cell::RefCell;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::{borrow, error, fmt, fs, io, ops};
 use toml::{Spanned, Value};
 
 //------------ Constants -----------------------------------------------------
 
 const ARG_CONFIG: &str = "config";
+
+// Process-wide, immutable after successful startup. Changing this on reload
+// would leave negotiated sessions and retained RIB state inconsistent.
+static EVPN_ENABLED: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn evpn_enabled() -> bool {
+    EVPN_ENABLED.get().copied().unwrap_or(false)
+}
 
 //------------ Config --------------------------------------------------------
 
@@ -38,6 +46,11 @@ const ARG_CONFIG: &str = "config";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Opt in to EVPN monitoring and its additional retained-state/query costs.
+    /// Defaults to false; changes require a daemon restart.
+    #[serde(default)]
+    pub enable_evpn: bool,
+
     /// Location of the .roto script containing all user defined filters.
     pub roto_script: Option<PathBuf>,
 
@@ -146,7 +159,16 @@ impl Config {
             trace!("{}", config_file.to_string());
         }
 
+        if EVPN_ENABLED
+            .get()
+            .is_some_and(|enabled| *enabled != self.enable_evpn)
+        {
+            error!("Changing enable_evpn requires a daemon restart");
+            return Err(Terminate::error());
+        }
         manager.prepare(&self, &config_file)?;
+        // Units are started only after finalise returns successfully.
+        let _ = EVPN_ENABLED.set(self.enable_evpn);
 
         // Pass the config file path, as well as the processed config, back to
         // the caller so that they can monitor it for changes while the
@@ -559,6 +581,20 @@ impl AsRef<Path> for ConfigPath {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn evpn_requires_explicit_enablement() {
+        for (setting, expected) in [
+            ("", false),
+            ("enable_evpn = false\n", false),
+            ("enable_evpn = true\n", true),
+        ] {
+            let text = format!("{setting}[units]\n[targets]\n");
+            let config =
+                Config::from_bytes(text.as_bytes(), None::<&Path>).unwrap();
+            assert_eq!(config.enable_evpn, expected);
+        }
+    }
 
     fn mk(toml: &str) -> ConfigFile {
         ConfigFile::new(toml.as_bytes().to_vec(), Source::default()).unwrap()

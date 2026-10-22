@@ -15,8 +15,11 @@ in this API changes state.
 
 ## Endpoints
 
+EVPN uses a separate [tenant-aware endpoint](evpn.md).
+
 | Endpoint | Returns |
 | --- | --- |
+| `GET /api/v1/ribs/l2vpnevpn/routes` | EVPN routes, with RD/RT/VNI filters (see [EVPN](evpn.md)) |
 | `GET /api/v1/ribs/ipv4unicast/routes/{addr}/{len}` | every route for one prefix |
 | `GET /api/v1/ribs/ipv6unicast/routes/{addr}/{len}` | |
 | `GET /api/v1/ribs/ipv4unicast/routes` | the whole table (see [Whole-table dumps](#whole-table-dumps)) |

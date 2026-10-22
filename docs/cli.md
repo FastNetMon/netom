@@ -61,6 +61,35 @@ Commands:
   exit                                      Exit the CLI
 ```
 
+## EVPN routes
+
+`show evpn` queries the [EVPN RIB](evpn.md), including both IPv4 and IPv6
+routes. The table shows route type, RD, MAC/prefix, both VNI fields, next hop,
+route targets, source peer/path ID, and active/withdrawn state.
+
+```sh
+netom-cli show evpn
+netom-cli show evpn route-target 65000:100 route-type 5
+netom-cli show evpn rd 192.0.2.1:100 vni 50000
+netom-cli show evpn prefix 2001:db8::/64
+netom-cli show evpn ingress 101 include-withdrawn detail
+netom-cli --json show evpn route-target 65000:100
+```
+
+Combine filters in this order, omitting stages as needed:
+
+1. `rd <value>` or `route-target <value>`.
+2. `route-type <1-255>` (type 2 MAC/IP, type 5 IP prefix).
+3. One of `vni <0-16777215>`, `prefix <address/length>`, or `ingress <id>`.
+4. `include-withdrawn`, then `detail`.
+
+`ingress` matches the stored ingress ID, including an ADD-PATH child ID.
+`include-withdrawn` requires retained withdrawn records on the daemon.
+`detail` displays all returned fields, including ESI, gateway, Router's MAC,
+raw NLRI, and attributes. `--json` passes through the original buffered
+`{"data": [...]}` response. VNI columns contain raw 24-bit label fields;
+interpret them as VNIs for VXLAN, not as decoded MPLS label numbers.
+
 ## Finding the daemon
 
 In order: `--url`, `$NETOM_URL`, `-c <config>`, `./netom.conf`,

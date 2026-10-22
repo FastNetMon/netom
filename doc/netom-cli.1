@@ -179,6 +179,13 @@ as above; the other filters are not implemented for FlowSpec.
 .B show ipv6 bgp ...
 As above, for IPv6.
 .TP
+.B show evpn
+EVPN routes with RD, MAC/prefix, VNIs, next hop, route targets, peer/path,
+and active/withdrawn state. Optional filters, in order: rd VALUE or
+route-target VALUE; route-type NUMBER; one of vni NUMBER, prefix PREFIX,
+or ingress ID; include-withdrawn; detail. Detail displays all returned
+fields and attributes. With --json, emits the buffered data-array response.
+.TP
 .B show bmp routers
 Monitored routers feeding BMP to this daemon.
 .TP
