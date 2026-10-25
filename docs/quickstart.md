@@ -8,7 +8,11 @@ on localhost. You will need a router or exporter that sends BMP data to it.
 The [release workflow](releases.md) builds DEB and RPM packages for amd64 and
 arm64, plus versioned container images. Published assets appear on the
 [GitHub releases page](https://github.com/FastNetMon/netom/releases). If no
-release is available yet, build from source:
+release is available yet, build from source. You will need Git, the Rust
+toolchain pinned in
+[`pkg/targets.toml`](https://github.com/FastNetMon/netom/blob/main/pkg/targets.toml),
+and the distribution build dependencies listed in
+[`pkg/Dockerfile`](https://github.com/FastNetMon/netom/blob/main/pkg/Dockerfile).
 
 ```sh
 git clone https://github.com/FastNetMon/netom.git
@@ -16,16 +20,14 @@ cd netom
 cargo build --locked --release --bin netom --bin netom-cli
 ```
 
-Use the Rust toolchain pinned in
-[`pkg/targets.toml`](https://github.com/FastNetMon/netom/blob/main/pkg/targets.toml).
-For distribution dependencies and container-based package builds,
-see [local builds](releases.md#local-builds). The commands below use binaries
-on `PATH`; after a source build, use `./target/release/netom` and
-`./target/release/netom-cli` instead.
+For container-based package builds, see [local builds](releases.md#local-builds).
+The commands below use installed binaries on `PATH`; source-build commands
+are included separately.
 
 ## Create a configuration
 
-Save the following as `netom.conf`:
+Save the following as `netom.conf` (in the repository directory if you built
+from source):
 
 ```toml
 log_level = "info"
@@ -52,15 +54,30 @@ making it accessible from another host.
 
 ## Start and inspect the collector
 
+With an installed package:
+
 ```sh
 netom --config netom.conf
 ```
 
+With a source build, from the repository directory:
+
+```sh
+./target/release/netom --config netom.conf
+```
+
 Configure your BMP exporter to connect to the collector's address on port
-11019. In another terminal, inspect the running instance:
+11019. In another terminal, inspect the running instance with the installed CLI:
 
 ```sh
 netom-cli --url http://127.0.0.1:8080 show ip bgp summary
+curl http://127.0.0.1:8080/metrics
+```
+
+For a source build, run the CLI from the same repository directory:
+
+```sh
+./target/release/netom-cli --url http://127.0.0.1:8080 show ip bgp summary
 curl http://127.0.0.1:8080/metrics
 ```
 
