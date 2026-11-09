@@ -2168,6 +2168,7 @@ dependencies = [
  "rayon",
  "rcgen",
  "reqwest",
+ "roaring",
  "roto",
  "rotonda-store",
  "routecore",
@@ -2935,7 +2936,7 @@ dependencies = [
 [[package]]
 name = "rotonda-store"
 version = "0.5.1-dev"
-source = "git+https://github.com/FastNetMon/netom-store.git?branch=fnm-gc#2bb37ffe257911f27253281e1282b0cf945c8500"
+source = "git+https://github.com/FastNetMon/netom-store.git?rev=1a58fe44b4eb5b0e68a7b0a07558ebfb692b6209#1a58fe44b4eb5b0e68a7b0a07558ebfb692b6209"
 dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",

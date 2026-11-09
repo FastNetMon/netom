@@ -433,7 +433,8 @@ impl DirectUpdate for BmpTcpOutRunner {
             // then silently discard that peer's parsed payloads. The
             // session memo goes too (bounded memory; a reused id simply
             // re-resolves).
-            Update::Withdraw(ingress_id, _) => {
+            Update::Withdraw(ingress_id, _)
+            | Update::IngressReappeared(ingress_id) => {
                 self.raw_covered.remove(ingress_id);
                 self.raw_session_of.remove(ingress_id);
             }
@@ -468,8 +469,19 @@ impl DirectUpdate for BmpTcpOutRunner {
             {
                 continue;
             }
-            match client.buffer_update_if_dumping(update.clone()).await {
+            match client
+                .buffer_update_if_dumping(
+                    update.clone(),
+                    &self.ingress_register,
+                )
+                .await
+            {
                 BufferUpdateResult::Buffered => {}
+                BufferUpdateResult::IdentityUnavailable => {
+                    if client.request_disconnect() {
+                        warn!("bmp-out: missing replay identity for {}; requesting a fresh dump", client.remote_addr);
+                    }
+                }
                 BufferUpdateResult::Overflow => {
                     // First overflow wins: compare-and-swap claims the
                     // disconnect, suppresses duplicate logs from races.
@@ -891,7 +903,12 @@ impl BmpTcpOutRunner {
                 }
 
                 // Clean up client on disconnect
-                clients_for_writer.write().await.remove(&client_id);
+                let removed =
+                    { clients_for_writer.write().await.remove(&client_id) };
+                if let Some(client) = removed {
+                    client.request_disconnect();
+                    client.discard_dump_buffer().await;
+                }
                 status_reporter.client_disconnected(client_addr);
             },
         );
@@ -975,8 +992,8 @@ impl BmpTcpOutRunner {
                         // send is correct (only this task is back-pressured).
                         if !client_handler::send_update_to_client(
                             &client,
-                            &update,
-                            &ingress_register,
+                            &update.update,
+                            &update.identities,
                             forward_router_info,
                             fan_in_peer_distinguisher,
                             true,

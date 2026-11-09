@@ -270,6 +270,54 @@ impl Register {
         }
     }
 
+    pub(crate) fn session_identity(
+        &self,
+        id: IngressId,
+    ) -> Option<(IngressId, u64)> {
+        let entries = self.info.read().unwrap();
+        let source = entries.get(&id)?;
+        let emit = if source.ingress_type == Some(IngressType::BgpPath) {
+            source.parent_ingress?
+        } else {
+            id
+        };
+        Some((emit, entries.get(&emit)?.history_generation))
+    }
+
+    /// Copy a bounded lineage under one lock: child -> peer -> router.
+    /// Missing ancestors or cycles cannot be silently encoded as default peers.
+    pub(crate) fn snapshot_lineage(
+        &self,
+        id: IngressId,
+        inline: Option<&IngressInfo>,
+    ) -> Option<Vec<(IngressId, IngressInfo)>> {
+        let entries = self.info.read().unwrap();
+        let first = inline.cloned().or_else(|| entries.get(&id).cloned())?;
+        let mut snapshot = vec![(id, first)];
+        while let Some(parent) = snapshot.last()?.1.parent_ingress {
+            if snapshot.len() >= 8
+                || snapshot.iter().any(|(id, _)| *id == parent)
+            {
+                return None;
+            }
+            snapshot.push((parent, entries.get(&parent)?.clone()));
+        }
+        Some(snapshot)
+    }
+
+    pub(crate) fn snapshot_matches(
+        &self,
+        snapshot: &[(IngressId, IngressInfo)],
+    ) -> bool {
+        let entries = self.info.read().unwrap();
+        snapshot.iter().all(|(id, old)| {
+            entries.get(id).is_some_and(|new| {
+                new.history_generation == old.history_generation
+                    && new.history_revision == old.history_revision
+            })
+        })
+    }
+
     pub fn current_serial(&self) -> u32 {
         self.serial.load(Ordering::Relaxed)
     }
@@ -438,7 +486,7 @@ impl Register {
 
     /// Request a new, unique [`IngressId`]
     pub(crate) fn register(&self) -> IngressId {
-        self.serial.fetch_add(1, Ordering::Relaxed)
+        self.serial.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1)).expect("ingress ID space exhausted; refusing to reuse a live-process identity")
     }
 
     /// Retrieve the information for the given [`IngressId`]
@@ -1106,7 +1154,8 @@ mod tests {
         res.update_info(id, info.clone());
         assert_eq!(res.get(id), Some(info));
 
-        let mut newinfo = IngressInfo::new().with_local_asn(Asn::from_u32(65537));
+        let mut newinfo =
+            IngressInfo::new().with_local_asn(Asn::from_u32(65537));
         res.update_info(id, newinfo.clone());
         newinfo.history_revision = 1;
         assert_eq!(res.get(id), Some(newinfo));
