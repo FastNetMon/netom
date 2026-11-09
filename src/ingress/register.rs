@@ -284,8 +284,10 @@ impl Register {
         Some((emit, entries.get(&emit)?.history_generation))
     }
 
-    /// Copy a bounded lineage under one lock: child -> peer -> router.
-    /// Missing ancestors or cycles cannot be silently encoded as default peers.
+    /// Copy a bounded wire-identity lineage under one lock: child -> peer ->
+    /// router. A router's parent is an opaque unit ID, not encoding metadata.
+    /// Missing required ancestors or cycles cannot be silently encoded as
+    /// default peers.
     pub(crate) fn snapshot_lineage(
         &self,
         id: IngressId,
@@ -295,6 +297,9 @@ impl Register {
         let first = inline.cloned().or_else(|| entries.get(&id).cloned())?;
         let mut snapshot = vec![(id, first)];
         while let Some(parent) = snapshot.last()?.1.parent_ingress {
+            if snapshot.last()?.1.ingress_type == Some(IngressType::Bmp) {
+                break;
+            }
             if snapshot.len() >= 8
                 || snapshot.iter().any(|(id, _)| *id == parent)
             {
