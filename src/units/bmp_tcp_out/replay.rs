@@ -183,6 +183,90 @@ mod tests {
             RouteStatus::Active,
         ))
     }
+
+    #[test]
+    fn missing_required_router_still_rejects_replay_capture() {
+        let registry = Register::default();
+        registry.update_info(7, peer(65001).with_parent_ingress(3u32));
+        assert!(SnapshotCache::default()
+            .capture(&route(7), &registry)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn replay_stops_at_router_before_opaque_unit_parent() {
+        // BMP input reserves a unit ID without an IngressInfo entry. The
+        // router points at it for internal ownership; it is not wire identity.
+        for source in [7, 8] {
+            let registry = Register::default();
+            let unit = registry.register();
+            registry.update_info(
+                3,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::Bmp)
+                    .with_parent_ingress(unit)
+                    .with_name("example-router"),
+            );
+            registry.update_info(7, peer(65001).with_parent_ingress(3u32));
+            registry.update_info(
+                8,
+                IngressInfo::new()
+                    .with_ingress_type(IngressType::BgpPath)
+                    .with_parent_ingress(7u32)
+                    .with_path_id(33u32),
+            );
+            assert!(registry.get(unit).is_none());
+
+            let (tx, mut rx) = mpsc::channel(8);
+            let client = Arc::new(ClientState::new(
+                "127.0.0.1:1234".parse().unwrap(),
+                tx,
+                10,
+                1_000_000,
+            ));
+            assert!(matches!(
+                client
+                    .buffer_update_if_dumping(route(source), &registry)
+                    .await,
+                super::super::client_state::BufferUpdateResult::Buffered
+            ));
+            for id in [8, 7, 3] {
+                registry.remove(id);
+            }
+            let queued = client.take_buffered_updates().await;
+            assert_eq!(queued.len(), 1);
+            let identities = &queued[0].identities;
+            assert_eq!(identities.session_identity(source), Some((7, 0)));
+            assert!(identities.get(unit).is_none());
+            assert_eq!(
+                identities.get(3).unwrap().name.as_deref(),
+                Some("example-router")
+            );
+            assert!(
+                send_update_to_client(
+                    &client,
+                    &queued[0].update,
+                    identities,
+                    true,
+                    FanInPeerDistinguisher::default(),
+                    false,
+                )
+                .await
+            );
+            let up = rx.try_recv().unwrap();
+            assert_eq!(up[5], 3);
+            assert_eq!(
+                u32::from_be_bytes(up[32..36].try_into().unwrap()),
+                65001
+            );
+            assert!(up
+                .windows(b"example-router".len())
+                .any(|part| part == b"example-router"));
+            assert_eq!(rx.try_recv().unwrap()[5], 0);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn replay_keeps_original_headers_across_retirement_and_same_id_reconnect(
     ) {
