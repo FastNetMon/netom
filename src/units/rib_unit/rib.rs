@@ -5,8 +5,8 @@ use std::{
     net::IpAddr,
     ops::Deref,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex, RwLock,
     },
     time::Instant,
 };
@@ -158,6 +158,14 @@ type RotoHttpFilter = roto::TypedFunc<
     ) -> roto::Verdict<(), ()>,
 >;
 
+#[derive(Default)]
+struct ReclaimProgress {
+    prefixes: AtomicU64,
+    records: AtomicU64,
+    completed: AtomicU64,
+    failures: AtomicU64,
+}
+
 #[derive(Clone)]
 pub struct Rib {
     unicast: Arc<Option<Store>>,
@@ -172,15 +180,15 @@ pub struct Rib {
     roto_package: Option<Arc<RotoPackage>>,
     roto_context: Arc<Mutex<Ctx>>,
     path_attribute_interner: Arc<PathAttributeInterner>,
-    // Serialises every writer to the per-store `withdrawn_muis_bmin`
-    // roaring bitmap: `withdraw_for_ingress` (mark_mui_as_withdrawn) and
-    // `remove_for_ingresses` (`remove_mui` marks the MUI active).
-    // rotonda-store 0.5.0's
-    // `TreeBitMap::update_withdrawn_muis_bmin` has a CAS retry loop that
-    // never reloads its `expected` value, so any concurrent writer that
-    // loses a CAS race livelocks indefinitely. Holding this mutex around
-    // every call guarantees there's only ever one in flight.
+    // Serializes reusable-session resets and logical withdrawals. Permanent
+    // GC only takes this for a single prefix/finalization, never a whole scan.
     withdraw_lock: Arc<Mutex<()>>,
+    // Admission fence for permanently retired IDs. Numeric tombstones contain
+    // no route/peer Arcs. IDs are never recycled within a process.
+    retired: Arc<RwLock<roaring::RoaringBitmap>>,
+    pending_reclaims: Arc<Mutex<HashSet<IngressId>>>,
+    reclaim_worker: Arc<Mutex<()>>,
+    reclaim_progress: Arc<ReclaimProgress>,
     // Serialises the read-modify-write of FlowSpecRuleSet blobs: the store
     // overwrites whole records per (prefix, mui), so two concurrent
     // upserts of different rules under the same key would lose one rule
@@ -283,6 +291,10 @@ impl Rib {
                 PathAttributeInterner::default(),
             ),
             withdraw_lock: Arc::new(Mutex::new(())),
+            retired: Arc::new(RwLock::new(roaring::RoaringBitmap::new())),
+            pending_reclaims: Default::default(),
+            reclaim_worker: Default::default(),
+            reclaim_progress: Default::default(),
             flowspec_lock: Arc::new(Mutex::new(())),
         })
     }
@@ -553,6 +565,14 @@ impl Rib {
         retain_withdrawn_attributes: bool,
         deduplicate_path_attributes: bool,
     ) -> Result<UpsertReport, String> {
+        // Hold admission until the write finishes. Retirement acquires the
+        // writer side before unlinking the registration, draining older writes.
+        let admission = self.retired.read().unwrap();
+        if admission.contains(ingress_id) {
+            return Err(format!(
+                "ingress {ingress_id} has been permanently retired"
+            ));
+        }
         let res = match val {
             RotondaRoute::Ipv4Unicast(n, ..) => self.insert_prefix(
                 &n.prefix(),
@@ -1252,6 +1272,13 @@ impl Rib {
         ids: &[(IngressId, Option<AfiSafiType>)],
         retain_withdrawn_attributes: bool,
     ) {
+        let admission = self.retired.read().unwrap();
+        let ids: Vec<_> = ids
+            .iter()
+            .copied()
+            .filter(|(id, _)| !admission.contains(*id))
+            .collect();
+        let ids = ids.as_slice();
         if ids.is_empty() {
             return;
         }
@@ -1407,9 +1434,19 @@ impl Rib {
     /// retained previous session before reusing an id. Synthesized BMP peers
     /// that mint a fresh ingress id every session must take this path so
     /// mark-withdraw does not leak one record slot per announced prefix.
-    pub fn remove_for_ingresses(&self, ids: &[IngressId]) {
+    pub fn remove_for_ingresses(
+        &self,
+        ids: &[IngressId],
+    ) -> Result<(), String> {
         if ids.is_empty() {
-            return;
+            return Ok(());
+        }
+
+        let admission = self.retired.read().unwrap();
+        if ids.iter().any(|id| admission.contains(*id)) {
+            return Err(
+                "cannot reset a permanently retired ingress".to_string()
+            );
         }
 
         // `remove_mui` clears the per-store `withdrawn_muis_bmin` bitmap (via
@@ -1424,42 +1461,204 @@ impl Rib {
 
         for &id in ids {
             reset_peer_gauge(id, None);
-            if let Some(store) = (*self.unicast).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from unicast rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from unicast rib: {e}"
-                    ),
-                }
-            }
-            if let Some(store) = (*self.multicast).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from multicast rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from multicast rib: {e}"
-                    ),
-                }
-            }
-            if let Some(store) = (*self.flowspec).as_ref() {
-                match store.remove_mui(id) {
-                    Ok((records, emptied)) => debug!(
-                        "removed MUI {id} from flowspec rib: \
-                         {records} records, {emptied} prefixes emptied"
-                    ),
-                    Err(e) => error!(
-                        "failed to remove MUI {id} from flowspec rib: {e}"
-                    ),
-                }
-            }
+        }
+        for store in [self.unicast.as_ref(), self.multicast.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            store.remove_muis(ids).map_err(|err| err.to_string())?;
+        }
+        if let Some(store) = self.flowspec.as_ref() {
+            store.remove_muis(ids).map_err(|err| err.to_string())?;
         }
         drop(count_mutation);
         drop(_guard);
+        self.recount_flowspec_rules();
+        Ok(())
+    }
+
+    pub(crate) fn reclamation_stats(&self) -> [u64; 5] {
+        [
+            self.pending_reclaims.lock().unwrap().len() as u64,
+            self.reclaim_progress.prefixes.load(Ordering::Relaxed),
+            self.reclaim_progress.records.load(Ordering::Relaxed),
+            self.reclaim_progress.completed.load(Ordering::Relaxed),
+            self.reclaim_progress.failures.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// Retire IDs already unlinked by their producer. Drain admitted writes
+    /// before scheduling physical deletion. Reusable IDs use the reset path.
+    pub fn retire_for_ingresses(&self, ids: &[IngressId]) {
+        {
+            let mut retired = self.retired.write().unwrap();
+            for id in ids {
+                retired.insert(*id);
+            }
+            self.pending_reclaims
+                .lock()
+                .unwrap()
+                .extend(ids.iter().copied());
+        }
+        if let Err(err) = self.hide_retired(ids) {
+            self.reclaim_progress
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+            error!(
+                "cannot hide retired records; keeping cleanup tickets: {err}"
+            );
+            return;
+        }
+        self.reclaim_pending();
+    }
+
+    fn hide_retired(&self, ids: &[IngressId]) -> Result<(), String> {
+        let _lock =
+            self.withdraw_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let _mutation = self.flowspec_rule_counts.begin_mutation();
+        for store in [self.unicast.as_ref(), self.multicast.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            store
+                .mark_muis_as_withdrawn(ids)
+                .map_err(|err| err.to_string())?;
+        }
+        if let Some(store) = self.flowspec.as_ref() {
+            store
+                .mark_muis_as_withdrawn(ids)
+                .map_err(|err| err.to_string())?;
+        }
+        for id in ids {
+            reset_peer_gauge(*id, None);
+        }
+        Ok(())
+    }
+
+    /// Single prefix-major pass over all pending IDs, with short guards and
+    /// lock holds. Keep failed tickets; idempotent retry must not lose cleanup.
+    fn reclaim_pending(&self) {
+        self.reclaim_pending_with(&mut |_| Ok(()));
+    }
+
+    fn reclaim_pending_with(
+        &self,
+        before_prefix: &mut impl FnMut(&Prefix) -> Result<(), String>,
+    ) {
+        // One worker drains all pending retirement tickets. Other producers
+        // only enqueue; a failed ticket remains available to the next GC tick.
+        let Ok(_worker) = self.reclaim_worker.try_lock() else {
+            return;
+        };
+        let ids: Vec<_> = self
+            .pending_reclaims
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        if ids.is_empty() {
+            return;
+        }
+        if let Err(err) = self.hide_retired(&ids) {
+            self.reclaim_progress
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+            error!(
+                "cannot hide retired records; keeping cleanup tickets: {err}"
+            );
+            return;
+        }
+        let targets: HashSet<_> = ids.iter().copied().collect();
+        let start = Instant::now();
+        let mut scanned = 0usize;
+        let mut removed = 0usize;
+        let mut last_report = Instant::now();
+        let mut walk = |prefixes: Vec<Prefix>,
+                        delete: &mut dyn FnMut(
+            &Prefix,
+        ) -> Result<
+            (usize, usize),
+            String,
+        >|
+         -> Result<(), String> {
+            for prefix in prefixes {
+                before_prefix(&prefix)?;
+                {
+                    let _lock = self
+                        .withdraw_lock
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let delta = delete(&prefix)?;
+                    removed += delta.0;
+                    self.reclaim_progress
+                        .records
+                        .fetch_add(delta.0 as u64, Ordering::Relaxed);
+                }
+                scanned += 1;
+                self.reclaim_progress
+                    .prefixes
+                    .fetch_add(1, Ordering::Relaxed);
+                if scanned % 512 == 0 {
+                    // No lock/epoch guard survives this scheduling boundary.
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    if last_report.elapsed().as_secs() >= 5 {
+                        info!("rib GC progress: {} retired IDs, {scanned} prefixes scanned, {removed} records removed, elapsed={}s", ids.len(), start.elapsed().as_secs());
+                        last_report = Instant::now();
+                    }
+                }
+            }
+            Ok(())
+        };
+        let result = (|| -> Result<(), String> {
+            for store in [self.unicast.as_ref(), self.multicast.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                walk(store.prefixes_keys_iter().collect(), &mut |p| {
+                    store
+                        .remove_muis_for_prefix(p, &targets)
+                        .map_err(|e| e.to_string())
+                })?;
+            }
+            if let Some(store) = self.flowspec.as_ref() {
+                walk(store.prefixes_keys_iter().collect(), &mut |p| {
+                    store
+                        .remove_muis_for_prefix(p, &targets)
+                        .map_err(|e| e.to_string())
+                })?;
+            }
+            let _lock =
+                self.withdraw_lock.lock().unwrap_or_else(|p| p.into_inner());
+            for store in [self.unicast.as_ref(), self.multicast.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                store.finish_remove_muis(&ids).map_err(|e| e.to_string())?;
+            }
+            if let Some(store) = self.flowspec.as_ref() {
+                store.finish_remove_muis(&ids).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            self.reclaim_progress
+                .failures
+                .fetch_add(1, Ordering::Relaxed);
+            error!("rib GC incomplete; keeping {} cleanup tickets for retry: {err}", ids.len());
+            return;
+        }
+        self.reclaim_progress
+            .completed
+            .fetch_add(1, Ordering::Relaxed);
+        let stats = peer_stats::registry();
+        let mut pending = self.pending_reclaims.lock().unwrap();
+        for id in &ids {
+            pending.remove(id);
+            stats.remove(*id);
+        }
+        info!("rib GC completed: {} IDs, {scanned} prefixes scanned, {removed} records removed in {:.2}s", ids.len(), start.elapsed().as_secs_f64());
+        drop(pending);
         self.recount_flowspec_rules();
     }
 
@@ -1994,6 +2193,7 @@ impl Rib {
             // before remove_mui also means any concurrent reuse can no longer
             // match this id (it mints a fresh one instead), so remove_mui only
             // ever clears the old, genuinely-departed session's records.
+            let mut admission = self.retired.write().unwrap();
             let reclaimed: Vec<IngressId> = peers_to_reclaim
                 .iter()
                 .copied()
@@ -2003,18 +2203,11 @@ impl Rib {
                         .is_some()
                 })
                 .collect();
-            if !reclaimed.is_empty() {
-                self.remove_for_ingresses(&reclaimed);
-                let stats = peer_stats::registry();
-                for id in &reclaimed {
-                    stats.remove(*id);
-                }
-                info!(
-                    "rib GC: reclaimed {} peer/path ingress(es) idle \
-                     (Disconnected) for >= one GC interval",
-                    reclaimed.len()
-                );
+            for id in &reclaimed {
+                admission.insert(*id);
             }
+            self.pending_reclaims.lock().unwrap().extend(reclaimed);
+            drop(admission);
         }
 
         // Reclaim childless BMP router (parent) entries that were already
@@ -2041,6 +2234,8 @@ impl Rib {
                 );
             }
         }
+
+        self.reclaim_pending();
 
         // Reclaimed ids are now gone from the register, so they won't appear
         // in the next sweep's snapshot; returning the full current set is fine.
@@ -2206,11 +2401,9 @@ impl Rib {
         }
 
         if deadline_hit {
-            warn!(
-                "rib::stream_prefix_records: dump deadline ({}s) reached \
-                 after {count} records; emitting partial RIB",
-                DUMP_MAX_DURATION.as_secs()
-            );
+            return Err(format!(
+                "RIB dump deadline reached after {count} records"
+            ));
         }
         debug!("rib::stream_prefix_records: {count} prefix records");
         Ok(count)
@@ -2261,11 +2454,9 @@ impl Rib {
             }
 
             if Instant::now() >= deadline {
-                warn!(
-                    "rib::stream_flowspec_records: dump deadline reached \
-                     after {count} records; emitting partial table"
-                );
-                break;
+                return Err(format!(
+                    "FlowSpec dump deadline reached after {count} records"
+                ));
             }
         }
         debug!("rib::stream_flowspec_records: {count} records");
@@ -4401,7 +4592,7 @@ mod tests {
         assert_eq!(streamed, 1);
 
         // Physical whole-mui reclaim covers the default-route record.
-        rib.remove_for_ingresses(&[mui]);
+        rib.remove_for_ingresses(&[mui]).unwrap();
         assert!(flowspec_rows(&rib).is_empty());
         let mut streamed = 0;
         rib.stream_flowspec_records(|_pr| {
@@ -4798,5 +4989,154 @@ mod tests {
         rib.recount_flowspec_rules();
         assert_eq!(flowspec_rows(&rib).len(), 1);
         assert_eq!(rib.flowspec_rule_counts.snapshot(), (1, 0));
+    }
+}
+
+#[cfg(test)]
+mod reclamation_tests {
+    use super::*;
+    use crate::roto_runtime::Ctx;
+    use std::{
+        sync::{mpsc, Barrier},
+        time::Duration,
+    };
+
+    fn rib() -> Arc<Rib> {
+        Arc::new(
+            Rib::new(
+                Default::default(),
+                None,
+                Arc::new(Mutex::new(Ctx::empty())),
+            )
+            .unwrap(),
+        )
+    }
+    fn route() -> RotondaRoute {
+        let prefix: Prefix = "192.0.2.0/24".parse().unwrap();
+        RotondaRoute::Ipv4Unicast(
+            prefix.try_into().unwrap(),
+            RotondaPaMap::empty_path_attributes(),
+        )
+    }
+    #[test]
+    fn retirement_waits_for_admitted_writer_and_rejects_late_writes() {
+        let rib = rib();
+        let admitted = rib.retired.read().unwrap();
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, rx) = mpsc::channel();
+        let other = rib.clone();
+        let ready = barrier.clone();
+        let worker = std::thread::spawn(move || {
+            ready.wait();
+            other.retire_for_ingresses(&[7]);
+            tx.send(()).unwrap();
+        });
+        barrier.wait();
+        // Simulate a write already admitted before retirement requested the fence.
+        let p: Prefix = "192.0.2.0/24".parse().unwrap();
+        rib.store()
+            .unwrap()
+            .insert(
+                &p,
+                Record::new(
+                    7,
+                    0,
+                    RouteStatus::Active,
+                    RotondaPaMap::empty_path_attributes(),
+                ),
+                None,
+            )
+            .unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
+        drop(admitted);
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(rib.store().unwrap().routes_count().total(), 0);
+        assert!(rib
+            .insert(&route(), RouteStatus::Active, 0, 7, false, false)
+            .is_err());
+        assert_eq!(rib.store().unwrap().routes_count().total(), 0);
+        assert!(rib.pending_reclaims.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retirement_preserves_live_peer_and_owned_route_snapshot() {
+        let rib = rib();
+        for id in [7, 8] {
+            rib.insert(&route(), RouteStatus::Active, 0, id, false, false)
+                .unwrap();
+        }
+        let snapshot = rib.iter_all_prefix_records().unwrap();
+        rib.retire_for_ingresses(&[7]);
+        assert_eq!(
+            snapshot[0].meta.len(),
+            2,
+            "readers own valid snapshots after physical deletion"
+        );
+        let live = rib.iter_all_prefix_records().unwrap();
+        assert_eq!(live[0].meta.len(), 1);
+        assert_eq!(live[0].meta[0].multi_uniq_id, 8);
+        assert!(rib
+            .insert(&route(), RouteStatus::Active, 1, 8, false, false)
+            .is_ok());
+        rib.retire_for_ingresses(&[7]); // safe repeat
+        assert_eq!(rib.store().unwrap().routes_count().total(), 1);
+    }
+
+    #[test]
+    fn busy_worker_keeps_ticket_and_withdrawn_visibility() {
+        let rib = rib();
+        rib.insert(&route(), RouteStatus::Active, 0, 7, false, false)
+            .unwrap();
+        // An active worker defers this ticket; it must remain hidden and
+        // discoverable by the next GC pass until physical cleanup succeeds.
+        let worker = rib.reclaim_worker.lock().unwrap();
+        rib.retire_for_ingresses(&[7]);
+        assert!(rib.pending_reclaims.lock().unwrap().contains(&7));
+        assert!(rib.store().unwrap().mui_is_withdrawn_v4(7));
+        drop(worker);
+        rib.reclaim_pending();
+        assert!(rib.pending_reclaims.lock().unwrap().is_empty());
+        assert_eq!(rib.store().unwrap().routes_count().total(), 0);
+    }
+    #[test]
+    fn partial_cleanup_failure_retains_ticket_and_retries_without_double_counting(
+    ) {
+        let rib = rib();
+        rib.insert(&route(), RouteStatus::Active, 0, 7, false, false)
+            .unwrap();
+        let second: Prefix = "198.51.100.0/24".parse().unwrap();
+        rib.insert(
+            &RotondaRoute::Ipv4Unicast(
+                second.try_into().unwrap(),
+                RotondaPaMap::empty_path_attributes(),
+            ),
+            RouteStatus::Active,
+            0,
+            7,
+            false,
+            false,
+        )
+        .unwrap();
+        let worker = rib.reclaim_worker.lock().unwrap();
+        rib.retire_for_ingresses(&[7]);
+        drop(worker);
+        let mut visited = 0;
+        rib.reclaim_pending_with(&mut |_| {
+            visited += 1;
+            if visited == 2 {
+                Err("injected traversal failure".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(rib.pending_reclaims.lock().unwrap().contains(&7));
+        assert!(rib.store().unwrap().mui_is_withdrawn_v4(7));
+        assert_eq!(rib.store().unwrap().routes_count().total(), 1);
+        assert_eq!(rib.reclamation_stats()[4], 1);
+        rib.reclaim_pending();
+        assert!(rib.pending_reclaims.lock().unwrap().is_empty());
+        assert_eq!(rib.store().unwrap().routes_count().total(), 0);
+        assert_eq!(rib.store().unwrap().routes_count().in_memory(), 0);
     }
 }
