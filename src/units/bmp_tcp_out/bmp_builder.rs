@@ -16,7 +16,7 @@ use routecore::bgp::types::AfiSafiType;
 use routecore::bmp::message::PeerType;
 
 use crate::ingress::{IngressId, IngressInfo, IngressType};
-use crate::payload::{RotondaPaMap, RotondaRoute};
+use crate::payload::{RotondaPaMap, RotondaRoute, PPI_MP_REACH_ADDPATH};
 use crate::roto_runtime::types::PeerRibType;
 
 // BMP message types (RFC 7854 Section 4.1)
@@ -1092,8 +1092,12 @@ struct AggGroup {
 }
 
 impl AggGroup {
-    fn new(pamap: &RotondaPaMap, is_v4: bool) -> Self {
-        let (pa_bytes, next_hop_opt) = filter_raw_path_attributes(pamap);
+    /// `prefix` is the first prefix of the group; every prefix later pushed
+    /// shares its family and next-hop source (both are in the group key).
+    fn new(pamap: &RotondaPaMap, prefix: Prefix) -> Self {
+        let is_v4 = prefix.is_v4();
+        let (pa_bytes, next_hop_opt) =
+            unicast_path_attributes(pamap.as_ref(), prefix);
         let base_len = if is_v4 {
             19 + 2 + 2 + pa_bytes.len()
         } else {
@@ -1153,10 +1157,10 @@ impl AggGroup {
         peer: &PeerInfo,
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
-        if self.prefixes.is_empty() {
+        let Some(&(first, _)) = self.prefixes.first() else {
             return true;
-        }
-        let (pa_bytes, next_hop) = filter_pa_from_raw(&self.raw);
+        };
+        let (pa_bytes, next_hop) = unicast_path_attributes(&self.raw, first);
         let nh = if self.is_v4 {
             None
         } else {
@@ -1307,12 +1311,14 @@ impl FsAggGroup {
 /// This keeps aggregation effective at a given budget instead of repeatedly
 /// dumping half-empty groups (which a flush-everything policy would do).
 pub struct RouteAggregator {
-    /// Key: (peer ingress, is_v4, carries-path-ids, attribute-blob hash).
-    /// The third component keeps ADD-PATH and plain NLRI in separate
-    /// groups — mixing them in one UPDATE would be unparseable (relevant
-    /// when a session has ADD-PATH for one family only, e.g. unicast but
-    /// not multicast, both encoded into the same v4/v6 NLRI space).
-    groups: HashMap<(IngressId, bool, bool, u64), AggGroup>,
+    /// Key: (peer ingress, is_v4, carries-path-ids, next hop from MP_REACH,
+    /// attribute-blob hash). The third component keeps ADD-PATH and plain
+    /// NLRI in separate groups — mixing them in one UPDATE would be
+    /// unparseable (relevant when a session has ADD-PATH for one family
+    /// only, e.g. unicast but not multicast, both encoded into the same
+    /// v4/v6 NLRI space). The fourth separates IPv4 prefixes of one mixed
+    /// UPDATE by where their next hop lives (see `ipv4_mp_next_hop`).
+    groups: HashMap<(IngressId, bool, bool, bool, u64), AggGroup>,
     // FlowSpec groups live in their own map so flowspec and unicast NLRI
     // structurally cannot share an UPDATE; they draw on the same byte
     // budget as the unicast groups. Same key shape as `groups` — the
@@ -1390,7 +1396,13 @@ impl RouteAggregator {
         let is_v4 = prefix.is_v4();
         let raw = pamap.as_ref();
         let blob = raw.get(2..).unwrap_or(&[]);
-        let key = (ingress_id, is_v4, path_id.is_some(), hash_pa_blob(blob));
+        let key = (
+            ingress_id,
+            is_v4,
+            path_id.is_some(),
+            is_v4 && ipv4_mp_next_hop(raw, prefix).is_some(),
+            hash_pa_blob(blob),
+        );
         let nlri_len = nlri_encoded_len(prefix, path_id.is_some());
 
         // Pull the group out so the budget bookkeeping below borrows `self`
@@ -1408,11 +1420,11 @@ impl RouteAggregator {
                     return false;
                 }
                 self.groups_created += 1;
-                AggGroup::new(pamap, is_v4)
+                AggGroup::new(pamap, prefix)
             }
             None => {
                 self.groups_created += 1;
-                AggGroup::new(pamap, is_v4)
+                AggGroup::new(pamap, prefix)
             }
         };
 
@@ -1544,7 +1556,7 @@ impl RouteAggregator {
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
         // Order open groups by prefix count, descending.
-        let mut keys: Vec<(IngressId, bool, bool, u64)> =
+        let mut keys: Vec<(IngressId, bool, bool, bool, u64)> =
             self.groups.keys().copied().collect();
         keys.sort_unstable_by_key(|k| {
             std::cmp::Reverse(
@@ -1609,7 +1621,7 @@ impl RouteAggregator {
         // Drain groups into a temporary so `self.peer_info` can be borrowed
         // for the per-group lookup without conflicting with the drain (the
         // peer map is now an owned HashMap, not a cheap-to-clone Arc).
-        let groups: Vec<((IngressId, bool, bool, u64), AggGroup)> =
+        let groups: Vec<((IngressId, bool, bool, bool, u64), AggGroup)> =
             self.groups.drain().collect();
         for (key, group) in groups {
             if let Some(peer) = self.peer_info.get(&key.0) {
@@ -1756,7 +1768,8 @@ fn build_bgp_update(
 
     // Get raw path attributes (filtering out types 14 and 15) and the
     // original next hop from MP_REACH_NLRI if present.
-    let (pa_bytes, orig_next_hop) = filter_raw_path_attributes(pamap);
+    let (pa_bytes, orig_next_hop) =
+        unicast_path_attributes(pamap.as_ref(), prefix);
 
     if is_ipv4 {
         // For IPv4: put prefix in NLRI field
@@ -1839,66 +1852,150 @@ fn filter_raw_path_attributes(
 /// recompute the filtered attributes from a held `Arc<[u8]>` at emit time
 /// instead of caching a second copy per open group.
 fn filter_pa_from_raw(raw: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
-    if raw.len() < 2 {
-        return (Vec::new(), None);
-    }
-
-    let pa_blob = &raw[2..];
-    let mut result = Vec::with_capacity(pa_blob.len());
+    let blob = raw.get(2..).unwrap_or(&[]);
+    let mut result = Vec::with_capacity(blob.len());
     let mut next_hop = None;
-    let mut pos = 0;
-
-    while pos < pa_blob.len() {
-        if pos + 2 > pa_blob.len() {
-            break;
-        }
-
-        let flags = pa_blob[pos];
-        let type_code = pa_blob[pos + 1];
-
-        // Determine attribute length
-        let (attr_len, header_len) = if flags & 0x10 != 0 {
-            // Extended length (2 bytes)
-            if pos + 4 > pa_blob.len() {
-                break;
-            }
-            let len = u16::from_be_bytes([pa_blob[pos + 2], pa_blob[pos + 3]])
-                as usize;
-            (len, 4)
-        } else {
-            // Regular length (1 byte)
-            if pos + 3 > pa_blob.len() {
-                break;
-            }
-            (pa_blob[pos + 2] as usize, 3)
-        };
-
-        let total_attr_len = header_len + attr_len;
-
-        if pos + total_attr_len > pa_blob.len() {
-            break;
-        }
-
-        if type_code == 14 {
-            // MP_REACH_NLRI: extract the next hop before discarding.
-            // Wire format of the value: AFI(2) + SAFI(1) + NH_LEN(1) + NH(NH_LEN) + ...
-            let value_start = pos + header_len;
-            let value = &pa_blob[value_start..pos + total_attr_len];
-            if value.len() >= 4 {
-                let nh_len = value[3] as usize;
-                if value.len() >= 4 + nh_len {
-                    next_hop = Some(value[4..4 + nh_len].to_vec());
+    for (type_code, attr, value) in path_attrs(blob) {
+        match type_code {
+            14 => {
+                if let Some(nh) = mp_reach_next_hop(value) {
+                    next_hop = Some(nh.to_vec());
                 }
             }
-        } else if type_code != 15 {
-            // Keep everything except MP_REACH_NLRI (14) and MP_UNREACH_NLRI (15)
-            result.extend_from_slice(&pa_blob[pos..pos + total_attr_len]);
+            15 => {}
+            _ => result.extend_from_slice(attr),
         }
-
-        pos += total_attr_len;
     }
-
     (result, next_hop)
+}
+
+/// Iterate a wire-format path-attribute blob as `(type code, whole
+/// attribute, value)`, stopping at the first truncated attribute.
+fn path_attrs(blob: &[u8]) -> impl Iterator<Item = (u8, &[u8], &[u8])> {
+    let mut rest = blob;
+    std::iter::from_fn(move || {
+        let (&flags, &type_code) = (rest.first()?, rest.get(1)?);
+        let (len, header_len) = if flags & 0x10 != 0 {
+            (
+                u16::from_be_bytes([*rest.get(2)?, *rest.get(3)?]) as usize,
+                4,
+            )
+        } else {
+            (*rest.get(2)? as usize, 3)
+        };
+        let attr = rest.get(..header_len + len)?;
+        rest = &rest[header_len + len..];
+        Some((type_code, attr, &attr[header_len..]))
+    })
+}
+
+/// The next hop of an MP_REACH_NLRI value:
+/// AFI(2) + SAFI(1) + NH_LEN(1) + NH(NH_LEN) + ...
+fn mp_reach_next_hop(value: &[u8]) -> Option<&[u8]> {
+    value.get(4..4 + usize::from(*value.get(3)?))
+}
+
+/// The MP_REACH next hop of an IPv4 `prefix`, when that is where the stored
+/// attribute set carries it.
+///
+/// Only an IPv4 MP_REACH qualifies, so another family's MP_REACH can never
+/// supply the next hop of conventional IPv4 NLRI in a mixed UPDATE. Multicast
+/// (SAFI 2) is accepted because its routes are folded into the unicast NLRI
+/// space (see `PeerInfo::supported_afisafis`).
+///
+/// The stored blob is shared by every NLRI of the original UPDATE and does
+/// not record which section announced a prefix. When it holds both NEXT_HOP
+/// and an IPv4 MP_REACH, the MP_REACH NLRI list decides: for a prefix listed
+/// there NEXT_HOP is to be ignored (RFC 4760 section 3), while any other
+/// prefix was conventional NLRI and keeps NEXT_HOP.
+fn ipv4_mp_next_hop(raw: &[u8], prefix: Prefix) -> Option<&[u8]> {
+    let mut has_next_hop = false;
+    let mut mp_reach = None;
+    for (type_code, _, value) in path_attrs(raw.get(2..)?) {
+        match type_code {
+            3 => has_next_hop = true,
+            14 if value.starts_with(&[0, 1])
+                && matches!(value.get(2), Some(1 | 2)) =>
+            {
+                mp_reach = Some(value)
+            }
+            _ => {}
+        }
+    }
+    let value = mp_reach?;
+    let nh = mp_reach_next_hop(value).filter(|nh| !nh.is_empty())?;
+    if has_next_hop {
+        // Skip the reserved octet that follows the next hop.
+        let nlri = value.get(4 + nh.len() + 1..)?;
+        let addpath = raw[1] & PPI_MP_REACH_ADDPATH != 0;
+        if !nlri_lists_prefix(nlri, addpath, prefix) {
+            return None;
+        }
+    }
+    Some(nh)
+}
+
+/// Whether a prefix NLRI field (optionally with RFC 7911 path ids) lists
+/// `prefix`.
+fn nlri_lists_prefix(mut nlri: &[u8], addpath: bool, prefix: Prefix) -> bool {
+    let want = encode_prefix_nlri(prefix, None);
+    while !nlri.is_empty() {
+        if addpath {
+            nlri = match nlri.get(4..) {
+                Some(rest) => rest,
+                None => return false,
+            };
+        }
+        let Some(&bits) = nlri.first() else {
+            return false;
+        };
+        let Some(entry) = nlri.get(..1 + (usize::from(bits) + 7) / 8) else {
+            return false;
+        };
+        // Bits beyond the prefix length are not significant on the wire.
+        let mut entry_bytes = entry.to_vec();
+        if bits % 8 != 0 {
+            if let Some(last) = entry_bytes.last_mut() {
+                *last &= 0xffu8 << (8 - bits % 8);
+            }
+        }
+        if entry_bytes == want {
+            return true;
+        }
+        nlri = &nlri[entry.len()..];
+    }
+    false
+}
+
+/// Path attributes and next hop for rebuilding `prefix` as unicast NLRI.
+///
+/// Returns the attributes without MP_REACH/MP_UNREACH, and the next hop to
+/// encode in a fresh MP_REACH_NLRI. For IPv4 the supported 4-byte MP_REACH
+/// next hop (see [`ipv4_mp_next_hop`]) is converted to a conventional
+/// NEXT_HOP, replacing any NEXT_HOP it supersedes, and no MP_REACH next hop
+/// is returned.
+fn unicast_path_attributes(
+    raw: &[u8],
+    prefix: Prefix,
+) -> (Vec<u8>, Option<Vec<u8>>) {
+    if !prefix.is_v4() {
+        return filter_pa_from_raw(raw);
+    }
+    let mp_next_hop =
+        ipv4_mp_next_hop(raw, prefix).filter(|nh| nh.len() == 4);
+    let blob = raw.get(2..).unwrap_or(&[]);
+    let mut attrs = Vec::with_capacity(blob.len() + 7);
+    for (type_code, attr, _) in path_attrs(blob) {
+        let superseded = type_code == 3 && mp_next_hop.is_some();
+        if !matches!(type_code, 14 | 15) && !superseded {
+            attrs.extend_from_slice(attr);
+        }
+    }
+    if let Some(nh) = mp_next_hop {
+        attrs.extend_from_slice(&[0x40, 3, 4]);
+        attrs.extend_from_slice(nh);
+    }
+    (attrs, None)
 }
 
 /// Build a BGP UPDATE withdrawal message.
@@ -3142,6 +3239,199 @@ mod tests {
             addpath_cap_value: Vec::new(),
             admin_label: None,
         }
+    }
+
+    fn mp_v4_pamap(
+        nh: &[u8],
+        addpath: bool,
+    ) -> (RotondaPaMap, routecore::bgp::message::SessionConfig) {
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        let mut attrs = vec![0x90, 14];
+        let nlri_len = if addpath { 8 } else { 4 };
+        attrs.extend_from_slice(
+            &((5 + nh.len() + nlri_len) as u16).to_be_bytes(),
+        );
+        attrs.extend_from_slice(&[0, 1, 1, nh.len() as u8]);
+        attrs.extend_from_slice(nh);
+        attrs.push(0);
+        if addpath {
+            attrs.extend_from_slice(&1u32.to_be_bytes());
+        }
+        attrs.extend_from_slice(&[24, 198, 51, 100]);
+        attrs.extend_from_slice(&[
+            0x40, 1, 1, 0, 0x40, 2, 6, 2, 1, 0, 0, 0xfb, 0xf4,
+        ]);
+        let mut wire = vec![0xff; 16];
+        wire.extend_from_slice(&((23 + attrs.len()) as u16).to_be_bytes());
+        wire.extend_from_slice(&[2, 0, 0]);
+        wire.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&attrs);
+        let mut sc = SessionConfig::modern();
+        if addpath {
+            sc.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+        }
+        let update = UpdateMessage::from_octets(wire, &sc).unwrap();
+        assert_eq!(update.announcements_vec().unwrap().len(), 1);
+        (
+            RotondaPaMap::new(update.path_attributes().unwrap().into()),
+            sc,
+        )
+    }
+
+    fn assert_mp_v4_rebuild(
+        msg: &[u8],
+        nh: &[u8],
+        addpath: bool,
+        count: usize,
+    ) {
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        let mut sc = SessionConfig::modern();
+        if addpath {
+            sc.add_addpath_rxtx(AfiSafiType::Ipv4Unicast);
+        }
+        assert_eq!(
+            u32::from_be_bytes(msg[1..5].try_into().unwrap()) as usize,
+            msg.len()
+        );
+        let bgp = &msg[48..];
+        assert!(bgp.len() <= MAX_BGP_UPDATE_LEN);
+        assert_eq!(
+            u16::from_be_bytes(bgp[16..18].try_into().unwrap()) as usize,
+            bgp.len()
+        );
+        let update = UpdateMessage::from_octets(bgp, &sc).unwrap();
+        assert!(update.path_attributes().unwrap().all(|a| a.is_ok()));
+        let announcements = update.announcements_vec().unwrap();
+        assert_eq!(announcements.len(), count);
+        for nlri in announcements {
+            match nlri {
+                routecore::bgp::nlri::afisafi::Nlri::Ipv4UnicastAddpath(
+                    n,
+                ) => {
+                    assert_eq!(IsPrefix::path_id(&n).unwrap().0, 1)
+                }
+                routecore::bgp::nlri::afisafi::Nlri::Ipv4Unicast(_) => {
+                    assert!(!addpath)
+                }
+                other => panic!("unexpected NLRI {other:?}"),
+            }
+        }
+        assert_eq!(
+            update.conventional_next_hop().unwrap().unwrap().to_string(),
+            std::net::Ipv4Addr::new(nh[0], nh[1], nh[2], nh[3]).to_string()
+        );
+        assert!(update.mp_next_hop().unwrap().is_none());
+    }
+
+    #[test]
+    fn ipv4_mp_next_hops_survive_single_and_aggregated_rebuilds() {
+        let nh = &[192, 0, 2, 1];
+        for addpath in [false, true] {
+            let (pamap, _) = mp_v4_pamap(nh, addpath);
+            let peer = agg_test_peer();
+            let prefix = "198.51.100.0/24".parse().unwrap();
+            let pid = addpath.then_some(1);
+            let single =
+                build_route_monitoring(&peer, prefix, &pamap, false, pid)
+                    .unwrap();
+            assert_mp_v4_rebuild(&single, nh, addpath, 1);
+            let mut agg =
+                RouteAggregator::new(usize::MAX, [(1, peer)].into());
+            let mut emitted = 0;
+            let mut sink = |msg: Vec<u8>, count: usize| {
+                assert_mp_v4_rebuild(&msg, nh, addpath, count);
+                emitted += count;
+                true
+            };
+            // Cross the 65,535-byte boundary to check NEXT_HOP and
+            // path-id accounting when splitting a dump.
+            for _ in 0..17_000 {
+                assert!(agg.add(1, pid, prefix, &pamap, &mut sink));
+            }
+            assert!(agg.flush_all(&mut sink));
+            assert_eq!(emitted, 17_000);
+        }
+    }
+
+    /// One stored attribute set holding both NEXT_HOP and an IPv4 MP_REACH:
+    /// the prefix listed in MP_REACH takes the MP next hop (RFC 4760 says
+    /// to ignore NEXT_HOP for it), any other prefix was conventional NLRI.
+    #[test]
+    fn mixed_update_next_hop_follows_the_announcing_section() {
+        let mp_nh = [0x40, 3, 4, 192, 0, 2, 1];
+        let conventional_nh = [0x40, 3, 4, 192, 0, 2, 2];
+        let in_mp: Prefix = "198.51.100.0/24".parse().unwrap();
+        let conventional: Prefix = "203.0.113.0/24".parse().unwrap();
+        let next_hops = |attrs: &[u8]| -> Vec<Vec<u8>> {
+            path_attrs(attrs)
+                .filter(|(code, _, _)| *code == 3)
+                .map(|(_, attr, _)| attr.to_vec())
+                .collect()
+        };
+        for addpath in [false, true] {
+            let (pamap, _) = mp_v4_pamap(&[192, 0, 2, 1], addpath);
+            let mut raw = pamap.as_ref().to_vec();
+            raw.extend_from_slice(&conventional_nh);
+            let pid = addpath.then_some(1);
+
+            let (attrs, nh) = unicast_path_attributes(&raw, in_mp);
+            assert!(nh.is_none());
+            assert_eq!(next_hops(&attrs), [mp_nh.to_vec()]);
+            let (attrs, nh) = unicast_path_attributes(&raw, conventional);
+            assert!(nh.is_none());
+            assert_eq!(next_hops(&attrs), [conventional_nh.to_vec()]);
+
+            // The dump aggregator must not merge the two prefixes: they
+            // share an attribute blob but not a next hop.
+            let pamap = RotondaPaMap::from_raw(raw.clone());
+            let mut agg = RouteAggregator::new(
+                usize::MAX,
+                [(1, agg_test_peer())].into(),
+            );
+            let mut seen = Vec::new();
+            let mut sink = |msg: Vec<u8>, count: usize| {
+                assert_eq!(count, 2);
+                // BGP UPDATE: header(19) + withdrawn len(2) + attr len(2).
+                let bgp = &msg[48..];
+                let pa_len =
+                    usize::from(u16::from_be_bytes([bgp[21], bgp[22]]));
+                seen.push(next_hops(&bgp[23..23 + pa_len]));
+                true
+            };
+            for prefix in [in_mp, conventional, in_mp, conventional] {
+                assert!(agg.add(1, pid, prefix, &pamap, &mut sink));
+            }
+            assert!(agg.flush_all(&mut sink));
+            seen.sort();
+            assert_eq!(
+                seen,
+                [vec![mp_nh.to_vec()], vec![conventional_nh.to_vec()]]
+            );
+
+            // MP_REACH for another family cannot supply IPv4's next hop.
+            raw[7] = 2; // MP_REACH AFI low byte (extended attribute header).
+            let (attrs, nh) = unicast_path_attributes(&raw, in_mp);
+            assert!(nh.is_none());
+            assert_eq!(next_hops(&attrs), [conventional_nh.to_vec()]);
+            let (attrs, nh) =
+                unicast_path_attributes(&raw[..raw.len() - 7], in_mp);
+            assert!(nh.is_none());
+            assert!(next_hops(&attrs).is_empty());
+        }
+    }
+
+    #[test]
+    fn nlri_membership_handles_path_ids_and_host_bits() {
+        let prefix: Prefix = "198.51.100.0/23".parse().unwrap();
+        // 10.0.0.0/8, then 198.51.101.0/23 with a non-zero host bit.
+        let plain = [8, 10, 23, 198, 51, 101];
+        assert!(nlri_lists_prefix(&plain, false, prefix));
+        assert!(!nlri_lists_prefix(&plain[..2], false, prefix));
+        let addpath = [0, 0, 0, 7, 8, 10, 0, 0, 0, 9, 23, 198, 51, 100];
+        assert!(nlri_lists_prefix(&addpath, true, prefix));
+        // Truncated entries never match and never read out of bounds.
+        assert!(!nlri_lists_prefix(&addpath[..12], true, prefix));
+        assert!(!nlri_lists_prefix(&[0, 0, 0], true, prefix));
     }
 
     /// An aggregated IPv4 message packs every prefix's NLRI into one BGP

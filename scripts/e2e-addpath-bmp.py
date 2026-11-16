@@ -12,6 +12,7 @@ import socket
 import struct
 import sys
 import time
+import urllib.error
 import urllib.request
 
 HTTP_ADDR = os.environ["HTTP_ADDR"]
@@ -21,6 +22,8 @@ BMP_OUT_REBUILD_ADDR = os.environ["BMP_OUT_REBUILD_ADDR"]
 
 PEER_IP = "10.99.0.1"
 PEER_AS = 65001
+NEXT_HOP_ENCODING = os.environ.get("NEXT_HOP_ENCODING", "classic")
+assert NEXT_HOP_ENCODING in ("classic", "mpv4")
 PREFIX_WIRE = bytes([24, 10, 0, 0])  # 10.0.0.0/24
 
 # ADD-PATH (cap 69) families the feeder negotiates: v4 unicast and v4
@@ -118,11 +121,22 @@ def pa(flags, type_code, val):
     return bytes([flags, type_code, len(val)]) + val
 
 
+def expected_next_hop(path_id):
+    return socket.inet_aton(f"192.0.2.{path_id}")
+
+
 def announce(path_id, nexthop):
     pas = pa(0x40, 1, b"\x00")  # ORIGIN IGP
-    pas += pa(0x40, 2, bytes([2, 1]) + struct.pack("!I", PEER_AS))  # AS_PATH
-    pas += pa(0x40, 3, socket.inet_aton(nexthop))  # NEXT_HOP
+    pas += pa(0x40, 2, bytes([2, 1]) + struct.pack("!I", 64496))
     nlri = struct.pack("!I", path_id) + PREFIX_WIRE
+    if NEXT_HOP_ENCODING == "classic":
+        pas += pa(0x40, 3, socket.inet_aton(nexthop))
+    else:
+        nh = expected_next_hop(path_id)
+        value = bytes([0, 1, 1, len(nh)]) + nh + b"\x00" + nlri
+        # Exercise extended attribute lengths, as used by some exporters.
+        pas += bytes([0x90, 14]) + struct.pack("!H", len(value)) + value
+        nlri = b""
     return bmp_msg(0, pph() + bgp_update(pas, nlri))
 
 
@@ -255,9 +269,19 @@ def collect_announced_pids(reader, want, context):
         if msg_type != 0:
             continue
         wd, nlri = parse_route_monitoring(msg)
+        attrs = parse_path_attrs(msg)
+        nh = attrs.get(3)
+        if 14 in attrs and attrs[14][:3] == bytes([0, 1, 1]):
+            value = attrs[14]
+            nhlen = value[3]
+            nh = value[4:4 + nhlen]
+            nlri = value[5 + nhlen:]
         if not nlri:
-            continue  # EoR, withdraw-only, or MP-only (flowspec)
+            continue  # EoR, withdraw-only, or flowspec
         for pid, wire in addpath_entries(nlri):
+            assert nh == expected_next_hop(pid), (
+                f"FAIL ({context}): next hop {nh!r} for path {pid}"
+            )
             assert wire == PREFIX_WIRE, (
                 f"FAIL ({context}): unexpected NLRI {wire.hex()}"
             )
@@ -351,6 +375,31 @@ def main():
             f"{context} live restream: cap 69 advertised, paths 1+2 "
             "with path ids: OK"
         )
+
+    # The coordinator restarts the HTTP router after all units register
+    # their endpoints; the BMP listener can be ready before this completes.
+    while True:
+        remaining()
+        try:
+            with urllib.request.urlopen(
+                f"http://{HTTP_ADDR}/api/v1/ribs/ipv4unicast/best-path/10.0.0.0/24?alternatives=all",
+                timeout=10,
+            ) as resp:
+                best_path = json.load(resp)["data"]
+            break
+        except urllib.error.HTTPError as error:
+            if error.code != 404:
+                raise
+        except (urllib.error.URLError, ConnectionError):
+            # The listener is down while the router restarts; remaining()
+            # bounds the retries.
+            pass
+        time.sleep(0.05)
+    assert best_path["counts"]["eligible"] == 2, best_path
+    assert best_path["counts"]["ineligible"] == 0, best_path
+    if NEXT_HOP_ENCODING == "mpv4":
+        assert "mpReachNlri" in json.dumps(best_path), best_path
+    print(f"RIB best-path retains next hop ({NEXT_HOP_ENCODING}): OK")
 
     # FlowSpec ADD-PATH: two rules under distinct path ids; both consumers
     # must see them restreamed with their path ids inside MP_REACH.

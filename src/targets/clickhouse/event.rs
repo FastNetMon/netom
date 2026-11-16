@@ -61,7 +61,13 @@ fn array_u32(out: &mut Vec<u8>, values: &[u32]) {
 impl Event {
     pub fn encode(&self, out: &mut Vec<u8>) {
         let raw = self.attrs.get(2..).unwrap_or_default();
-        let width = if self.attrs.get(1) == Some(&0) { 2 } else { 4 };
+        // The low parse-info bit selects ASN width; ADD-PATH flags occupy
+        // higher bits and must not change the RowBinary asn_width contract.
+        let width = if self.attrs.get(1).is_some_and(|b| b & 1 == 0) {
+            2
+        } else {
+            4
+        };
         let derived = Derived::parse(raw, width, self.afi, self.safi)
             .unwrap_or_default();
         out.extend_from_slice(&1u16.to_le_bytes());
@@ -254,6 +260,33 @@ mod tests {
         e.encode(&mut bytes);
         assert!(bytes.windows(raw.len() - 2).any(|v| v == &raw[2..]));
     }
+    #[test]
+    fn addpath_flags_do_not_change_asn_width_or_encoded_history() {
+        for four_octet in [false, true] {
+            let asn = if four_octet { 4_200_000_001u32 } else { 64500 };
+            let mut baseline = None;
+            for flags in 0u8..8 {
+                let mut raw =
+                    vec![0, (flags << 1) | u8::from(four_octet), 0x40, 2];
+                let encoded_asn = asn.to_be_bytes();
+                let asn_bytes = if four_octet {
+                    &encoded_asn[..]
+                } else {
+                    &encoded_asn[2..]
+                };
+                raw.extend_from_slice(&[(2 + asn_bytes.len()) as u8, 2, 1]);
+                raw.extend_from_slice(asn_bytes);
+                let (row, ok) = encoded(&raw);
+                assert_eq!(ok, 1);
+                if let Some(expected) = &baseline {
+                    assert_eq!(&row, expected);
+                } else {
+                    baseline = Some(row);
+                }
+            }
+        }
+    }
+
     // RFC 8669 BGP Prefix-SID (type 40). Netom does not model it — routecore
     // leaves it Unimplemented — so the only record of one ever arriving is the
     // raw_attrs blob. These pin that: the attribute survives byte-for-byte,
