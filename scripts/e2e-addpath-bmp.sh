@@ -20,7 +20,7 @@
 #   * PeerDown is emitted exactly once (for the session, not per child).
 #
 # Requirements: cargo, python3. Set NETOM_BIN to skip the build.
-# NEXT_HOP_ENCODING=mpv4 exercises MP_REACH ingestion, best-path,
+# NEXT_HOP_ENCODING=mpv4, mpv6 or mpv6-ll exercises MP_REACH ingestion, best-path,
 # live forwarding/rebuilding and reconnect dumps (default: classic NEXT_HOP).
 set -euo pipefail
 

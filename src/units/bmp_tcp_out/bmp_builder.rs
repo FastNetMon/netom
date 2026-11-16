@@ -92,7 +92,8 @@ pub struct PeerInfo {
     /// timestamp of the emitted Peer Up; otherwise `now()` is used.
     pub session_up_time: Option<(u32, u32)>,
     /// Raw wire-format blob of all capabilities the peer advertised
-    /// (`capabilities_as_vec`). Capabilities not synthesized or excluded are
+    /// (`capabilities_as_vec`), with Extended Next Hop normalized from the
+    /// route receiver’s OPEN. Capabilities not synthesized or excluded are
     /// passed through verbatim into the received OPEN (see `OpenCapExtras`).
     pub peer_capabilities: Vec<u8>,
     /// ADD-PATH capability (69) value bytes to advertise in BOTH synthesized
@@ -117,16 +118,45 @@ pub struct PeerInfo {
 ///       (`PeerInfo::addpath_cap_value`), never passed through: the upstream
 ///       OPEN blob is one side's offer, not the negotiated set, and it may
 ///       list families/directions that don't match our re-encoding.
-///   5=ExtendedNextHop — would change how downstream parses our re-encoded
-///       UPDATEs (next hops are rebuilt). Kept in sync with
-///       `machine::DROPPED_CAP_CODES`.
+///   5=ExtendedNextHop — synthesized only for IPv4 unicast with an IPv6
+///       next hop ([`ENH_IPV4_UNICAST_IPV6`]), the one tuple the rebuild
+///       path supports, and only when the route receiver advertised it.
 const PASSTHROUGH_EXCLUDE: &[u8] = &[1, 5, 6, 9, 64, 65, 69, 73, 75];
+
+/// The Extended Next Hop (code 5, RFC 8950) tuple bmp-out can reproduce:
+/// NLRI AFI 1 (IPv4), NLRI SAFI 1 (unicast), next-hop AFI 2 (IPv6).
+pub(crate) const ENH_IPV4_UNICAST_IPV6: [u8; 6] = [0, 1, 0, 1, 0, 2];
+
+/// The 6-byte tuples of an Extended Next Hop capability TLV
+/// (`code | length | value`). `None` if `cap` is not a well-formed code-5
+/// capability.
+pub(crate) fn extended_next_hop_tuples(
+    cap: &[u8],
+) -> Option<std::slice::ChunksExact<'_, u8>> {
+    match cap {
+        [5, len, value @ ..]
+            if value.len() == usize::from(*len) && value.len() % 6 == 0 =>
+        {
+            Some(value.chunks_exact(6))
+        }
+        _ => None,
+    }
+}
+
+/// Largest capability block one OPEN can carry: the Optional Parameters
+/// Length octet also covers the enclosing parameter's type and length.
+const MAX_OPEN_CAPS_LEN: usize = u8::MAX as usize - 2;
 
 /// Best-effort optional capabilities recovered from an upstream session and
 /// re-emitted in the (received) Peer Up OPEN so downstream consumers recover
-/// them the standard way. All absent/empty for the synthetic *sent* OPEN.
+/// them the standard way. All absent/empty for the synthetic *sent* OPEN,
+/// except `extended_next_hop`, which is advertised in both OPENs so the
+/// synthetic session supports replay in either direction.
 #[derive(Default)]
 struct OpenCapExtras<'a> {
+    /// Advertise [`ENH_IPV4_UNICAST_IPV6`]
+    /// (see [`PeerInfo::extended_next_hop`]).
+    extended_next_hop: bool,
     hostname: Option<&'a str>,
     software_version: Option<&'a str>,
     role: Option<u8>,
@@ -169,8 +199,34 @@ impl PeerInfo {
             Some(PeerRibType::Loc) | None => peer_flags |= 0x40,
         }
 
-        let mut peer_capabilities =
-            info.remote_capabilities.clone().unwrap_or_default();
+        // ENH is a receiver capability (RFC 8950 section 4): the local
+        // OPEN enables inbound routes, the remote OPEN outbound routes.
+        // Normalize just this capability; descriptive and passthrough
+        // capabilities still come from the remote OPEN.
+        let remote_caps = info.remote_capabilities.as_deref().unwrap_or(&[]);
+        let receiver_caps = if peer_flags & 0x10 != 0 {
+            remote_caps
+        } else {
+            info.local_capabilities.as_deref().unwrap_or(&[])
+        };
+        let mut peer_capabilities = Vec::with_capacity(remote_caps.len());
+        for cap in Capabilities(remote_caps).iter() {
+            if cap.as_ref().first() != Some(&5) {
+                peer_capabilities.extend_from_slice(cap.as_ref());
+            }
+        }
+        if info.ingress_type == Some(IngressType::Mrt)
+            || Capabilities(receiver_caps).iter().any(|cap| {
+                extended_next_hop_tuples(cap.as_ref()).is_some_and(
+                    |mut tuples| {
+                        tuples.any(|tuple| tuple == ENH_IPV4_UNICAST_IPV6)
+                    },
+                )
+            })
+        {
+            peer_capabilities.extend_from_slice(&[5, 6]);
+            peer_capabilities.extend_from_slice(&ENH_IPV4_UNICAST_IPV6);
+        }
         if info.ingress_type == Some(IngressType::Mrt) {
             // MRT records do not carry the OPEN that negotiated their
             // address families. BMP-out nevertheless has to advertise each
@@ -276,6 +332,18 @@ impl PeerInfo {
                 && raw[1] == 4
                 && u16::from_be_bytes([raw[2], raw[3]]) == want_afi
                 && raw[5] == want_safi
+        })
+    }
+
+    /// Whether the route receiver advertised Extended Next Hop for IPv4
+    /// unicast over an IPv6 next hop, or MRT input needs synthetic support.
+    pub fn extended_next_hop(&self) -> bool {
+        Capabilities(&self.peer_capabilities).iter().any(|cap| {
+            extended_next_hop_tuples(cap.as_ref()).is_some_and(
+                |mut tuples| {
+                    tuples.any(|tuple| tuple == ENH_IPV4_UNICAST_IPV6)
+                },
+            )
         })
     }
 
@@ -467,6 +535,17 @@ fn build_bgp_open(
         caps.push(safi);
     }
 
+    // RFC 8950: IPv4 unicast can retain an IPv6 next hop in MP_REACH.
+    // Normalize to the one supported tuple, in both OPENs, when the route
+    // receiver advertised it. Do not copy VPN or labeled-family tuples
+    // unsupported by this encoder.
+    if extras.extended_next_hop
+        && afisafis.contains(&AfiSafiType::Ipv4Unicast)
+    {
+        caps.extend_from_slice(&[5, 6]);
+        caps.extend_from_slice(&ENH_IPV4_UNICAST_IPV6);
+    }
+
     // Capability: ADD-PATH (code 69, RFC 7911). Emitted in BOTH OPENs (the
     // caller passes the same value for sent and received) so downstream
     // computes the intersection as negotiated and parses our re-encoded
@@ -507,7 +586,7 @@ fn build_bgp_open(
     // Closure appends one capability (code + length + value) if it fits.
     let mut push_cap = |code: u8, value: &[u8]| {
         if value.len() <= u8::MAX as usize
-            && caps.len() + 2 + value.len() <= u8::MAX as usize
+            && caps.len() + 2 + value.len() <= MAX_OPEN_CAPS_LEN
         {
             caps.push(code);
             caps.push(value.len() as u8);
@@ -551,7 +630,7 @@ fn build_bgp_open(
     // Pass through every other capability the peer advertised, verbatim,
     // except PASSTHROUGH_EXCLUDE (synthesized above, or incompatible with our
     // re-encoding). Each blob entry is already a full code|len|value TLV;
-    // copy it whole if it still fits the single-octet param length.
+    // copy it whole if it still fits the single-octet param lengths.
     let passthrough = Capabilities(extras.passthrough);
     for cap in passthrough.iter() {
         let bytes = cap.as_ref();
@@ -562,7 +641,7 @@ fn build_bgp_open(
         if PASSTHROUGH_EXCLUDE.contains(&code) {
             continue;
         }
-        if caps.len() + bytes.len() <= u8::MAX as usize {
+        if caps.len() + bytes.len() <= MAX_OPEN_CAPS_LEN {
             caps.extend_from_slice(bytes);
         }
     }
@@ -661,7 +740,9 @@ pub fn build_peer_up(
     // so leave it zero and advertise no peer-supplied extras. Received OPEN:
     // stamp the peer's BGP Identifier so it agrees with the per-peer header's
     // Peer BGP ID, and re-emit the peer's best-effort descriptive caps.
+    let extended_next_hop = peer.extended_next_hop();
     let received_extras = OpenCapExtras {
+        extended_next_hop,
         hostname: peer.peer_hostname.as_deref(),
         software_version: peer.peer_software_version.as_deref(),
         role: peer.peer_role,
@@ -671,7 +752,10 @@ pub fn build_peer_up(
     let sent_open = build_bgp_open(
         peer.peer_asn,
         [0u8; 4],
-        &OpenCapExtras::default(),
+        &OpenCapExtras {
+            extended_next_hop,
+            ..Default::default()
+        },
         &afisafis,
         advertise_graceful_restart,
         addpath_cap,
@@ -982,9 +1066,9 @@ fn hash_pa_blob(blob: &[u8]) -> u64 {
 /// All `prefixes` must belong to the same address family (`is_v4`) and the
 /// caller must guarantee the encoded BGP UPDATE fits [`MAX_BGP_UPDATE_LEN`]
 /// — [`RouteAggregator`] enforces both. `pa_bytes` are the path attributes
-/// already filtered of MP_REACH/MP_UNREACH (types 14/15); for IPv6,
-/// `next_hop` carries the next hop recovered from the original MP_REACH and a
-/// fresh MP_REACH_NLRI is rebuilt around all the prefixes.
+/// already filtered of MP_REACH/MP_UNREACH (types 14/15). IPv4 next hops
+/// are normalized to NEXT_HOP; `next_hop` carries an IPv6 next hop requiring
+/// a fresh MP_REACH_NLRI around all prefixes, including IPv4 NLRI.
 fn build_aggregated_route_monitoring(
     peer: &PeerInfo,
     prefixes: &[(Prefix, Option<u32>)],
@@ -997,7 +1081,7 @@ fn build_aggregated_route_monitoring(
         append_prefix_nlri(&mut nlri, *p, *pid);
     }
 
-    let bgp_update = if is_v4 {
+    let bgp_update = if is_v4 && next_hop.is_none() {
         // IPv4: shared path attributes (incl. legacy NEXT_HOP, if any) once,
         // then every prefix in the NLRI field.
         let update_body_len = 2 + 2 + pa_bytes.len() + nlri.len();
@@ -1013,7 +1097,7 @@ fn build_aggregated_route_monitoring(
         buf.extend_from_slice(&nlri);
         buf
     } else {
-        // IPv6: shared attributes plus a single MP_REACH_NLRI (always encoded
+        // MP-BGP: shared attributes plus a single MP_REACH_NLRI (always encoded
         // with the extended-length flag so the 2-byte length math is uniform
         // regardless of how many prefixes are packed) carrying the shared
         // next hop once and all prefixes as NLRI.
@@ -1037,7 +1121,7 @@ fn build_aggregated_route_monitoring(
         buf.push(0x90);
         buf.push(14);
         buf.extend_from_slice(&(value_len as u16).to_be_bytes());
-        buf.extend_from_slice(&2u16.to_be_bytes()); // AFI = IPv6
+        buf.extend_from_slice(&(if is_v4 { 1u16 } else { 2 }).to_be_bytes());
         buf.push(1); // SAFI = unicast
         buf.push(nh.len() as u8);
         buf.extend_from_slice(nh);
@@ -1094,11 +1178,15 @@ struct AggGroup {
 impl AggGroup {
     /// `prefix` is the first prefix of the group; every prefix later pushed
     /// shares its family and next-hop source (both are in the group key).
-    fn new(pamap: &RotondaPaMap, prefix: Prefix) -> Self {
+    fn new(
+        pamap: &RotondaPaMap,
+        prefix: Prefix,
+        path_id: Option<u32>,
+    ) -> Self {
         let is_v4 = prefix.is_v4();
         let (pa_bytes, next_hop_opt) =
-            unicast_path_attributes(pamap.as_ref(), prefix);
-        let base_len = if is_v4 {
+            unicast_path_attributes(pamap.as_ref(), prefix, path_id);
+        let base_len = if is_v4 && next_hop_opt.is_none() {
             19 + 2 + 2 + pa_bytes.len()
         } else {
             let nh_len = next_hop_opt.as_ref().map(|n| n.len()).unwrap_or(16);
@@ -1157,15 +1245,12 @@ impl AggGroup {
         peer: &PeerInfo,
         sink: &mut dyn FnMut(Vec<u8>, usize) -> bool,
     ) -> bool {
-        let Some(&(first, _)) = self.prefixes.first() else {
+        let Some(&(first, path_id)) = self.prefixes.first() else {
             return true;
         };
-        let (pa_bytes, next_hop) = unicast_path_attributes(&self.raw, first);
-        let nh = if self.is_v4 {
-            None
-        } else {
-            next_hop.as_deref().or(Some(&[0u8; 16][..]))
-        };
+        let (pa_bytes, next_hop) =
+            unicast_path_attributes(&self.raw, first, path_id);
+        let nh = next_hop.as_deref();
         let msg = build_aggregated_route_monitoring(
             peer,
             &self.prefixes,
@@ -1400,7 +1485,7 @@ impl RouteAggregator {
             ingress_id,
             is_v4,
             path_id.is_some(),
-            is_v4 && ipv4_mp_next_hop(raw, prefix).is_some(),
+            is_v4 && ipv4_mp_next_hop(raw, prefix, path_id).is_some(),
             hash_pa_blob(blob),
         );
         let nlri_len = nlri_encoded_len(prefix, path_id.is_some());
@@ -1420,11 +1505,11 @@ impl RouteAggregator {
                     return false;
                 }
                 self.groups_created += 1;
-                AggGroup::new(pamap, prefix)
+                AggGroup::new(pamap, prefix, path_id)
             }
             None => {
                 self.groups_created += 1;
-                AggGroup::new(pamap, prefix)
+                AggGroup::new(pamap, prefix, path_id)
             }
         };
 
@@ -1769,9 +1854,9 @@ fn build_bgp_update(
     // Get raw path attributes (filtering out types 14 and 15) and the
     // original next hop from MP_REACH_NLRI if present.
     let (pa_bytes, orig_next_hop) =
-        unicast_path_attributes(pamap.as_ref(), prefix);
+        unicast_path_attributes(pamap.as_ref(), prefix, path_id);
 
-    if is_ipv4 {
+    if is_ipv4 && orig_next_hop.is_none() {
         // For IPv4: put prefix in NLRI field
         let nlri_bytes = encode_prefix_nlri(prefix, path_id);
         let update_body_len = 2 + 2 + pa_bytes.len() + nlri_bytes.len();
@@ -1793,7 +1878,7 @@ fn build_bgp_update(
 
         Some(buf)
     } else {
-        // For IPv6: add MP_REACH_NLRI (type 14) with the original next hop
+        // Keep IPv6 next hops in MP_REACH, including for IPv4 NLRI.
         let mp_reach =
             build_mp_reach_nlri(prefix, orig_next_hop.as_deref(), path_id);
         let total_pa_len = pa_bytes.len() + mp_reach.len();
@@ -1905,10 +1990,14 @@ fn mp_reach_next_hop(value: &[u8]) -> Option<&[u8]> {
 ///
 /// The stored blob is shared by every NLRI of the original UPDATE and does
 /// not record which section announced a prefix. When it holds both NEXT_HOP
-/// and an IPv4 MP_REACH, the MP_REACH NLRI list decides: for a prefix listed
-/// there NEXT_HOP is to be ignored (RFC 4760 section 3), while any other
-/// prefix was conventional NLRI and keeps NEXT_HOP.
-fn ipv4_mp_next_hop(raw: &[u8], prefix: Prefix) -> Option<&[u8]> {
+/// and an IPv4 MP_REACH, the MP_REACH NLRI list decides: for a matching
+/// (prefix, path ID) NEXT_HOP is ignored (RFC 4760 section 3), while any
+/// other route was conventional NLRI and keeps NEXT_HOP.
+fn ipv4_mp_next_hop(
+    raw: &[u8],
+    prefix: Prefix,
+    path_id: Option<u32>,
+) -> Option<&[u8]> {
     let mut has_next_hop = false;
     let mut mp_reach = None;
     for (type_code, _, value) in path_attrs(raw.get(2..)?) {
@@ -1923,12 +2012,14 @@ fn ipv4_mp_next_hop(raw: &[u8], prefix: Prefix) -> Option<&[u8]> {
         }
     }
     let value = mp_reach?;
-    let nh = mp_reach_next_hop(value).filter(|nh| !nh.is_empty())?;
+    // IPv4 (4), IPv6 global (16) or IPv6 global + link-local (32).
+    let nh = mp_reach_next_hop(value)
+        .filter(|nh| matches!(nh.len(), 4 | 16 | 32))?;
     if has_next_hop {
         // Skip the reserved octet that follows the next hop.
         let nlri = value.get(4 + nh.len() + 1..)?;
         let addpath = raw[1] & PPI_MP_REACH_ADDPATH != 0;
-        if !nlri_lists_prefix(nlri, addpath, prefix) {
+        if !nlri_lists_prefix(nlri, addpath, prefix, path_id) {
             return None;
         }
     }
@@ -1936,16 +2027,25 @@ fn ipv4_mp_next_hop(raw: &[u8], prefix: Prefix) -> Option<&[u8]> {
 }
 
 /// Whether a prefix NLRI field (optionally with RFC 7911 path ids) lists
-/// `prefix`.
-fn nlri_lists_prefix(mut nlri: &[u8], addpath: bool, prefix: Prefix) -> bool {
+/// the given `(prefix, path_id)` route.
+fn nlri_lists_prefix(
+    mut nlri: &[u8],
+    addpath: bool,
+    prefix: Prefix,
+    path_id: Option<u32>,
+) -> bool {
     let want = encode_prefix_nlri(prefix, None);
     while !nlri.is_empty() {
-        if addpath {
-            nlri = match nlri.get(4..) {
-                Some(rest) => rest,
-                None => return false,
+        let entry_path_id = if addpath {
+            let Some(id) = nlri.get(..4) else {
+                return false;
             };
-        }
+            let id = u32::from_be_bytes(id.try_into().unwrap());
+            nlri = &nlri[4..];
+            Some(id)
+        } else {
+            None
+        };
         let Some(&bits) = nlri.first() else {
             return false;
         };
@@ -1959,7 +2059,7 @@ fn nlri_lists_prefix(mut nlri: &[u8], addpath: bool, prefix: Prefix) -> bool {
                 *last &= 0xffu8 << (8 - bits % 8);
             }
         }
-        if entry_bytes == want {
+        if entry_path_id == path_id && entry_bytes == want {
             return true;
         }
         nlri = &nlri[entry.len()..];
@@ -1970,19 +2070,19 @@ fn nlri_lists_prefix(mut nlri: &[u8], addpath: bool, prefix: Prefix) -> bool {
 /// Path attributes and next hop for rebuilding `prefix` as unicast NLRI.
 ///
 /// Returns the attributes without MP_REACH/MP_UNREACH, and the next hop to
-/// encode in a fresh MP_REACH_NLRI. For IPv4 the supported 4-byte MP_REACH
-/// next hop (see [`ipv4_mp_next_hop`]) is converted to a conventional
-/// NEXT_HOP, replacing any NEXT_HOP it supersedes, and no MP_REACH next hop
-/// is returned.
+/// encode in a fresh MP_REACH_NLRI. For IPv4 an MP_REACH next hop (see
+/// [`ipv4_mp_next_hop`]) replaces any NEXT_HOP it supersedes: a 4-byte one
+/// is converted to a conventional NEXT_HOP, an IPv6 one (RFC 8950) is
+/// returned for MP_REACH encoding. Without one, IPv4 stays conventional.
 fn unicast_path_attributes(
     raw: &[u8],
     prefix: Prefix,
+    path_id: Option<u32>,
 ) -> (Vec<u8>, Option<Vec<u8>>) {
     if !prefix.is_v4() {
         return filter_pa_from_raw(raw);
     }
-    let mp_next_hop =
-        ipv4_mp_next_hop(raw, prefix).filter(|nh| nh.len() == 4);
+    let mp_next_hop = ipv4_mp_next_hop(raw, prefix, path_id);
     let blob = raw.get(2..).unwrap_or(&[]);
     let mut attrs = Vec::with_capacity(blob.len() + 7);
     for (type_code, attr, _) in path_attrs(blob) {
@@ -1991,11 +2091,14 @@ fn unicast_path_attributes(
             attrs.extend_from_slice(attr);
         }
     }
-    if let Some(nh) = mp_next_hop {
-        attrs.extend_from_slice(&[0x40, 3, 4]);
-        attrs.extend_from_slice(nh);
+    match mp_next_hop {
+        Some(nh) if nh.len() == 4 => {
+            attrs.extend_from_slice(&[0x40, 3, 4]);
+            attrs.extend_from_slice(nh);
+            (attrs, None)
+        }
+        other => (attrs, other.map(<[u8]>::to_vec)),
     }
-    (attrs, None)
 }
 
 /// Build a BGP UPDATE withdrawal message.
@@ -3316,40 +3419,60 @@ mod tests {
                 other => panic!("unexpected NLRI {other:?}"),
             }
         }
-        assert_eq!(
-            update.conventional_next_hop().unwrap().unwrap().to_string(),
-            std::net::Ipv4Addr::new(nh[0], nh[1], nh[2], nh[3]).to_string()
-        );
-        assert!(update.mp_next_hop().unwrap().is_none());
+        if nh.len() == 4 {
+            assert_eq!(
+                update.conventional_next_hop().unwrap().unwrap().to_string(),
+                std::net::Ipv4Addr::new(nh[0], nh[1], nh[2], nh[3])
+                    .to_string()
+            );
+            assert!(update.mp_next_hop().unwrap().is_none());
+        } else {
+            assert!(update.conventional_next_hop().unwrap().is_none());
+            let attrs: routecore::bgp::path_attributes::OwnedPathAttributes =
+                update.path_attributes().unwrap().into();
+            let mut raw = vec![0, 1];
+            raw.extend_from_slice(&attrs.into_vec());
+            assert_eq!(filter_pa_from_raw(&raw).1.as_deref(), Some(nh));
+            assert!(update.mp_next_hop().unwrap().is_some());
+        }
     }
 
     #[test]
     fn ipv4_mp_next_hops_survive_single_and_aggregated_rebuilds() {
-        let nh = &[192, 0, 2, 1];
-        for addpath in [false, true] {
-            let (pamap, _) = mp_v4_pamap(nh, addpath);
-            let peer = agg_test_peer();
-            let prefix = "198.51.100.0/24".parse().unwrap();
-            let pid = addpath.then_some(1);
-            let single =
-                build_route_monitoring(&peer, prefix, &pamap, false, pid)
-                    .unwrap();
-            assert_mp_v4_rebuild(&single, nh, addpath, 1);
-            let mut agg =
-                RouteAggregator::new(usize::MAX, [(1, peer)].into());
-            let mut emitted = 0;
-            let mut sink = |msg: Vec<u8>, count: usize| {
-                assert_mp_v4_rebuild(&msg, nh, addpath, count);
-                emitted += count;
-                true
-            };
-            // Cross the 65,535-byte boundary to check NEXT_HOP and
-            // path-id accounting when splitting a dump.
-            for _ in 0..17_000 {
-                assert!(agg.add(1, pid, prefix, &pamap, &mut sink));
+        let nh6 = "2001:db8::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let mut pair = nh6.to_vec();
+        pair.extend_from_slice(
+            &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        );
+        for nh in [&[192, 0, 2, 1][..], &nh6, &pair] {
+            for addpath in [false, true] {
+                let (pamap, _) = mp_v4_pamap(nh, addpath);
+                let peer = agg_test_peer();
+                let prefix = "198.51.100.0/24".parse().unwrap();
+                let pid = addpath.then_some(1);
+                let single =
+                    build_route_monitoring(&peer, prefix, &pamap, false, pid)
+                        .unwrap();
+                assert_mp_v4_rebuild(&single, nh, addpath, 1);
+                let mut agg =
+                    RouteAggregator::new(usize::MAX, [(1, peer)].into());
+                let mut emitted = 0;
+                let mut sink = |msg: Vec<u8>, count: usize| {
+                    assert_mp_v4_rebuild(&msg, nh, addpath, count);
+                    emitted += count;
+                    true
+                };
+                // Cross the 65,535-byte boundary to check next-hop and
+                // path-id accounting when splitting a dump.
+                for _ in 0..17_000 {
+                    assert!(agg.add(1, pid, prefix, &pamap, &mut sink));
+                }
+                assert!(agg.flush_all(&mut sink));
+                assert_eq!(emitted, 17_000);
             }
-            assert!(agg.flush_all(&mut sink));
-            assert_eq!(emitted, 17_000);
         }
     }
 
@@ -3374,10 +3497,11 @@ mod tests {
             raw.extend_from_slice(&conventional_nh);
             let pid = addpath.then_some(1);
 
-            let (attrs, nh) = unicast_path_attributes(&raw, in_mp);
+            let (attrs, nh) = unicast_path_attributes(&raw, in_mp, pid);
             assert!(nh.is_none());
             assert_eq!(next_hops(&attrs), [mp_nh.to_vec()]);
-            let (attrs, nh) = unicast_path_attributes(&raw, conventional);
+            let (attrs, nh) =
+                unicast_path_attributes(&raw, conventional, pid);
             assert!(nh.is_none());
             assert_eq!(next_hops(&attrs), [conventional_nh.to_vec()]);
 
@@ -3410,13 +3534,145 @@ mod tests {
 
             // MP_REACH for another family cannot supply IPv4's next hop.
             raw[7] = 2; // MP_REACH AFI low byte (extended attribute header).
-            let (attrs, nh) = unicast_path_attributes(&raw, in_mp);
+            let (attrs, nh) = unicast_path_attributes(&raw, in_mp, pid);
             assert!(nh.is_none());
             assert_eq!(next_hops(&attrs), [conventional_nh.to_vec()]);
             let (attrs, nh) =
-                unicast_path_attributes(&raw[..raw.len() - 7], in_mp);
+                unicast_path_attributes(&raw[..raw.len() - 7], in_mp, pid);
             assert!(nh.is_none());
             assert!(next_hops(&attrs).is_empty());
+        }
+    }
+
+    #[test]
+    fn mixed_update_same_prefix_keeps_each_path_next_hop() {
+        use crate::roto_runtime::types::explode_announcements;
+        use routecore::bgp::message::UpdateMessage;
+
+        let prefix: Prefix = "198.51.100.0/24".parse().unwrap();
+        let conventional_nh = [192, 0, 2, 2];
+        let nh6 = "2001:db8::1"
+            .parse::<std::net::Ipv6Addr>()
+            .unwrap()
+            .octets();
+        let mut pair = nh6.to_vec();
+        pair.extend_from_slice(
+            &"fe80::1".parse::<std::net::Ipv6Addr>().unwrap().octets(),
+        );
+        for mp_nh in [&[192, 0, 2, 1][..], &nh6, &pair] {
+            let (pamap, sc) = mp_v4_pamap(mp_nh, true);
+            let mut attrs = pamap.as_ref()[2..].to_vec();
+            attrs.extend_from_slice(&[0x40, 3, 4]);
+            attrs.extend_from_slice(&conventional_nh);
+            let nlri = encode_prefix_nlri(prefix, Some(2));
+            let mut wire = vec![0xff; 16];
+            wire.extend_from_slice(
+                &((23 + attrs.len() + nlri.len()) as u16).to_be_bytes(),
+            );
+            wire.extend_from_slice(&[2, 0, 0]);
+            wire.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+            wire.extend_from_slice(&attrs);
+            wire.extend_from_slice(&nlri);
+            let update = UpdateMessage::from_octets(wire, &sc).unwrap();
+            let routes = explode_announcements(&update).unwrap();
+            assert_eq!(routes.len(), 2);
+
+            let check = |msg: &[u8], count: usize| {
+                let update =
+                    UpdateMessage::from_octets(&msg[48..], &sc).unwrap();
+                let attrs: routecore::bgp::path_attributes::OwnedPathAttributes =
+                    update.path_attributes().unwrap().into();
+                let attrs = attrs.into_vec();
+                let actual_nh = path_attrs(&attrs)
+                    .find_map(|(code, _, value)| match code {
+                        3 => Some(value),
+                        14 => mp_reach_next_hop(value),
+                        _ => None,
+                    })
+                    .unwrap();
+                let nlris = update.announcements_vec().unwrap();
+                assert_eq!(nlris.len(), count);
+                for nlri in nlris {
+                    let routecore::bgp::nlri::afisafi::Nlri::Ipv4UnicastAddpath(n) = nlri else {
+                        panic!("expected ADD-PATH IPv4 NLRI");
+                    };
+                    match IsPrefix::path_id(&n).unwrap().0 {
+                        1 => assert_eq!(actual_nh, mp_nh),
+                        2 => assert_eq!(actual_nh, conventional_nh),
+                        id => panic!("unexpected path id {id}"),
+                    }
+                }
+            };
+            let peer = agg_test_peer();
+            let mut agg =
+                RouteAggregator::new(usize::MAX, [(1, peer.clone())].into());
+            let mut messages = 0;
+            let mut sink = |msg: Vec<u8>, count: usize| {
+                assert_eq!(
+                    count, 1,
+                    "different next hops must stay in separate groups"
+                );
+                check(&msg, count);
+                messages += 1;
+                true
+            };
+            for (route, pid) in routes {
+                let pid = Some(pid.unwrap().0);
+                let pamap = route.rotonda_pamap();
+                check(
+                    &build_route_monitoring(&peer, prefix, pamap, false, pid)
+                        .unwrap(),
+                    1,
+                );
+                assert!(agg.add(1, pid, prefix, pamap, &mut sink));
+            }
+            assert!(agg.flush_all(&mut sink));
+            assert_eq!(messages, 2);
+        }
+    }
+
+    #[test]
+    fn peer_up_extended_next_hop_uses_the_route_receiver() {
+        let enh = [5, 6, 0, 1, 0, 1, 0, 2];
+        for rib_type in [
+            None,
+            Some(PeerRibType::InPre),
+            Some(PeerRibType::InPost),
+            Some(PeerRibType::OutPre),
+            Some(PeerRibType::OutPost),
+        ] {
+            for local in [false, true] {
+                for remote in [false, true] {
+                    let mut info = IngressInfo::new()
+                        .with_local_capabilities(if local {
+                            enh.to_vec()
+                        } else {
+                            vec![]
+                        })
+                        .with_remote_capabilities(if remote {
+                            enh.to_vec()
+                        } else {
+                            vec![]
+                        });
+                    info.peer_rib_type = rib_type;
+                    let peer = PeerInfo::from_ingress_info(&info);
+                    let expected = if matches!(
+                        rib_type,
+                        Some(PeerRibType::OutPre | PeerRibType::OutPost)
+                    ) {
+                        remote
+                    } else {
+                        local
+                    };
+                    let msg = build_peer_up(&peer, false);
+                    assert_eq!(
+                        msg.windows(enh.len()).filter(|w| *w == enh).count(),
+                        if expected { 2 } else { 0 },
+                        "{rib_type:?}, local={local}, remote={remote}"
+                    );
+                    assert_peer_up_opens_parse(&peer, "directional ENH");
+                }
+            }
         }
     }
 
@@ -3425,13 +3681,100 @@ mod tests {
         let prefix: Prefix = "198.51.100.0/23".parse().unwrap();
         // 10.0.0.0/8, then 198.51.101.0/23 with a non-zero host bit.
         let plain = [8, 10, 23, 198, 51, 101];
-        assert!(nlri_lists_prefix(&plain, false, prefix));
-        assert!(!nlri_lists_prefix(&plain[..2], false, prefix));
+        assert!(nlri_lists_prefix(&plain, false, prefix, None));
+        assert!(!nlri_lists_prefix(&plain[..2], false, prefix, None));
         let addpath = [0, 0, 0, 7, 8, 10, 0, 0, 0, 9, 23, 198, 51, 100];
-        assert!(nlri_lists_prefix(&addpath, true, prefix));
+        assert!(nlri_lists_prefix(&addpath, true, prefix, Some(9)));
+        assert!(!nlri_lists_prefix(&addpath, true, prefix, Some(7)));
+        assert!(!nlri_lists_prefix(&addpath, true, prefix, None));
+        assert!(!nlri_lists_prefix(&plain, false, prefix, Some(9)));
+        let zero_id = [0, 0, 0, 0, 23, 198, 51, 100];
+        assert!(nlri_lists_prefix(&zero_id, true, prefix, Some(0)));
         // Truncated entries never match and never read out of bounds.
-        assert!(!nlri_lists_prefix(&addpath[..12], true, prefix));
-        assert!(!nlri_lists_prefix(&[0, 0, 0], true, prefix));
+        assert!(!nlri_lists_prefix(&addpath[..12], true, prefix, Some(9)));
+        assert!(!nlri_lists_prefix(&[0, 0, 0], true, prefix, Some(9)));
+    }
+
+    #[test]
+    fn peer_up_normalizes_ipv4_extended_next_hop_in_both_opens() {
+        let mut peer = agg_test_peer();
+        let supported = [5, 6, 0, 1, 0, 1, 0, 2];
+        let unsupported = [5, 6, 0, 1, 0, 128, 0, 2];
+        peer.peer_capabilities =
+            [supported.as_slice(), unsupported.as_slice()].concat();
+        let msg = build_peer_up(&peer, false);
+        assert_eq!(
+            msg.windows(supported.len())
+                .filter(|w| *w == supported)
+                .count(),
+            2
+        );
+        assert!(!msg.windows(unsupported.len()).any(|w| w == unsupported));
+
+        // Only the unsupported tuple, or no capability at all: the session
+        // did not negotiate what the encoder emits, so do not claim it.
+        for caps in [unsupported.to_vec(), Vec::new()] {
+            peer.peer_capabilities = caps;
+            let msg = build_peer_up(&peer, false);
+            assert!(!msg.windows(2).any(|w| w == [5, 6]));
+        }
+
+        // MRT has no OPEN to consult; advertise what may be replayed.
+        let info = IngressInfo::new().with_ingress_type(IngressType::Mrt);
+        let msg = build_peer_up(&PeerInfo::from_ingress_info(&info), false);
+        assert_eq!(
+            msg.windows(supported.len())
+                .filter(|w| *w == supported)
+                .count(),
+            2
+        );
+    }
+
+    /// Both embedded OPENs of a Peer Up are self-consistent and parseable.
+    fn assert_peer_up_opens_parse(peer: &PeerInfo, context: &str) {
+        let msg = build_peer_up(peer, false);
+        let mut pos = BMP_COMMON_HEADER_LEN + BMP_PER_PEER_HEADER_LEN + 20;
+        for _ in 0..2 {
+            let len = u16::from_be_bytes(
+                msg[pos + 16..pos + 18].try_into().unwrap(),
+            ) as usize;
+            let open = &msg[pos..pos + len];
+            assert_eq!(usize::from(open[28]) + 29, len, "{context}");
+            assert_eq!(
+                usize::from(open[30]) + 2,
+                usize::from(open[28]),
+                "{context}"
+            );
+            routecore::bgp::message::OpenMessage::from_octets(open).unwrap();
+            pos += len;
+        }
+        assert_eq!(pos, msg.len(), "{context}");
+    }
+
+    #[test]
+    fn open_capabilities_leave_room_for_optional_parameter_header() {
+        let enh = [5, 6, 0, 1, 0, 1, 0, 2];
+        for length in 200..=255 {
+            // Synthesized descriptive capability near the limit.
+            let mut peer = agg_test_peer();
+            peer.peer_capabilities = enh.to_vec();
+            peer.peer_hostname = Some("x".repeat(length));
+            assert_peer_up_opens_parse(&peer, &format!("hostname {length}"));
+
+            // Passed-through capability near the limit, followed by a
+            // small one that must not be squeezed into the header's room.
+            let mut peer = agg_test_peer();
+            peer.peer_capabilities = enh.to_vec();
+            peer.peer_capabilities
+                .extend_from_slice(&[200, length as u8]);
+            peer.peer_capabilities
+                .extend(std::iter::repeat_n(0, length));
+            peer.peer_capabilities.extend_from_slice(&[201, 0]);
+            assert_peer_up_opens_parse(
+                &peer,
+                &format!("passthrough {length}"),
+            );
+        }
     }
 
     /// An aggregated IPv4 message packs every prefix's NLRI into one BGP

@@ -37,6 +37,9 @@ members = ["tools/bmpdump"]
 default-members = [".", "tools/bmpdump"]
 
 [workspace.dependencies]
+# No `rev` here: rotonda-store depends on the same git source without one,
+# and a differing source would link a second, incompatible routecore. The
+# commit is pinned by Cargo.lock, so build with `--locked`.
 routecore          = { git = "https://github.com/FastNetMon/routecore.git", features = ["bgp", "bmp", "serde", "fsm", "mrt"] }
 inetnum            = { git = "https://github.com/FastNetMon/inetnum.git", tag = "v0.1.1-fnm1", features = ["arbitrary", "serde"] }
 rotonda-store      = { git = "https://github.com/FastNetMon/netom-store.git", rev = "1a58fe44b4eb5b0e68a7b0a07558ebfb692b6209" } # batched, concurrent-safe reclamation

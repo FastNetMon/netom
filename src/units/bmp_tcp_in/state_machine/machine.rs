@@ -67,6 +67,9 @@ use std::{
 };
 
 use crate::ingress::IngressId;
+use crate::units::bmp_tcp_out::{
+    extended_next_hop_tuples, ENH_IPV4_UNICAST_IPV6,
+};
 use crate::{
     common::{
         routecore_extra::{
@@ -1717,17 +1720,17 @@ struct UnknownPeerThrottle {
 /// capabilities netom received but does not forward to bmp-out.
 const UNDECODED_CAP_SUMMARY_INTERVAL: Duration = Duration::from_secs(300);
 
-/// Capability codes that bmp-out can neither synthesize nor pass through,
-/// because netom re-encodes route-monitoring UPDATEs in a way that is
-/// incompatible with them (see `bmp_tcp_out::bmp_builder`):
-///   5 = ExtendedNextHop — next hops are rebuilt, not replayed
-/// Everything else a peer advertises is either synthesized to match our
-/// output encoding (ADD-PATH, code 69, is synthesized from the negotiated
-/// `addpath_families`) or forwarded verbatim, so only this one is genuinely
-/// lost. We log it (rate-limited) since it can reduce route fidelity for
-/// the affected peer downstream. Keep in sync with
-/// `bmp_tcp_out::bmp_builder`'s passthrough exclude set.
-const DROPPED_CAP_CODES: &[u8] = &[5];
+/// Whether a capability contains a tuple bmp-out cannot reproduce. Code 5
+/// is normalized to the one tuple bmp-out re-encodes
+/// ([`ENH_IPV4_UNICAST_IPV6`]); other extended next-hop families, and a
+/// malformed capability, still lose fidelity. Other capabilities are either
+/// synthesized or passed through by `bmp_tcp_out::bmp_builder`.
+fn capability_loses_fidelity(raw: &[u8]) -> bool {
+    raw.first() == Some(&5)
+        && extended_next_hop_tuples(raw).is_none_or(|mut tuples| {
+            tuples.any(|tuple| tuple != ENH_IPV4_UNICAST_IPV6)
+        })
+}
 
 /// What to log for a received-but-not-forwarded BGP capability. Mirrors
 /// [`UnknownPeerLog`]: the first sighting of each distinct capability code is
@@ -1914,10 +1917,9 @@ impl PeerAware for PeerStates {
             Some(pph.timestamp()).filter(|ts| ts.timestamp() > 0);
 
         // Surface (rate-limited) capabilities a peer advertised that bmp-out
-        // cannot carry because we re-encode routes incompatibly with them
-        // (ExtendedNextHop). Other capabilities are synthesized or passed
-        // through, so this is a focused route-fidelity warning rather than
-        // a flood.
+        // cannot fully reproduce. IPv4-unicast ExtendedNextHop is now
+        // synthesized, but unsupported tuples in the same capability still
+        // warrant the focused warning.
         let now = Instant::now();
         let caps = Capabilities(&remote_capabilities);
         for cap in caps.iter() {
@@ -1925,7 +1927,7 @@ impl PeerAware for PeerStates {
                 Some(c) => *c,
                 None => continue,
             };
-            if !DROPPED_CAP_CODES.contains(&code) {
+            if !capability_loses_fidelity(cap.as_ref()) {
                 continue;
             }
             match self.2.note(code, now, UNDECODED_CAP_SUMMARY_INTERVAL) {
@@ -2290,8 +2292,8 @@ impl PeerAware for PeerStates {
 #[cfg(test)]
 mod capability_extract_tests {
     use super::{
-        first_len_prefixed_string, with_capability_value, UndecodedCapLog,
-        UndecodedCapThrottle,
+        capability_loses_fidelity, first_len_prefixed_string,
+        with_capability_value, UndecodedCapLog, UndecodedCapThrottle,
     };
     use routecore::bgp::message::open::CapabilityType;
     use std::time::{Duration, Instant};
@@ -2366,6 +2368,18 @@ mod capability_extract_tests {
         // Zero-length string is treated as absent.
         assert_eq!(hostname(&fqdn_cap(b"", b"")), None);
         assert_eq!(version(&software_version_cap(b"")), None);
+    }
+
+    #[test]
+    fn extended_next_hop_warning_only_covers_unsupported_tuples() {
+        assert!(!capability_loses_fidelity(&[5, 6, 0, 1, 0, 1, 0, 2]));
+        assert!(!capability_loses_fidelity(&[5, 0]));
+        assert!(!capability_loses_fidelity(&[65, 4, 0, 0, 0xfb, 0xf4]));
+        assert!(capability_loses_fidelity(&[5, 6, 0, 1, 0, 128, 0, 2]));
+        assert!(capability_loses_fidelity(&[
+            5, 12, 0, 1, 0, 1, 0, 2, 0, 1, 0, 128, 0, 2,
+        ]));
+        assert!(capability_loses_fidelity(&[5, 6, 0, 1, 0, 1, 0]));
     }
 
     #[test]

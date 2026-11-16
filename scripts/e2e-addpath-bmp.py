@@ -23,7 +23,7 @@ BMP_OUT_REBUILD_ADDR = os.environ["BMP_OUT_REBUILD_ADDR"]
 PEER_IP = "10.99.0.1"
 PEER_AS = 65001
 NEXT_HOP_ENCODING = os.environ.get("NEXT_HOP_ENCODING", "classic")
-assert NEXT_HOP_ENCODING in ("classic", "mpv4")
+assert NEXT_HOP_ENCODING in ("classic", "mpv4", "mpv6", "mpv6-ll")
 PREFIX_WIRE = bytes([24, 10, 0, 0])  # 10.0.0.0/24
 
 # ADD-PATH (cap 69) families the feeder negotiates: v4 unicast and v4
@@ -96,6 +96,8 @@ def bgp_open():
     # Capabilities: MP families + ADD-PATH (69) + 4-octet ASN (65), one
     # type-2 parameter.
     caps = MP_CAPS + ADDPATH_CAP + bytes([65, 4]) + struct.pack("!I", PEER_AS)
+    if NEXT_HOP_ENCODING.startswith("mpv6"):
+        caps += bytes([5, 6, 0, 1, 0, 1, 0, 2])
     opt = bytes([2, len(caps)]) + caps
     body = struct.pack("!BHH", 4, PEER_AS, 0)
     body += socket.inet_aton(PEER_IP)
@@ -122,6 +124,11 @@ def pa(flags, type_code, val):
 
 
 def expected_next_hop(path_id):
+    if NEXT_HOP_ENCODING.startswith("mpv6"):
+        nh = socket.inet_pton(socket.AF_INET6, f"2001:db8::{path_id}")
+        if NEXT_HOP_ENCODING == "mpv6-ll":
+            nh += socket.inet_pton(socket.AF_INET6, f"fe80::{path_id}")
+        return nh
     return socket.inet_aton(f"192.0.2.{path_id}")
 
 
@@ -251,7 +258,14 @@ def expect_peer_up_with_cap69(reader, context):
         off = 6 + 42 + 16 + 2 + 2  # headers, local addr, ports
         for which in ("sent", "received"):
             olen = struct.unpack("!H", msg[off + 16 : off + 18])[0]
-            quads = open_cap69_quads(msg[off : off + olen])
+            embedded_open = msg[off : off + olen]
+            # Extended Next Hop is advertised only when the feeder did.
+            has_enh = bytes([5, 6, 0, 1, 0, 1, 0, 2]) in embedded_open
+            assert has_enh == NEXT_HOP_ENCODING.startswith("mpv6"), (
+                f"FAIL ({context}): {which} OPEN Extended Next Hop "
+                f"capability present={has_enh}"
+            )
+            quads = open_cap69_quads(embedded_open)
             assert quads == want, (
                 f"FAIL ({context}): {which} OPEN of the synthesized Peer "
                 f"Up advertises cap-69 quads {sorted(quads)}, "
@@ -397,8 +411,12 @@ def main():
         time.sleep(0.05)
     assert best_path["counts"]["eligible"] == 2, best_path
     assert best_path["counts"]["ineligible"] == 0, best_path
-    if NEXT_HOP_ENCODING == "mpv4":
+    if NEXT_HOP_ENCODING != "classic":
         assert "mpReachNlri" in json.dumps(best_path), best_path
+    if NEXT_HOP_ENCODING == "mpv6":
+        assert "ipv6Unicast" in json.dumps(best_path), best_path
+    if NEXT_HOP_ENCODING == "mpv6-ll":
+        assert "ipv6LL" in json.dumps(best_path), best_path
     print(f"RIB best-path retains next hop ({NEXT_HOP_ENCODING}): OK")
 
     # FlowSpec ADD-PATH: two rules under distinct path ids; both consumers
