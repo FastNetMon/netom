@@ -910,7 +910,8 @@ impl Rib {
         if raw.len() < 2 {
             return (None, None);
         }
-        let asn_len = if raw[1] == 1 { 4 } else { 2 };
+        // Bit 0 is ASN width; higher bits describe ADD-PATH sections.
+        let asn_len = if raw[1] & 1 != 0 { 4 } else { 2 };
         let attrs = &raw[2..];
         let mut originator = None;
         let mut neighbor = None;
@@ -4799,6 +4800,43 @@ mod tests {
             .find(|r| r.ingress_id == peer_a && r.key_prefix.len() == 24)
             .expect("rule from peer A stored");
         assert_eq!(a_row.rule.validity, FlowSpecValidity::Invalid);
+    }
+
+    #[test]
+    fn flowspec_validation_asn_width_is_independent_of_addpath() {
+        let rib = test_rib();
+        for four_octet in [false, true] {
+            let asn = if four_octet { 4_200_000_001u32 } else { 64500 };
+            for flags in 0u8..8 {
+                let mut raw = vec![
+                    0,
+                    (flags << 1) | u8::from(four_octet),
+                    0x80,
+                    9,
+                    4,
+                    192,
+                    0,
+                    2,
+                    1,
+                    0x40,
+                    2,
+                ];
+                let encoded = asn.to_be_bytes();
+                let asn_bytes = if four_octet {
+                    &encoded[..]
+                } else {
+                    &encoded[2..]
+                };
+                raw.extend_from_slice(&[(2 + asn_bytes.len()) as u8, 2, 1]);
+                raw.extend_from_slice(asn_bytes);
+                assert_eq!(
+                    rib.flowspec_validation_attrs(&RotondaPaMap::from_raw(
+                        raw
+                    )),
+                    (Some([192, 0, 2, 1]), Some(Asn::from_u32(asn)))
+                );
+            }
+        }
     }
 
     #[test]

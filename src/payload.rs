@@ -375,21 +375,57 @@ fn hash_bytes(raw: &[u8]) -> u64 {
     hasher.finish()
 }
 
-// These from/to byte functions should ideally live in routecore, but as we
-// will refactor many routecore types to zerocopy structs soon(tm), we define
-// these here for now.
+// Keep the historical ASN-width bit (old blobs use 0/1), and preserve all
+// three independent ADD-PATH flags in the remaining low bits.
 fn ppi_to_byte(ppi: PduParseInfo) -> u8 {
-    match ppi.four_octet_enabled() {
-        true => 1,
-        false => 0,
-    }
+    u8::from(ppi.four_octet_enabled())
+        | (u8::from(ppi.conventional_addpath()) << 1)
+        | (u8::from(ppi.mp_reach_addpath()) * PPI_MP_REACH_ADDPATH)
+        | (u8::from(ppi.mp_unreach_addpath()) << 3)
 }
 
+/// Bit of the stored parse-info byte (`raw[1]`) set when the NLRI inside
+/// MP_REACH carry RFC 7911 path ids. For readers that walk the raw
+/// attribute blob without building a `PduParseInfo`.
+pub(crate) const PPI_MP_REACH_ADDPATH: u8 = 1 << 2;
+
 fn byte_to_ppi(byte: u8) -> PduParseInfo {
-    if byte == 0x01 {
-        PduParseInfo::modern()
-    } else {
-        PduParseInfo::legacy()
+    match byte & 0x0f {
+        0 => PduParseInfo::legacy(),
+        1 => PduParseInfo::modern(),
+        bits => {
+            // routecore has no public constructor for individual PDU flags.
+            // Build the 16 combinations once using distinct stand-in families
+            // for conventional, MP_REACH and MP_UNREACH. These families only
+            // select booleans; PduParseInfo stores no address-family values.
+            // The hot path is a lookup, with no SessionConfig allocation.
+            static FLAGS: std::sync::OnceLock<[PduParseInfo; 16]> =
+                std::sync::OnceLock::new();
+            FLAGS.get_or_init(|| {
+                std::array::from_fn(|bits| {
+                    use routecore::bgp::message::SessionConfig;
+                    let mut sc = if bits & 1 != 0 {
+                        SessionConfig::modern()
+                    } else {
+                        SessionConfig::legacy()
+                    };
+                    for (bit, family) in [
+                        (2, AfiSafiType::Ipv4Unicast),
+                        (4, AfiSafiType::Ipv6Unicast),
+                        (8, AfiSafiType::Ipv4Multicast),
+                    ] {
+                        if bits & bit != 0 {
+                            sc.add_addpath_rxtx(family);
+                        }
+                    }
+                    PduParseInfo::from_session_config(
+                        &sc,
+                        Some(AfiSafiType::Ipv6Unicast),
+                        Some(AfiSafiType::Ipv4Multicast),
+                    )
+                })
+            })[usize::from(bits)]
+        }
     }
 }
 
@@ -814,5 +850,64 @@ mod interner_tests {
         let shards = interner.num_shards();
         assert_eq!(interner.sweep_shard(shards), (0, 0));
         assert_eq!(interner.sweep_shard(usize::MAX), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod parse_info_tests {
+    use super::*;
+    use routecore::bgp::message::SessionConfig;
+
+    #[test]
+    fn stored_parse_info_preserves_independent_addpath_flags() {
+        for asn4 in [false, true] {
+            for conventional in [false, true] {
+                for reach in [false, true] {
+                    for unreach in [false, true] {
+                        let mut sc = if asn4 {
+                            SessionConfig::modern()
+                        } else {
+                            SessionConfig::legacy()
+                        };
+                        for (enabled, family) in [
+                            (conventional, AfiSafiType::Ipv4Unicast),
+                            (reach, AfiSafiType::Ipv6Unicast),
+                            (unreach, AfiSafiType::Ipv4FlowSpec),
+                        ] {
+                            if enabled {
+                                sc.add_addpath_rxtx(family);
+                            }
+                        }
+                        let expected = PduParseInfo::from_session_config(
+                            &sc,
+                            Some(AfiSafiType::Ipv6Unicast),
+                            Some(AfiSafiType::Ipv4FlowSpec),
+                        );
+                        let stored = RotondaPaMap::new(
+                            OwnedPathAttributes::new(expected, vec![]),
+                        );
+                        for actual in [
+                            stored.path_attributes().pdu_parse_info(),
+                            stored.path_attributes_ref().pdu_parse_info,
+                        ] {
+                            assert_eq!(actual.four_octet_enabled(), asn4);
+                            assert_eq!(
+                                actual.conventional_addpath(),
+                                conventional
+                            );
+                            assert_eq!(actual.mp_reach_addpath(), reach);
+                            assert_eq!(actual.mp_unreach_addpath(), unreach);
+                        }
+                        assert_eq!(
+                            stored.as_ref().len(),
+                            2,
+                            "no per-route metadata growth"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(ppi_to_byte(PduParseInfo::legacy()), 0);
+        assert_eq!(ppi_to_byte(PduParseInfo::modern()), 1);
     }
 }

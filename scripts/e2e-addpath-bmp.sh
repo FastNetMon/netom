@@ -20,14 +20,16 @@
 #   * PeerDown is emitted exactly once (for the session, not per child).
 #
 # Requirements: cargo, python3. Set NETOM_BIN to skip the build.
+# NEXT_HOP_ENCODING=mpv4, mpv6 or mpv6-ll exercises MP_REACH ingestion, best-path,
+# live forwarding/rebuilding and reconnect dumps (default: classic NEXT_HOP).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKDIR="$(mktemp -d /tmp/netom-e2e-addpath-bmp.XXXXXX)"
-HTTP_ADDR="127.0.0.1:8819"
-BMP_IN_ADDR="127.0.0.1:31019"
-BMP_OUT_ADDR="127.0.0.1:31020"
-BMP_OUT_REBUILD_ADDR="127.0.0.1:31022"
+HTTP_ADDR="${HTTP_ADDR:-127.0.0.1:8819}"
+BMP_IN_ADDR="${BMP_IN_ADDR:-127.0.0.1:31019}"
+BMP_OUT_ADDR="${BMP_OUT_ADDR:-127.0.0.1:31020}"
+BMP_OUT_REBUILD_ADDR="${BMP_OUT_REBUILD_ADDR:-127.0.0.1:31022}"
 NETOM_PID=""
 
 cleanup() {

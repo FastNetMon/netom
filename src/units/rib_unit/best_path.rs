@@ -1218,6 +1218,40 @@ mod tests {
         run(records, info, Strategy::Rfc4271)
     }
 
+    #[test]
+    fn addpath_mp_reach_is_readable_and_eligible_after_explosion() {
+        use crate::roto_runtime::types::explode_announcements;
+        use routecore::bgp::message::{SessionConfig, UpdateMessage};
+        let attrs = hex::decode(concat!(
+            "900e002100010104c0000201000000000118c633640000000118cb00710000000118c61201",
+            "4001010040020a02020000fbf40000fbf540050400000064"
+        )).unwrap();
+        let mut wire = vec![0xff; 16];
+        wire.extend_from_slice(&((23 + attrs.len()) as u16).to_be_bytes());
+        wire.extend_from_slice(&[2, 0, 0]);
+        wire.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&attrs);
+        let mut sc = SessionConfig::modern();
+        sc.add_addpath_rxtx(routecore::bgp::types::AfiSafiType::Ipv4Unicast);
+        let update = UpdateMessage::from_octets(wire, &sc).unwrap();
+        let routes = explode_announcements(&update).unwrap();
+        assert_eq!(routes.len(), 3);
+        for (route, pid) in routes {
+            assert_eq!(pid.unwrap().0, 1);
+            let stored = route.rotonda_pamap();
+            assert_eq!(&stored.as_ref()[2..], attrs);
+            assert!(serde_json::to_string(stored)
+                .unwrap()
+                .contains("mpReachNlri"));
+            let outcome = rfc4271(
+                &[record(1, stored.clone())],
+                &registry(vec![(1, ibgp("192.0.2.2", [192, 0, 2, 2]))]),
+            );
+            assert!(outcome.excluded.is_empty());
+            assert_eq!(outcome.best_mui(), 1);
+        }
+    }
+
     //--- The tie-breakers, in RFC order -------------------------------------
 
     /// Phase 1: LOCAL_PREF outranks everything below it, but only on IBGP
